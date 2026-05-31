@@ -1,4 +1,6 @@
-# Carpool
+# Lets_Carpool
+
+Connecting people to save gas and money.
 
 A two-sided carpool marketplace MVP. Riders publish ride requests, drivers publish trips, and either side can search, connect, coordinate in chat, and confirm a gas split.
 
