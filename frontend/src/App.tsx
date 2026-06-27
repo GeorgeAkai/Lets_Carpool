@@ -3,17 +3,21 @@ import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
   Check, X, Fuel, ChevronRight, Home, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield,
+  ClipboardList, Shield, Map, Package, Camera,
 } from "lucide-react"
 import { motion } from "motion/react"
 import * as api from "./api"
-import type { ApiUser } from "./api"
+import type { ApiUser, WsMessage } from "./api"
+import { MapView } from "./MapView"
+import { PoolView } from "./PoolView"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type View = "home" | "feed" | "post" | "my-listings" | "connections" | "notifications" | "profile"
+type View = "home" | "feed" | "post" | "my-listings" | "connections" | "notifications" | "profile" | "map" | "pools"
 type ListingType = "driver" | "rider"
-type RideTag = "airport" | "student"
+type RideTag = "airport" | "student" | "church" | "college" | "work" | "event"
+type LuggageSize = "none" | "small" | "medium" | "large" | "oversized"
+type CarType = "sedan" | "suv" | "van" | "minivan" | "truck" | "other"
 type Flexibility = "morning" | "afternoon" | "evening" | "flexible"
 type ConnStatus = "pending" | "accepted" | "declined" | "completed" | "cancelled" | "expired"
 
@@ -32,6 +36,9 @@ interface Listing {
   estimatedGas?: number
   tags: RideTag[]
   vehicle?: string
+  carType?: CarType
+  luggageSize?: LuggageSize
+  luggageCapacity?: LuggageSize
   status: "open" | "matched"
   postedAt: string
 }
@@ -79,6 +86,18 @@ const CANNED_MESSAGES: Record<string, string> = {
   luggage: "I have a luggage question.",
 }
 
+const LUGGAGE_LABELS: Record<LuggageSize, string> = {
+  none: "No luggage", small: "Small bag", medium: "Medium bag", large: "Large bag", oversized: "Oversized",
+}
+
+const CAR_TYPE_LABELS: Record<CarType, string> = {
+  sedan: "Sedan", suv: "SUV", van: "Van", minivan: "Minivan", truck: "Truck", other: "Other",
+}
+
+const CAR_TYPE_EMOJI: Record<CarType, string> = {
+  sedan: "🚗", suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", other: "🚗",
+}
+
 const SERIF: CSSProperties = { fontFamily: "'DM Serif Display', serif" }
 const MONO: CSSProperties = { fontFamily: "'DM Mono', monospace" }
 
@@ -100,6 +119,8 @@ function apiFlexibility(f: string): Flexibility {
   return (["morning", "afternoon", "evening", "flexible"].includes(f) ? f : "flexible") as Flexibility
 }
 
+const VALID_RIDE_TAGS = new Set(["airport", "student", "church", "college", "work", "event"])
+
 function tripToListing(trip: api.ApiDriverTrip): Listing {
   return {
     id: trip.id, type: "driver", apiId: trip.id,
@@ -107,7 +128,9 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     from: trip.pickup.label, to: trip.destination.label,
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
-    tags: trip.tags.filter((t): t is RideTag => t === "airport" || t === "student"),
+    tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
+    carType: (trip.car_type as CarType) ?? undefined,
+    luggageCapacity: (trip.luggage_capacity as LuggageSize) ?? undefined,
     status: trip.status === "open" ? "open" : "matched",
     postedAt: relativeTime(trip.created_at),
   }
@@ -120,7 +143,8 @@ function requestToListing(req: api.ApiRideRequest): Listing {
     from: req.pickup.label, to: req.destination.label,
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
-    tags: req.tags.filter((t): t is RideTag => t === "airport" || t === "student"),
+    tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
+    luggageSize: (req.luggage_size as LuggageSize) ?? undefined,
     status: req.status === "open" ? "open" : "matched",
     postedAt: relativeTime(req.created_at),
   }
@@ -302,12 +326,39 @@ function ListingCard({ listing, onConnect }: { listing: Listing; onConnect: (l: 
             </span>
           </>
         )}
-        {isDriver && listing.vehicle && (
+        {isDriver && listing.carType && (
+          <>
+            <span className="text-border">·</span>
+            <span className="flex items-center gap-1">
+              <span>{CAR_TYPE_EMOJI[listing.carType]}</span>
+              {CAR_TYPE_LABELS[listing.carType]}
+            </span>
+          </>
+        )}
+        {isDriver && listing.vehicle && !listing.carType && (
           <>
             <span className="text-border">·</span>
             <span className="flex items-center gap-1">
               <Car className="size-3" />
               {listing.vehicle}
+            </span>
+          </>
+        )}
+        {isDriver && listing.luggageCapacity && listing.luggageCapacity !== "none" && (
+          <>
+            <span className="text-border">·</span>
+            <span className="flex items-center gap-1">
+              <Package className="size-3" />
+              Up to {LUGGAGE_LABELS[listing.luggageCapacity]}
+            </span>
+          </>
+        )}
+        {!isDriver && listing.luggageSize && listing.luggageSize !== "none" && (
+          <>
+            <span className="text-border">·</span>
+            <span className="flex items-center gap-1">
+              <Package className="size-3" />
+              {LUGGAGE_LABELS[listing.luggageSize]}
             </span>
           </>
         )}
@@ -334,13 +385,18 @@ function ListingCard({ listing, onConnect }: { listing: Listing; onConnect: (l: 
 
 function FeedView({
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   listings, onConnect, loading,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: "all" | "driver" | "rider"; setFilterType: (v: "all" | "driver" | "rider") => void
   filterTag: "" | RideTag; setFilterTag: (v: "" | RideTag) => void
+  filterCarType: "" | CarType; setFilterCarType: (v: "" | CarType) => void
+  filterLuggage: "" | LuggageSize; setFilterLuggage: (v: "" | LuggageSize) => void
   listings: Listing[]; onConnect: (l: Listing) => void; loading: boolean
 }) {
+  const [showAdvanced, setShowAdvanced] = useState(false)
+
   return (
     <div className="space-y-6">
       <div className="pb-2">
@@ -366,12 +422,40 @@ function FeedView({
           </button>
         ))}
         <div className="w-px h-5 bg-border mx-0.5" />
-        {(["", "airport", "student"] as const).map(tag => (
+        {(["", "airport", "student", "church", "college"] as const).map(tag => (
           <button key={tag} onClick={() => setFilterTag(tag as "" | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? "bg-accent/20 text-amber-800 ring-1 ring-accent/40" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
             {tag === "" ? "All tags" : tag.charAt(0).toUpperCase() + tag.slice(1)}
           </button>
         ))}
+        <button onClick={() => setShowAdvanced(v => !v)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${showAdvanced ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+          Filters {showAdvanced ? "▲" : "▼"}
+        </button>
       </div>
+
+      {showAdvanced && (
+        <div className="rounded-2xl bg-muted p-4 space-y-3">
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Vehicle size</p>
+            <div className="flex flex-wrap gap-2">
+              {(["", "sedan", "suv", "van", "minivan", "truck"] as const).map(ct => (
+                <button key={ct} onClick={() => setFilterCarType(ct as "" | CarType)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterCarType === ct ? "bg-primary text-primary-foreground" : "bg-card text-muted-foreground hover:text-foreground border border-border"}`}>
+                  {ct === "" ? "Any" : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Luggage I'm bringing</p>
+            <div className="flex flex-wrap gap-2">
+              {(["", "small", "medium", "large", "oversized"] as const).map(ls => (
+                <button key={ls} onClick={() => setFilterLuggage(ls as "" | LuggageSize)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterLuggage === ls ? "bg-primary text-primary-foreground" : "bg-card text-muted-foreground hover:text-foreground border border-border"}`}>
+                  {ls === "" ? "Any" : LUGGAGE_LABELS[ls as LuggageSize]}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex items-center gap-2 text-sm text-muted-foreground">
         {loading ? <span className="animate-pulse">Loading…</span> : (
@@ -407,6 +491,9 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
   const [gasEstimate, setGasEstimate] = useState("")
   const [tags, setTags] = useState<Set<RideTag>>(new Set())
   const [vehicle, setVehicle] = useState("")
+  const [carType, setCarType] = useState<CarType | "">("")
+  const [luggageSize, setLuggageSize] = useState<LuggageSize>("none")
+  const [luggageCapacity, setLuggageCapacity] = useState<LuggageSize>("medium")
   const [declared, setDeclared] = useState(false)
   const [submitted, setSubmitted] = useState(false)
   const [error, setError] = useState("")
@@ -431,6 +518,8 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
           target_date: date, flexibility,
           seats_available: parseInt(seats, 10),
           tags: Array.from(tags),
+          car_type: carType || undefined,
+          luggage_capacity: luggageCapacity,
         })
         onPost(tripToMyListing(trip))
       } else {
@@ -440,6 +529,7 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
           target_date: date, flexibility,
           passenger_count: parseInt(passengers, 10),
           tags: Array.from(tags),
+          luggage_size: luggageSize,
         })
         onPost(requestToMyListing(req))
       }
@@ -517,10 +607,38 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
           </div>
         )}
 
+        {type === "driver" && (
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">Vehicle type</label>
+            <div className="flex flex-wrap gap-2">
+              {(["sedan", "suv", "van", "minivan", "truck"] as CarType[]).map(ct => (
+                <button key={ct} type="button" onClick={() => setCarType(carType === ct ? "" : ct)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${carType === ct ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+                  {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium">{type === "driver" ? "Max luggage accepted" : "Luggage I'm bringing"}</label>
+          <div className="flex flex-wrap gap-2">
+            {(["none", "small", "medium", "large", "oversized"] as LuggageSize[]).map(ls => {
+              const current = type === "driver" ? luggageCapacity : luggageSize
+              const setter = type === "driver" ? setLuggageCapacity : setLuggageSize
+              return (
+                <button key={ls} type="button" onClick={() => setter(ls)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${current === ls ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+                  {LUGGAGE_LABELS[ls]}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
         <div className="space-y-1.5">
           <label className="text-sm font-medium">Tags</label>
           <div className="flex gap-2 flex-wrap">
-            {(["airport", "student"] as RideTag[]).map(tag => (
+            {(["airport", "student", "church", "college", "work", "event"] as RideTag[]).map(tag => (
               <button key={tag} type="button" onClick={() => toggleTag(tag)} className={`px-3.5 py-2 rounded-xl text-sm font-medium transition-colors ${tags.has(tag) ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
                 {tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
@@ -1030,6 +1148,7 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
   const [model, setModel] = useState(vehicle?.model ?? "")
   const [color, setColor] = useState(vehicle?.color ?? "")
   const [vSeats, setVSeats] = useState(String(vehicle?.seats ?? ""))
+  const [vCarType, setVCarType] = useState(vehicle?.car_type ?? "")
   const [hasLicense, setHasLicense] = useState(vehicle?.has_license ?? false)
   const [hasInsurance, setHasInsurance] = useState(vehicle?.has_insurance ?? false)
   const [hasRecord, setHasRecord] = useState(vehicle?.has_good_driving_record ?? false)
@@ -1056,6 +1175,7 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
         make: make || undefined, model: model || undefined,
         color: color || undefined,
         seats: vSeats ? parseInt(vSeats, 10) : undefined,
+        car_type: vCarType || undefined,
         has_license: hasLicense, has_insurance: hasInsurance, has_good_driving_record: hasRecord,
       })
       onProfileUpdate({ ...currentUser, vehicle: v })
@@ -1071,9 +1191,43 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
     <div className="space-y-6">
       <div className="rounded-[2rem] bg-card border border-border p-8">
         <div className="flex flex-wrap items-center gap-6">
-          <Avatar initials={toInitials(profile.display_name)} size="lg" />
+          <div className="relative group">
+            {profile.photo_url ? (
+              <img src={profile.photo_url} alt="Profile" className="size-14 rounded-full object-cover ring-2 ring-primary/20" />
+            ) : (
+              <Avatar initials={toInitials(profile.display_name)} size="lg" />
+            )}
+            <label className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">
+              <Camera className="size-5 text-white" />
+              <input
+                type="file"
+                accept="image/*"
+                className="sr-only"
+                onChange={async (e) => {
+                  const file = e.target.files?.[0]
+                  if (!file) return
+                  const reader = new FileReader()
+                  reader.onload = async (ev) => {
+                    const dataUrl = ev.target?.result as string
+                    try {
+                      const updated = await api.uploadPhoto(dataUrl)
+                      onProfileUpdate({ ...currentUser, profile: { ...profile, photo_url: updated.photo_url, photo_verified: true } })
+                    } catch (err) {
+                      alert(err instanceof Error ? err.message : "Upload failed")
+                    }
+                  }
+                  reader.readAsDataURL(file)
+                }}
+              />
+            </label>
+            {profile.photo_verified && (
+              <span className="absolute -bottom-1 -right-1 size-5 bg-green-500 rounded-full flex items-center justify-center">
+                <Check className="size-3 text-white" />
+              </span>
+            )}
+          </div>
           <div>
-            <p className="text-sm text-muted-foreground">Your profile</p>
+            <p className="text-sm text-muted-foreground">Your profile{profile.photo_verified ? " · ✓ Photo verified" : " · Hover photo to upload"}</p>
             <h2 className="mt-2 text-2xl font-semibold text-foreground">{profile.display_name}</h2>
             <p className="mt-1 text-sm text-muted-foreground">{currentUser.email}</p>
           </div>
@@ -1117,6 +1271,16 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
           <div className="space-y-1.5">
             <label className="text-sm font-medium">Seats</label>
             <input type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} className={inputCls} />
+          </div>
+        </div>
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium">Vehicle type</label>
+          <div className="flex flex-wrap gap-2">
+            {(["sedan", "suv", "van", "minivan", "truck", "other"] as CarType[]).map(ct => (
+              <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? "" : ct)} className={`px-3 py-1.5 rounded-xl text-sm font-medium transition-colors ${vCarType === ct ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+                {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
+              </button>
+            ))}
           </div>
         </div>
         <div className="space-y-2">
@@ -1308,8 +1472,9 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials }: {
 function BottomNav({ view, setView }: { view: View; setView: (v: View) => void }) {
   const items = [
     { id: "feed" as View, label: "Feed", Icon: Search, ariaLabel: "Discover feed" },
+    { id: "map" as View, label: "Map", Icon: Map, ariaLabel: "Live map" },
+    { id: "pools" as View, label: "Pools", Icon: Users, ariaLabel: "Community pools" },
     { id: "post" as View, label: "New", Icon: () => <span className="text-xl font-light leading-none">+</span>, ariaLabel: "New listing" },
-    { id: "my-listings" as View, label: "My Rides", Icon: ClipboardList, ariaLabel: "My rides" },
     { id: "connections" as View, label: "Inbox", Icon: MessageCircle, ariaLabel: "Connections inbox" },
     { id: "profile" as View, label: "Me", Icon: () => <Shield className="size-5" />, ariaLabel: "My account" },
   ] as const
@@ -1339,6 +1504,8 @@ function BottomNav({ view, setView }: { view: View; setView: (v: View) => void }
 function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) => void; onSignOut: () => void }) {
   const items: Array<{ id: View; label: string }> = [
     { id: "feed", label: "Discover" },
+    { id: "map", label: "Live Map" },
+    { id: "pools", label: "Pools" },
     { id: "post", label: "Post" },
     { id: "my-listings", label: "My Rides" },
     { id: "connections", label: "Connections" },
@@ -1415,6 +1582,8 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState("")
   const [filterType, setFilterType] = useState<"all" | "driver" | "rider">("all")
   const [filterTag, setFilterTag] = useState<"" | RideTag>("")
+  const [filterCarType, setFilterCarType] = useState<"" | CarType>("")
+  const [filterLuggage, setFilterLuggage] = useState<"" | LuggageSize>("")
   const [allListings, setAllListings] = useState<Listing[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
 
@@ -1431,6 +1600,28 @@ export function App() {
   // ── Notifications ─────────────────────────────────────────────────────────
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
   const [notifRead, setNotifRead] = useState(false)
+
+  // ── WebSocket real-time ───────────────────────────────────────────────────
+  const wsRef = useRef<WebSocket | null>(null)
+  useEffect(() => {
+    if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
+    const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
+      if (msg.type === "chat_message") {
+        setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, unreadMessages: c.unreadMessages + 1 } : c))
+        setNotifications(prev => [{
+          id: `ws_${Date.now()}`, user_id: currentUser.id, type: "chat_message",
+          title: "New message", body: msg.message.content, created_at: new Date().toISOString(), read: false,
+        }, ...prev])
+        setNotifRead(false)
+      } else if (msg.type === "connection_update") {
+        setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection["status"] } : c))
+      } else if (msg.type === "driver_nearby") {
+        showToast(`🚗 ${msg.display_name} is nearby!`, "success")
+      }
+    })
+    wsRef.current = ws
+    return () => { ws.close(); wsRef.current = null }
+  }, [currentUser]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Toast ─────────────────────────────────────────────────────────────────
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null)
@@ -1485,14 +1676,19 @@ export function App() {
 
   useEffect(() => { if (currentUser) loadListings(userCoords) }, [currentUser, userCoords, loadListings])
 
+  const LUGGAGE_ORDER = ["none", "small", "medium", "large", "oversized"]
+
   const filteredListings = useMemo(() => allListings.filter(listing => {
     const matchType = filterType === "all" || listing.type === filterType
     const matchTag = filterTag === "" || listing.tags.includes(filterTag)
     const matchSearch = searchQuery.trim() === "" ||
       listing.to.toLowerCase().includes(searchQuery.toLowerCase()) ||
       listing.from.toLowerCase().includes(searchQuery.toLowerCase())
-    return matchType && matchTag && matchSearch
-  }), [allListings, filterTag, filterType, searchQuery])
+    const matchCarType = filterCarType === "" || (listing.type === "driver" && listing.carType === filterCarType)
+    const matchLuggage = filterLuggage === "" || listing.type !== "driver" ||
+      (listing.luggageCapacity != null && LUGGAGE_ORDER.indexOf(listing.luggageCapacity) >= LUGGAGE_ORDER.indexOf(filterLuggage))
+    return matchType && matchTag && matchSearch && matchCarType && matchLuggage
+  }), [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Connect handler ───────────────────────────────────────────────────────
   const onConnect = useCallback(async (listing: Listing) => {
@@ -1561,7 +1757,7 @@ export function App() {
   }, [])
 
   // ── Auth guard — redirect unauthenticated nav to home ─────────────────────
-  const AUTH_VIEWS: View[] = ["feed", "post", "my-listings", "connections", "notifications", "profile"]
+  const AUTH_VIEWS: View[] = ["feed", "post", "my-listings", "connections", "notifications", "profile", "map", "pools"]
   const guardedView: View = !currentUser && AUTH_VIEWS.includes(view) ? "home" : view
 
   const displayName = currentUser?.profile?.display_name ?? "You"
@@ -1608,9 +1804,13 @@ export function App() {
                     searchQuery={searchQuery} setSearchQuery={setSearchQuery}
                     filterType={filterType} setFilterType={setFilterType}
                     filterTag={filterTag} setFilterTag={setFilterTag}
+                    filterCarType={filterCarType} setFilterCarType={setFilterCarType}
+                    filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
                     listings={filteredListings} onConnect={onConnect} loading={feedLoading}
                   />
                 )}
+                {guardedView === "map" && <MapView userCoords={userCoords} currentUserId={currentUser.id} />}
+                {guardedView === "pools" && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
                 {guardedView === "post" && <PostView onPost={onPost} userCoords={userCoords} />}
                 {guardedView === "my-listings" && <MyListingsView myListings={myListings} onCancel={onCancelListing} />}
                 {guardedView === "connections" && (

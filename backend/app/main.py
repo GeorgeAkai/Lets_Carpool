@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from typing import Any, Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -21,6 +22,8 @@ class Settings(BaseSettings):
     jwt_expires_minutes: int = 60 * 24 * 7
 
 
+# ─── Request/Response models ──────────────────────────────────────────────────
+
 class LoginRequest(BaseModel):
     name: str = Field(..., min_length=1, examples=["Ada Lovelace"])
     email: str = Field(..., examples=["ada@berkeley.edu"])
@@ -32,11 +35,16 @@ class ProfileUpdate(BaseModel):
     bio: str | None = None
 
 
+class PhotoUpload(BaseModel):
+    photo_data_url: str  # base64 data URL e.g. "data:image/jpeg;base64,..."
+
+
 class VehicleUpdate(BaseModel):
     make: str | None = None
     model: str | None = None
     color: str | None = None
     seats: int | None = Field(default=None, ge=1)
+    car_type: str | None = None  # sedan, suv, van, minivan, truck, other
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
@@ -58,6 +66,8 @@ class RideRequestCreate(BaseModel):
     flexibility: str
     passenger_count: int = Field(..., ge=1)
     tags: list[str] = Field(default_factory=list)
+    luggage_size: str = "none"           # none, small, medium, large, oversized
+    preferred_car_type: str | None = None
 
 
 class DriverTripCreate(BaseModel):
@@ -67,6 +77,8 @@ class DriverTripCreate(BaseModel):
     flexibility: str
     seats_available: int = Field(..., ge=1)
     tags: list[str] = Field(default_factory=list)
+    luggage_capacity: str = "medium"     # max luggage size accepted
+    car_type: str | None = None          # actual vehicle type
 
 
 class ConnectionCreate(BaseModel):
@@ -97,6 +109,55 @@ class ReportCreate(BaseModel):
     reason: str
 
 
+class PoolCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    community_tag: str = "event"         # church, college, work, event, etc.
+    trip_date: date
+    pickup_location_id: str
+    destination_location_id: str
+    max_participants: int = Field(default=10, ge=2)
+    description: str | None = None
+    seats_per_vehicle: int = Field(default=4, ge=1)
+
+
+class PoolJoin(BaseModel):
+    role: str = "passenger"              # driver or passenger
+
+
+class DriverLocationUpdate(BaseModel):
+    latitude: float
+    longitude: float
+    heading: float | None = None
+    speed_kmh: float | None = None
+
+
+# ─── WebSocket connection manager ─────────────────────────────────────────────
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self._sockets: dict[str, WebSocket] = {}
+
+    async def connect(self, user_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self._sockets[user_id] = ws
+
+    def disconnect(self, user_id: str) -> None:
+        self._sockets.pop(user_id, None)
+
+    async def send(self, user_id: str, data: dict[str, Any]) -> None:
+        ws = self._sockets.get(user_id)
+        if ws:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                self.disconnect(user_id)
+
+    async def broadcast(self, user_ids: list[str], data: dict[str, Any]) -> None:
+        await asyncio.gather(*[self.send(uid, data) for uid in user_ids], return_exceptions=True)
+
+
+# ─── App factory ──────────────────────────────────────────────────────────────
+
 def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Carpool API")
     app.add_middleware(
@@ -108,44 +169,44 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     )
     app.state.store = store or Store()
     app.state.settings = settings or Settings()
+    app.state.ws_manager = ConnectionManager()
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_: Any, exc: DomainError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
+    # ── Core ──────────────────────────────────────────────────────────────────
+
     @app.get("/")
     def root() -> dict[str, Any]:
-        settings = app.state.settings
         return {
             "status": "ok",
-            "service": settings.api_name,
+            "service": app.state.settings.api_name,
             "message": "Carpool API is running. Use /health or /docs for API information.",
         }
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        settings = app.state.settings
+        s = app.state.settings
         return {
             "status": "ok",
-            "service": settings.api_name,
-            "database": {
-                "configured": bool(settings.database_url),
-                "engine": "postgresql",
-                "postgis_extension": "required",
-            },
+            "service": s.api_name,
+            "database": {"configured": bool(s.database_url), "engine": "postgresql", "postgis_extension": "required"},
         }
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
     @app.post("/auth/login")
     def login(payload: LoginRequest) -> dict[str, Any]:
         settings = app.state.settings
         user = app.state.store.authenticate_email(str(payload.email), payload.name)
         access_token = create_access_token(
-            user_id=user.id,
-            email=user.email,
-            secret=settings.jwt_secret,
-            expires_minutes=settings.jwt_expires_minutes,
+            user_id=user.id, email=user.email,
+            secret=settings.jwt_secret, expires_minutes=settings.jwt_expires_minutes,
         )
         return {"access_token": access_token, "token_type": "bearer", "user": serialize_user(app.state.store, user)}
+
+    # ── User / Profile ────────────────────────────────────────────────────────
 
     @app.get("/me")
     def get_me(user: CurrentUser) -> dict[str, Any]:
@@ -156,10 +217,50 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         profile = app.state.store.update_profile(user.id, payload.display_name, payload.photo_url, payload.bio)
         return serialize(profile)
 
+    @app.post("/me/photo")
+    def upload_photo(payload: PhotoUpload, user: CurrentUser) -> dict[str, Any]:
+        profile = app.state.store.upload_photo(user.id, payload.photo_data_url)
+        return serialize(profile)
+
     @app.put("/me/driver-readiness")
     def update_driver_readiness(payload: VehicleUpdate, user: CurrentUser) -> dict[str, Any]:
         vehicle = app.state.store.update_vehicle(user.id, payload.model_dump())
         return serialize(vehicle)
+
+    @app.put("/me/location")
+    async def update_location(payload: DriverLocationUpdate, user: CurrentUser) -> dict[str, Any]:
+        loc = app.state.store.update_driver_location(user.id, payload.model_dump())
+        # Notify nearby logged-in users about this driver
+        profile = app.state.store.profiles.get(user.id)
+        vehicle = app.state.store.vehicles.get(user.id)
+        nearby = app.state.store.get_nearby_drivers(loc.latitude, loc.longitude, radius_meters=8000)
+        nearby_user_ids = [d["user_id"] for d in nearby if d["user_id"] != user.id]
+        await app.state.ws_manager.broadcast(nearby_user_ids, {
+            "type": "driver_nearby",
+            "user_id": user.id,
+            "display_name": profile.display_name if profile else "Driver",
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "heading": loc.heading,
+            "car_type": vehicle.car_type if vehicle else None,
+        })
+        return serialize(loc)
+
+    # ── Nearby drivers (for map view) ─────────────────────────────────────────
+
+    @app.get("/drivers/nearby")
+    def get_nearby_drivers(lat: float, lng: float, radius_meters: float = 10000, user: CurrentUser = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
+        _ = user
+        return app.state.store.get_nearby_drivers(lat, lng, radius_meters)
+
+    # ── Route suggestion (no 3rd-party API) ───────────────────────────────────
+
+    @app.get("/routes/suggest")
+    def suggest_route(pickup_lat: float, pickup_lng: float, dest_lat: float, dest_lng: float, passenger_count: int = 1, user: CurrentUser = None) -> dict[str, Any]:  # type: ignore[assignment]
+        _ = user
+        return app.state.store.suggest_route(pickup_lat, pickup_lng, dest_lat, dest_lng, passenger_count)
+
+    # ── Locations ─────────────────────────────────────────────────────────────
 
     @app.post("/locations")
     def create_location(payload: LocationCreate, user: CurrentUser) -> dict[str, Any]:
@@ -171,6 +272,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def get_location(location_id: str, exact: bool = False, user: CurrentUser | None = Depends(optional_user)) -> dict[str, Any]:
         _ = user
         return app.state.store.location_view(location_id, exact=exact)
+
+    # ── Ride requests ─────────────────────────────────────────────────────────
 
     @app.post("/ride-requests")
     def create_ride_request(payload: RideRequestCreate, user: CurrentUser) -> dict[str, Any]:
@@ -187,6 +290,13 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def cancel_ride_request(request_id: str, user: CurrentUser) -> dict[str, Any]:
         request = app.state.store.cancel_ride_request(user.id, request_id)
         return serialize_ride_request(app.state.store, request, exact=True)
+
+    @app.get("/ride-requests/search")
+    def search_ride_requests(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
+        requests = app.state.store.search_ride_requests(user.id, query.to_store_query())
+        return [serialize_ride_request(app.state.store, request, exact=False) for request in requests]
+
+    # ── Driver trips ──────────────────────────────────────────────────────────
 
     @app.post("/driver-trips")
     def create_driver_trip(payload: DriverTripCreate, user: CurrentUser) -> dict[str, Any]:
@@ -209,10 +319,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         trips = app.state.store.search_driver_trips(user.id, query.to_store_query())
         return [serialize_driver_trip(app.state.store, trip, exact=False) for trip in trips]
 
-    @app.get("/ride-requests/search")
-    def search_ride_requests(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
-        requests = app.state.store.search_ride_requests(user.id, query.to_store_query())
-        return [serialize_ride_request(app.state.store, request, exact=False) for request in requests]
+    # ── Connections ───────────────────────────────────────────────────────────
 
     @app.post("/connections")
     def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
@@ -226,13 +333,32 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return {"status": "ok"}
 
     @app.post("/connections/{connection_id}/transition")
-    def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser) -> dict[str, Any]:
+    async def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser) -> dict[str, Any]:
         connection = app.state.store.transition_connection(user.id, connection_id, payload.action)
+        # Push real-time update to both participants
+        req = app.state.store.ride_requests[connection.ride_request_id]
+        trip = app.state.store.driver_trips[connection.driver_trip_id]
+        participants = [req.rider_id, trip.driver_id]
+        await app.state.ws_manager.broadcast(participants, {
+            "type": "connection_update",
+            "connection_id": connection_id,
+            "status": connection.status,
+        })
         return serialize_connection(app.state.store, connection)
 
     @app.post("/connections/{connection_id}/messages")
-    def add_message(connection_id: str, payload: MessageCreate, user: CurrentUser) -> dict[str, Any]:
+    async def add_message(connection_id: str, payload: MessageCreate, user: CurrentUser) -> dict[str, Any]:
         message = app.state.store.add_message(user.id, connection_id, payload.model_dump())
+        # Push real-time message to the other participant
+        connection = app.state.store.connections[connection_id]
+        req = app.state.store.ride_requests[connection.ride_request_id]
+        trip = app.state.store.driver_trips[connection.driver_trip_id]
+        other_id = trip.driver_id if user.id == req.rider_id else req.rider_id
+        await app.state.ws_manager.send(other_id, {
+            "type": "chat_message",
+            "connection_id": connection_id,
+            "message": serialize(message),
+        })
         return serialize(message)
 
     @app.get("/connections/{connection_id}/messages")
@@ -254,9 +380,44 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         confirmation = app.state.store.confirm_gas_split(user.id, connection_id, payload.model_dump())
         return serialize(confirmation)
 
+    # ── Community Pools ───────────────────────────────────────────────────────
+
+    @app.get("/pools")
+    def list_pools(community_tag: str | None = None, trip_date: date | None = None, user: CurrentUser = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
+        _ = user
+        pools = app.state.store.list_pools(community_tag=community_tag, trip_date=trip_date)
+        return [serialize_pool(app.state.store, p) for p in pools]
+
+    @app.post("/pools")
+    def create_pool(payload: PoolCreate, user: CurrentUser) -> dict[str, Any]:
+        pool = app.state.store.create_pool(user.id, payload.model_dump())
+        return serialize_pool(app.state.store, pool)
+
+    @app.post("/pools/{pool_id}/join")
+    def join_pool(pool_id: str, payload: PoolJoin, user: CurrentUser) -> dict[str, Any]:
+        membership = app.state.store.join_pool(user.id, pool_id, payload.role)
+        return serialize(membership)
+
+    @app.post("/pools/{pool_id}/leave")
+    def leave_pool(pool_id: str, user: CurrentUser) -> dict[str, str]:
+        app.state.store.leave_pool(user.id, pool_id)
+        return {"status": "left"}
+
+    @app.get("/pools/{pool_id}")
+    def get_pool(pool_id: str, user: CurrentUser) -> dict[str, Any]:
+        _ = user
+        pool = app.state.store.pools.get(pool_id)
+        if not pool:
+            raise HTTPException(status_code=404, detail="Pool not found")
+        return serialize_pool(app.state.store, pool)
+
+    # ── Notifications ─────────────────────────────────────────────────────────
+
     @app.get("/notifications")
     def notifications(user: CurrentUser) -> list[dict[str, Any]]:
         return [serialize(notification) for notification in app.state.store.notifications.get(user.id, [])]
+
+    # ── User actions ──────────────────────────────────────────────────────────
 
     @app.post("/users/{target_user_id}/block")
     def block_user(target_user_id: str, user: CurrentUser) -> dict[str, str]:
@@ -268,8 +429,36 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         report = app.state.store.report_user(user.id, target_user_id, payload.reason)
         return serialize(report)
 
+    # ── WebSocket ─────────────────────────────────────────────────────────────
+
+    @app.websocket("/ws/{user_id}")
+    async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str | None = None) -> None:
+        # Verify token passed as query param
+        settings = app.state.settings
+        if token:
+            try:
+                decoded_id = decode_access_token(token, settings.jwt_secret)
+                if decoded_id != user_id:
+                    await websocket.close(code=4001)
+                    return
+            except DomainError:
+                await websocket.close(code=4001)
+                return
+        manager: ConnectionManager = app.state.ws_manager
+        await manager.connect(user_id, websocket)
+        try:
+            while True:
+                data = await websocket.receive_json()
+                # Echo back for ping/keepalive
+                if data.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+        except WebSocketDisconnect:
+            manager.disconnect(user_id)
+
     return app
 
+
+# ─── Query helpers ────────────────────────────────────────────────────────────
 
 class SearchQuery(BaseModel):
     destination_latitude: float | None = None
@@ -280,10 +469,14 @@ class SearchQuery(BaseModel):
     pickup_radius_meters: float = 5000
     target_date: date | None = None
     tag: str | None = None
+    car_type: str | None = None          # filter driver trips by car type
+    luggage_size: str | None = None      # filter driver trips that can handle this luggage
 
     def to_store_query(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)
 
+
+# ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 def current_user(request: Request, authorization: Annotated[str | None, Header()] = None) -> User:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -305,6 +498,8 @@ def optional_user(request: Request, authorization: Annotated[str | None, Header(
 
 CurrentUser = Annotated[User, Depends(current_user)]
 
+
+# ─── Serializers ──────────────────────────────────────────────────────────────
 
 def serialize_user(store: Store, user: User) -> dict[str, Any]:
     return {**serialize(user), "profile": serialize(store.profiles[user.id]), "vehicle": serialize(store.vehicles.get(user.id))}
@@ -332,6 +527,16 @@ def serialize_connection(store: Store, connection: Any) -> dict[str, Any]:
     data = serialize(connection)
     data["ride_request"] = serialize_ride_request(store, store.ride_requests[connection.ride_request_id], exact=connection.status == "accepted")
     data["driver_trip"] = serialize_driver_trip(store, store.driver_trips[connection.driver_trip_id], exact=connection.status == "accepted")
+    return data
+
+
+def serialize_pool(store: Store, pool: Any) -> dict[str, Any]:
+    data = serialize(pool)
+    data["pickup"] = serialize_location(store, pool.pickup_location_id, exact=True)
+    data["destination"] = serialize_location(store, pool.destination_location_id, exact=True)
+    members = store.pool_memberships.get(pool.id, [])
+    data["member_count"] = len(members)
+    data["members"] = [serialize(m) for m in members]
     return data
 
 

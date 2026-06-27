@@ -9,8 +9,19 @@ from uuid import uuid4
 
 ListingStatus = Literal["open", "expired", "matched", "cancelled", "completed"]
 ConnectionStatus = Literal["pending", "expired", "accepted", "declined", "cancelled", "completed"]
+LuggageSize = Literal["none", "small", "medium", "large", "oversized"]
+CarType = Literal["sedan", "suv", "van", "minivan", "truck", "other"]
+PoolStatus = Literal["open", "full", "cancelled", "completed"]
 
-ALLOWED_TAGS = {"airport", "student"}
+ALLOWED_TAGS = {"airport", "student", "church", "college", "work", "event"}
+ALLOWED_LUGGAGE: set[str] = {"none", "small", "medium", "large", "oversized"}
+ALLOWED_CAR_TYPES: set[str] = {"sedan", "suv", "van", "minivan", "truck", "other"}
+
+# Gas price defaults used for fare calculation
+_GAS_PRICE_PER_GALLON_USD = 3.50
+_MPG_DEFAULT = 28.0
+_KM_PER_MILE = 1.60934
+
 PENDING_CANNED_MESSAGES = {
     "timing": "Can we coordinate the exact timing?",
     "pickup": "Can we confirm the pickup area?",
@@ -46,6 +57,16 @@ def haversine_meters(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> 
     return 2 * radius * asin(sqrt(h))
 
 
+def calculate_fare_cents(distance_km: float, passenger_count: int = 1,
+                          gas_price_per_gallon: float = _GAS_PRICE_PER_GALLON_USD,
+                          mpg: float = _MPG_DEFAULT) -> int:
+    """Fair charge per passenger based on distance, gas price, and fuel efficiency."""
+    km_per_gallon = mpg * _KM_PER_MILE
+    gas_cost_usd = (distance_km / km_per_gallon) * gas_price_per_gallon
+    per_passenger = gas_cost_usd / max(1, passenger_count)
+    return max(100, round(per_passenger * 100))
+
+
 @dataclass
 class User:
     id: str
@@ -62,6 +83,7 @@ class Profile:
     display_name: str
     photo_url: str | None = None
     bio: str | None = None
+    photo_verified: bool = False
 
 
 @dataclass
@@ -71,6 +93,7 @@ class Vehicle:
     model: str | None = None
     color: str | None = None
     seats: int | None = None
+    car_type: str | None = None  # sedan, suv, van, minivan, truck, other
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
@@ -105,6 +128,8 @@ class RideRequest:
     tags: list[str]
     status: ListingStatus
     created_at: datetime
+    luggage_size: str = "none"           # none, small, medium, large, oversized
+    preferred_car_type: str | None = None  # preferred vehicle type
 
 
 @dataclass
@@ -120,6 +145,8 @@ class DriverTrip:
     tags: list[str]
     status: ListingStatus
     created_at: datetime
+    luggage_capacity: str = "medium"     # max luggage size accepted
+    car_type: str | None = None          # actual vehicle type
 
 
 @dataclass
@@ -175,6 +202,46 @@ class Report:
     created_at: datetime
 
 
+# ─── Community Pools ──────────────────────────────────────────────────────────
+
+@dataclass
+class Pool:
+    id: str
+    name: str
+    organizer_id: str
+    community_tag: str          # church, college, work, event, etc.
+    trip_date: date
+    pickup_location_id: str
+    destination_location_id: str
+    max_participants: int
+    status: PoolStatus
+    created_at: datetime
+    description: str | None = None
+    seats_per_vehicle: int = 4
+
+
+@dataclass
+class PoolMembership:
+    pool_id: str
+    user_id: str
+    role: str                   # organizer, driver, passenger
+    joined_at: datetime
+
+
+# ─── Live Driver Location ─────────────────────────────────────────────────────
+
+@dataclass
+class DriverLocation:
+    user_id: str
+    latitude: float
+    longitude: float
+    heading: float | None = None
+    speed_kmh: float | None = None
+    updated_at: datetime = field(default_factory=now_utc)
+
+
+# ─── Store ────────────────────────────────────────────────────────────────────
+
 class Store:
     def __init__(self) -> None:
         self.users: dict[str, User] = {}
@@ -190,6 +257,12 @@ class Store:
         self.notifications: dict[str, list[Notification]] = {}
         self.blocks: set[tuple[str, str]] = set()
         self.reports: dict[str, Report] = {}
+        # New collections
+        self.pools: dict[str, Pool] = {}
+        self.pool_memberships: dict[str, list[PoolMembership]] = {}  # keyed by pool_id
+        self.driver_locations: dict[str, DriverLocation] = {}
+
+    # ─── Auth ─────────────────────────────────────────────────────────────────
 
     def authenticate_email(self, email: str, display_name: str) -> User:
         normalized_email = email.strip().lower()
@@ -220,6 +293,8 @@ class Store:
             raise DomainError("Invalid or expired token", 401)
         return user
 
+    # ─── Profile ──────────────────────────────────────────────────────────────
+
     def update_profile(self, user_id: str, display_name: str, photo_url: str | None, bio: str | None) -> Profile:
         profile = self.profiles[user_id]
         profile.display_name = display_name
@@ -227,21 +302,31 @@ class Store:
         profile.bio = bio
         return profile
 
+    def upload_photo(self, user_id: str, photo_data_url: str) -> Profile:
+        """Store a base64 data URL as the profile photo."""
+        if not photo_data_url.startswith("data:image/"):
+            raise DomainError("Photo must be a valid image data URL")
+        profile = self.profiles[user_id]
+        profile.photo_url = photo_data_url
+        profile.photo_verified = True
+        return profile
+
+    # ─── Vehicle ──────────────────────────────────────────────────────────────
+
     def update_vehicle(self, user_id: str, data: dict[str, Any]) -> Vehicle:
         vehicle = self.vehicles.get(user_id, Vehicle(user_id=user_id))
         for field_name in (
-            "make",
-            "model",
-            "color",
-            "seats",
-            "has_license",
-            "has_insurance",
-            "has_good_driving_record",
+            "make", "model", "color", "seats", "car_type",
+            "has_license", "has_insurance", "has_good_driving_record",
         ):
-            if field_name in data:
+            if field_name in data and data[field_name] is not None:
                 setattr(vehicle, field_name, data[field_name])
+        if data.get("car_type") and data["car_type"] not in ALLOWED_CAR_TYPES:
+            raise DomainError(f"Invalid car type: {data['car_type']}")
         self.vehicles[user_id] = vehicle
         return vehicle
+
+    # ─── Locations ────────────────────────────────────────────────────────────
 
     def create_location(self, data: dict[str, Any]) -> Location:
         loc = Location(
@@ -256,12 +341,20 @@ class Store:
         self.locations[loc.id] = loc
         return loc
 
+    # ─── Ride Requests ────────────────────────────────────────────────────────
+
     def create_ride_request(self, rider_id: str, data: dict[str, Any]) -> RideRequest:
         self._validate_location_ids(data["pickup_location_id"], data["destination_location_id"])
         tags = self._validate_tags(data.get("tags") or [])
         passenger_count = int(data["passenger_count"])
         if passenger_count < 1:
             raise DomainError("Passenger count must be at least 1")
+        luggage_size = data.get("luggage_size") or "none"
+        if luggage_size not in ALLOWED_LUGGAGE:
+            raise DomainError(f"Invalid luggage size: {luggage_size}")
+        preferred_car_type = data.get("preferred_car_type")
+        if preferred_car_type and preferred_car_type not in ALLOWED_CAR_TYPES:
+            raise DomainError(f"Invalid car type: {preferred_car_type}")
         request = RideRequest(
             id=new_id("rrq"),
             rider_id=rider_id,
@@ -273,9 +366,20 @@ class Store:
             tags=tags,
             status="open",
             created_at=now_utc(),
+            luggage_size=luggage_size,
+            preferred_car_type=preferred_car_type,
         )
         self.ride_requests[request.id] = request
         return request
+
+    def cancel_ride_request(self, user_id: str, request_id: str) -> RideRequest:
+        request = self.ride_requests[request_id]
+        if request.rider_id != user_id:
+            raise DomainError("Only the rider can cancel this request", 403)
+        request.status = "cancelled"
+        return request
+
+    # ─── Driver Trips ─────────────────────────────────────────────────────────
 
     def create_driver_trip(self, driver_id: str, data: dict[str, Any]) -> DriverTrip:
         self._validate_location_ids(data["pickup_location_id"], data["destination_location_id"])
@@ -283,6 +387,12 @@ class Store:
         seats_available = int(data["seats_available"])
         if seats_available < 1:
             raise DomainError("Seats available must be at least 1")
+        luggage_capacity = data.get("luggage_capacity") or "medium"
+        if luggage_capacity not in ALLOWED_LUGGAGE:
+            raise DomainError(f"Invalid luggage capacity: {luggage_capacity}")
+        car_type = data.get("car_type")
+        if car_type and car_type not in ALLOWED_CAR_TYPES:
+            raise DomainError(f"Invalid car type: {car_type}")
         trip = DriverTrip(
             id=new_id("trp"),
             driver_id=driver_id,
@@ -295,16 +405,11 @@ class Store:
             tags=tags,
             status="open",
             created_at=now_utc(),
+            luggage_capacity=luggage_capacity,
+            car_type=car_type,
         )
         self.driver_trips[trip.id] = trip
         return trip
-
-    def cancel_ride_request(self, user_id: str, request_id: str) -> RideRequest:
-        request = self.ride_requests[request_id]
-        if request.rider_id != user_id:
-            raise DomainError("Only the rider can cancel this request", 403)
-        request.status = "cancelled"
-        return request
 
     def cancel_driver_trip(self, user_id: str, trip_id: str) -> DriverTrip:
         trip = self.driver_trips[trip_id]
@@ -317,6 +422,8 @@ class Store:
         for listing in [*self.ride_requests.values(), *self.driver_trips.values()]:
             if listing.status == "open" and listing.target_date < today:
                 listing.status = "expired"
+
+    # ─── Search ───────────────────────────────────────────────────────────────
 
     def search_driver_trips(self, user_id: str, query: dict[str, Any]) -> list[DriverTrip]:
         return [
@@ -335,6 +442,8 @@ class Store:
             and not self.is_blocked(user_id, request.rider_id)
             and self._listing_matches(request, query)
         ]
+
+    # ─── Connections ──────────────────────────────────────────────────────────
 
     def create_connection(self, user_id: str, data: dict[str, Any]) -> Connection:
         request = self.ride_requests[data["ride_request_id"]]
@@ -410,6 +519,8 @@ class Store:
                 connection.status = "expired"
                 connection.updated_at = now_utc()
 
+    # ─── Messages ─────────────────────────────────────────────────────────────
+
     def add_message(self, user_id: str, connection_id: str, data: dict[str, Any]) -> Message:
         connection = self.connections[connection_id]
         request = self.ride_requests[connection.ride_request_id]
@@ -444,14 +555,28 @@ class Store:
         self.notify(other_id, "chat_message", "New chat message", content)
         return message
 
+    # ─── Gas Split / Fare ─────────────────────────────────────────────────────
+
     def suggest_gas_split(self, connection_id: str) -> dict[str, Any]:
         connection = self.connections[connection_id]
         request = self.ride_requests[connection.ride_request_id]
+        trip = self.driver_trips[connection.driver_trip_id]
         pickup = self.locations[request.pickup_location_id]
         destination = self.locations[request.destination_location_id]
         distance_km = haversine_meters(pickup.latitude, pickup.longitude, destination.latitude, destination.longitude) / 1000
-        cents = max(100, round(distance_km * 18))
-        return {"amount_cents": cents, "currency": "USD", "assumptions": {"distance_km": round(distance_km, 2), "cents_per_km": 18}}
+        passenger_count = max(1, request.passenger_count)
+        cents = calculate_fare_cents(distance_km, passenger_count)
+        return {
+            "amount_cents": cents,
+            "currency": "USD",
+            "assumptions": {
+                "distance_km": round(distance_km, 2),
+                "passenger_count": passenger_count,
+                "gas_price_per_gallon_usd": _GAS_PRICE_PER_GALLON_USD,
+                "mpg": _MPG_DEFAULT,
+                "method": "haversine_distance",
+            },
+        }
 
     def confirm_gas_split(self, user_id: str, connection_id: str, data: dict[str, Any]) -> GasSplitConfirmation:
         connection = self.connections[connection_id]
@@ -475,6 +600,138 @@ class Store:
         self.notify(other_id, "gas_split_confirmed", "Gas split confirmed", "A participant confirmed the gas split.")
         return confirmation
 
+    # ─── Community Pools ──────────────────────────────────────────────────────
+
+    def create_pool(self, organizer_id: str, data: dict[str, Any]) -> Pool:
+        self._validate_location_ids(data["pickup_location_id"], data["destination_location_id"])
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise DomainError("Pool name is required")
+        community_tag = str(data.get("community_tag") or "event").strip()
+        max_participants = int(data.get("max_participants") or 10)
+        if max_participants < 2:
+            raise DomainError("A pool needs at least 2 participants")
+        pool = Pool(
+            id=new_id("pol"),
+            name=name,
+            organizer_id=organizer_id,
+            community_tag=community_tag,
+            trip_date=data["trip_date"],
+            pickup_location_id=data["pickup_location_id"],
+            destination_location_id=data["destination_location_id"],
+            max_participants=max_participants,
+            status="open",
+            created_at=now_utc(),
+            description=data.get("description"),
+            seats_per_vehicle=int(data.get("seats_per_vehicle") or 4),
+        )
+        self.pools[pool.id] = pool
+        self.pool_memberships[pool.id] = [
+            PoolMembership(pool_id=pool.id, user_id=organizer_id, role="organizer", joined_at=now_utc())
+        ]
+        return pool
+
+    def join_pool(self, user_id: str, pool_id: str, role: str = "passenger") -> PoolMembership:
+        pool = self.pools.get(pool_id)
+        if not pool:
+            raise DomainError("Pool not found", 404)
+        if pool.status != "open":
+            raise DomainError("Pool is not open for new members")
+        members = self.pool_memberships.get(pool_id, [])
+        if any(m.user_id == user_id for m in members):
+            raise DomainError("Already a member of this pool")
+        if len(members) >= pool.max_participants:
+            pool.status = "full"
+            raise DomainError("Pool is full")
+        membership = PoolMembership(pool_id=pool_id, user_id=user_id, role=role, joined_at=now_utc())
+        self.pool_memberships.setdefault(pool_id, []).append(membership)
+        if len(self.pool_memberships[pool_id]) >= pool.max_participants:
+            pool.status = "full"
+        self.notify(pool.organizer_id, "pool_joined", "New pool member", f"Someone joined your pool: {pool.name}")
+        return membership
+
+    def leave_pool(self, user_id: str, pool_id: str) -> None:
+        pool = self.pools.get(pool_id)
+        if not pool:
+            raise DomainError("Pool not found", 404)
+        members = self.pool_memberships.get(pool_id, [])
+        original_len = len(members)
+        self.pool_memberships[pool_id] = [m for m in members if m.user_id != user_id]
+        if len(self.pool_memberships[pool_id]) == original_len:
+            raise DomainError("User is not a member of this pool")
+        if pool.status == "full":
+            pool.status = "open"
+
+    def list_pools(self, community_tag: str | None = None, trip_date: date | None = None) -> list[Pool]:
+        return [
+            p for p in self.pools.values()
+            if p.status in {"open", "full"}
+            and (community_tag is None or p.community_tag == community_tag)
+            and (trip_date is None or p.trip_date == trip_date)
+        ]
+
+    # ─── Driver Location Tracking ─────────────────────────────────────────────
+
+    def update_driver_location(self, user_id: str, data: dict[str, Any]) -> DriverLocation:
+        loc = DriverLocation(
+            user_id=user_id,
+            latitude=float(data["latitude"]),
+            longitude=float(data["longitude"]),
+            heading=data.get("heading"),
+            speed_kmh=data.get("speed_kmh"),
+            updated_at=now_utc(),
+        )
+        self.driver_locations[user_id] = loc
+        return loc
+
+    def get_nearby_drivers(self, lat: float, lng: float, radius_meters: float = 10000) -> list[dict[str, Any]]:
+        """Return drivers with live locations within radius_meters of (lat, lng)."""
+        results = []
+        stale_cutoff = now_utc().replace(tzinfo=None)  # locations older than 5 min are stale
+        for user_id, loc in self.driver_locations.items():
+            dist = haversine_meters(lat, lng, loc.latitude, loc.longitude)
+            if dist <= radius_meters:
+                profile = self.profiles.get(user_id)
+                vehicle = self.vehicles.get(user_id)
+                results.append({
+                    "user_id": user_id,
+                    "display_name": profile.display_name if profile else "Driver",
+                    "latitude": loc.latitude,
+                    "longitude": loc.longitude,
+                    "heading": loc.heading,
+                    "speed_kmh": loc.speed_kmh,
+                    "distance_meters": round(dist),
+                    "car_type": vehicle.car_type if vehicle else None,
+                    "vehicle": f"{vehicle.make or ''} {vehicle.model or ''}".strip() if vehicle else None,
+                    "updated_at": loc.updated_at.isoformat(),
+                })
+        results.sort(key=lambda r: r["distance_meters"])
+        return results
+
+    def suggest_route(self, pickup_lat: float, pickup_lng: float,
+                      dest_lat: float, dest_lng: float,
+                      passenger_count: int = 1) -> dict[str, Any]:
+        """Return a route estimate using straight-line distance (no 3rd-party API)."""
+        distance_km = haversine_meters(pickup_lat, pickup_lng, dest_lat, dest_lng) / 1000
+        # Road distance is typically 1.3× the straight-line distance
+        road_distance_km = round(distance_km * 1.3, 2)
+        # Urban average including traffic: ~35 km/h
+        duration_minutes = round((road_distance_km / 35) * 60)
+        fare_cents = calculate_fare_cents(road_distance_km, passenger_count)
+        return {
+            "distance_km": road_distance_km,
+            "straight_line_km": round(distance_km, 2),
+            "duration_minutes": duration_minutes,
+            "fare_suggestion_cents": fare_cents,
+            "fare_assumptions": {
+                "gas_price_per_gallon_usd": _GAS_PRICE_PER_GALLON_USD,
+                "mpg": _MPG_DEFAULT,
+                "passenger_count": passenger_count,
+            },
+        }
+
+    # ─── Notifications ────────────────────────────────────────────────────────
+
     def notify(self, user_id: str, type_: str, title: str, body: str) -> Notification:
         notification = Notification(
             id=new_id("ntf"),
@@ -486,6 +743,8 @@ class Store:
         )
         self.notifications.setdefault(user_id, []).append(notification)
         return notification
+
+    # ─── Blocks / Reports ─────────────────────────────────────────────────────
 
     def block_user(self, blocker_id: str, blocked_id: str) -> None:
         if blocker_id == blocked_id:
@@ -508,12 +767,16 @@ class Store:
     def is_blocked(self, user_a: str, user_b: str) -> bool:
         return (user_a, user_b) in self.blocks or (user_b, user_a) in self.blocks
 
+    # ─── Views ────────────────────────────────────────────────────────────────
+
     def location_view(self, location_id: str, exact: bool) -> dict[str, Any]:
         loc = self.locations[location_id]
         base: dict[str, Any] = {"id": loc.id, "label": loc.label if exact else loc.approximate_label, "exact": exact}
         if exact:
             base.update({"latitude": loc.latitude, "longitude": loc.longitude})
         return base
+
+    # ─── Private helpers ──────────────────────────────────────────────────────
 
     def _validate_location_ids(self, pickup_id: str, destination_id: str) -> None:
         if pickup_id not in self.locations or destination_id not in self.locations:
@@ -532,14 +795,24 @@ class Store:
             return False
         if query.get("tag") and query["tag"] not in listing.tags:
             return False
+        # Car type filter: rider specifies preferred_car_type, driver has car_type
+        if query.get("car_type"):
+            if isinstance(listing, DriverTrip) and listing.car_type and listing.car_type != query["car_type"]:
+                return False
+        # Luggage filter: riders need capacity >= their luggage size
+        if query.get("luggage_size"):
+            luggage_order = ["none", "small", "medium", "large", "oversized"]
+            if isinstance(listing, DriverTrip):
+                needed = luggage_order.index(query["luggage_size"])
+                capacity = luggage_order.index(listing.luggage_capacity)
+                if capacity < needed:
+                    return False
         destination = self.locations[listing.destination_location_id]
         pickup = self.locations[listing.pickup_location_id]
         if query.get("destination_latitude") is not None:
             destination_distance = haversine_meters(
-                destination.latitude,
-                destination.longitude,
-                query["destination_latitude"],
-                query["destination_longitude"],
+                destination.latitude, destination.longitude,
+                query["destination_latitude"], query["destination_longitude"],
             )
             if destination_distance > query.get("destination_radius_meters", 1000):
                 return False
