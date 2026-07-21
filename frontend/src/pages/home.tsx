@@ -1,5 +1,6 @@
-import {
+import React, {
   useState, useMemo, useEffect, useCallback, useRef, useContext, type CSSProperties,
+  useId,
 } from 'react'
 import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
@@ -13,6 +14,7 @@ import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView } from '../MapView'
+import type { TripRoute } from '../MapView'
 import { PoolView } from '../PoolView'
 import { authClient } from '../lib/auth'
 
@@ -42,9 +44,156 @@ interface MyListing {
 }
 
 interface Connection {
-  id: string; withUser: { name: string; initials: string }; withUserId: string
-  myRole: 'rider' | 'driver'; route: string; date: string; status: ConnStatus
-  splitConfirmed: boolean; unreadMessages: number; driverTripId: string; rideRequestId: string
+  id: string
+  withUser: { name: string; initials: string; photoUrl: string | null }
+  withUserId: string
+  myRole: 'rider' | 'driver'
+  route: string
+  date: string
+  status: ConnStatus
+  splitConfirmed: boolean
+  unreadMessages: number
+  driverTripId: string
+  rideRequestId: string
+  pickupLat?: number; pickupLng?: number; pickupLabel?: string
+  destLat?: number; destLng?: number; destLabel?: string
+}
+
+interface LocationValue {
+  label: string
+  lat: number
+  lng: number
+}
+
+// ─── Location autocomplete ────────────────────────────────────────────────────
+
+interface NominatimResult {
+  place_id: number
+  display_name: string
+  name: string
+  lat: string
+  lon: string
+  address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
+}
+
+function shortLabel(r: NominatimResult): string {
+  const parts = [r.name || r.display_name.split(',')[0]]
+  const a = r.address ?? {}
+  const city = a.city ?? a.town ?? a.village
+  if (city) parts.push(city)
+  if (a.state) parts.push(a.state)
+  return parts.filter(Boolean).join(', ')
+}
+
+function LocationInput({
+  label, value, onChange, placeholder, required,
+}: {
+  label: string
+  value: LocationValue | null
+  onChange: (v: LocationValue | null) => void
+  placeholder: string
+  required?: boolean
+}) {
+  const [query, setQuery] = useState(value?.label ?? '')
+  const [suggestions, setSuggestions] = useState<NominatimResult[]>([])
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const listboxId = useId()
+
+  useEffect(() => {
+    setQuery(value?.label ?? '')
+  }, [value?.label])
+
+  const search = useCallback((q: string) => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    if (!q.trim()) { setSuggestions([]); setOpen(false); return }
+    debounceRef.current = setTimeout(async () => {
+      setLoading(true)
+      try {
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1`,
+          { headers: { 'Accept-Language': 'en' } },
+        )
+        const data: NominatimResult[] = await res.json()
+        setSuggestions(data)
+        setOpen(data.length > 0)
+      } catch { /* network error — silently ignore */ } finally {
+        setLoading(false)
+      }
+    }, 350)
+  }, [])
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const select = (r: NominatimResult) => {
+    const lbl = shortLabel(r)
+    setQuery(lbl)
+    onChange({ label: lbl, lat: parseFloat(r.lat), lng: parseFloat(r.lon) })
+    setOpen(false)
+    setSuggestions([])
+  }
+
+  return (
+    <div ref={containerRef} className="space-y-1.5">
+      <label className="text-sm font-medium">{label}</label>
+      <div className="relative">
+        <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+        <input
+          type="text"
+          required={required}
+          placeholder={placeholder}
+          value={query}
+          autoComplete="off"
+          aria-autocomplete="list"
+          aria-controls={listboxId}
+          aria-expanded={open}
+          onChange={e => {
+            setQuery(e.target.value)
+            onChange(null)
+            search(e.target.value)
+          }}
+          onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
+          className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors text-foreground placeholder:text-muted-foreground"
+        />
+        {loading && (
+          <div className="absolute right-3 top-1/2 -translate-y-1/2 size-3.5 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
+        )}
+        {open && suggestions.length > 0 && (
+          <ul
+            id={listboxId}
+            role="listbox"
+            className="absolute z-50 top-full mt-1.5 w-full bg-card border border-border rounded-2xl shadow-xl overflow-hidden"
+          >
+            {suggestions.map(r => (
+              <li key={r.place_id} role="option" aria-selected={false}>
+                <button
+                  type="button"
+                  onMouseDown={e => { e.preventDefault(); select(r) }}
+                  className="w-full text-left px-4 py-3 text-sm hover:bg-muted transition-colors flex items-start gap-3"
+                >
+                  <MapPin className="size-3.5 text-primary shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="font-medium text-foreground truncate">{shortLabel(r)}</p>
+                    <p className="text-xs text-muted-foreground truncate mt-0.5">{r.display_name}</p>
+                  </div>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  )
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -148,23 +297,35 @@ function requestToMyListing(req: api.ApiRideRequest): MyListing {
 function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
   const isDriver = conn.driver_trip.driver_id === currentUserId
   const withUserId = isDriver ? conn.ride_request.rider_id : conn.driver_trip.driver_id
-  const otherName = isDriver ? 'Rider' : 'Driver'
+  const profile = isDriver ? conn.rider_profile : conn.driver_profile
+  const otherName = profile?.display_name ?? (isDriver ? 'Rider' : 'Driver')
+  const trip = conn.driver_trip
   return {
     id: conn.id,
-    withUser: { name: otherName, initials: toInitials(otherName) },
-    withUserId, myRole: isDriver ? 'driver' : 'rider',
-    route: `${conn.driver_trip.pickup.label} → ${conn.driver_trip.destination.label}`,
-    date: conn.driver_trip.target_date,
+    withUser: { name: otherName, initials: toInitials(otherName), photoUrl: profile?.photo_url ?? null },
+    withUserId,
+    myRole: isDriver ? 'driver' : 'rider',
+    route: `${trip.pickup.label} → ${trip.destination.label}`,
+    date: trip.target_date,
     status: conn.status as ConnStatus,
     splitConfirmed: false, unreadMessages: 0,
     driverTripId: conn.driver_trip_id, rideRequestId: conn.ride_request_id,
+    pickupLat: trip.pickup.latitude,
+    pickupLng: trip.pickup.longitude,
+    pickupLabel: trip.pickup.label,
+    destLat: trip.destination.latitude,
+    destLng: trip.destination.longitude,
+    destLabel: trip.destination.label,
   }
 }
 
 // ─── Small utility components ─────────────────────────────────────────────────
 
-function Avatar({ initials, size = 'md' }: { initials: string; size?: 'sm' | 'md' | 'lg' }) {
+function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'lg'; photoUrl?: string | null }) {
   const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', lg: 'size-14 text-xl' }[size]
+  if (photoUrl) {
+    return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
+  }
   return (
     <div style={MONO} className={`${cls} rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0`}>
       {initials}
@@ -420,8 +581,8 @@ function FeedView({
 
 function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null }) {
   const [type, setType] = useState<ListingType>('driver')
-  const [from, setFrom] = useState('')
-  const [to, setTo] = useState('')
+  const [from, setFrom] = useState<LocationValue | null>(null)
+  const [to, setTo] = useState<LocationValue | null>(null)
   const [date, setDate] = useState('')
   const [flexibility, setFlexibility] = useState<Flexibility>('morning')
   const [seats, setSeats] = useState('3')
@@ -439,10 +600,14 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
   const toggleTag = (tag: RideTag) => setTags(prev => { const n = new Set(prev); n.has(tag) ? n.delete(tag) : n.add(tag); return n })
 
   const handleSubmit = async (e: { preventDefault(): void }) => {
-    e.preventDefault(); setSubmitted(true); setError('')
+    e.preventDefault()
+    if (!from || !to) { setError('Please select both pickup and destination from the suggestions'); return }
+    setSubmitted(true); setError('')
     try {
-      const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
-      const [pickupLoc, destLoc] = await Promise.all([api.createLocation(from, lat, lng), api.createLocation(to, lat, lng)])
+      const [pickupLoc, destLoc] = await Promise.all([
+        api.createLocation(from.label, from.lat, from.lng),
+        api.createLocation(to.label, to.lat, to.lng),
+      ])
       if (type === 'driver') {
         const trip = await api.createDriverTrip({
           pickup_location_id: pickupLoc.id, destination_location_id: destLoc.id,
@@ -481,15 +646,8 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
 
       <form onSubmit={handleSubmit} className="space-y-5">
         <div className="grid grid-cols-2 gap-3">
-          {[['From', from, setFrom, 'Your area'], ['To', to, setTo, 'Destination']].map(([label, value, setter, ph]) => (
-            <div key={label as string} className="space-y-1.5">
-              <label className="text-sm font-medium">{label as string}</label>
-              <div className="relative">
-                <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
-                <input required type="text" placeholder={ph as string} value={value as string} onChange={e => (setter as (v: string) => void)(e.target.value)} className={iconInputCls} />
-              </div>
-            </div>
-          ))}
+          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required />
+          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required />
         </div>
 
         <div className="grid grid-cols-2 gap-3">
@@ -650,12 +808,14 @@ function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onC
 // ─── Connection card ──────────────────────────────────────────────────────────
 
 function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast,
+  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead,
 }: {
   connection: Connection; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
+  onViewRoute: (conn: Connection) => void
+  onMarkRead: (id: string) => void
 }) {
   const [expanded, setExpanded] = useState<'chat' | 'gassplit' | 'blockreport' | null>(null)
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
@@ -673,13 +833,26 @@ function ConnectionCard({
   const toggleSection = async (section: 'chat' | 'gassplit' | 'blockreport') => {
     const next = expanded === section ? null : section
     setExpanded(next)
-    if (next === 'chat' && !msgsLoaded) {
-      try { const fetched = await api.getMessages(connection.id); setMsgs(fetched); setMsgsLoaded(true) } catch { /* ignore */ }
+    if (next === 'chat') {
+      onMarkRead(connection.id)
+      if (!msgsLoaded) {
+        try { const fetched = await api.getMessages(connection.id); setMsgs(fetched); setMsgsLoaded(true) } catch { /* ignore */ }
+      }
+      setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100)
     }
     if (next === 'gassplit' && !gasSuggestion) {
       try { const s = await api.suggestGasSplit(connection.id); setGasSuggestion(s); setSplitAmount(String((s.amount_cents / 100).toFixed(2))) } catch { /* ignore */ }
     }
   }
+
+  // Append incoming WS messages from parent-updated connection (via unreadMessages bump)
+  const prevUnread = useRef(connection.unreadMessages)
+  useEffect(() => {
+    if (connection.unreadMessages > prevUnread.current && expanded !== 'chat') {
+      // message arrived while chat closed — will show count on badge
+    }
+    prevUnread.current = connection.unreadMessages
+  }, [connection.unreadMessages, expanded])
 
   const sendCanned = async (key: string) => {
     setSending(true)
@@ -717,83 +890,136 @@ function ConnectionCard({
   }
 
   const { status } = connection
+  const hasRouteCoords = !!(connection.pickupLat && connection.destLat)
 
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className="bg-card rounded-3xl border border-border p-6 space-y-4">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <span className="text-sm text-muted-foreground">{connection.myRole === 'driver' ? 'As driver' : 'As rider'}</span>
-          <h2 className="mt-1 text-xl font-semibold text-foreground">{connection.withUser.name}</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">{connection.route}</p>
-        </div>
-        <div className="flex flex-col items-end gap-2">
-          <div className="flex items-center gap-2">
-            <button onClick={() => toggleSection('blockreport')} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors"><MoreHorizontal className="size-4" /></button>
-            <Avatar initials={connection.withUser.initials} />
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className="bg-card rounded-3xl border border-border overflow-hidden">
+      {/* Header strip */}
+      <div className="px-6 pt-6 pb-4 space-y-4">
+        <div className="flex items-start justify-between gap-4">
+          {/* Partner info */}
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="relative shrink-0">
+              <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
+              {connection.unreadMessages > 0 && (
+                <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
+              )}
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">{connection.myRole === 'driver' ? 'You are driving' : 'You are riding with'}</span>
+              </div>
+              <h2 className="text-base font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+              <p className="text-xs text-muted-foreground mt-0.5 truncate">{connection.route}</p>
+            </div>
           </div>
-          <ConnStatusBadge status={status} />
+          <div className="flex flex-col items-end gap-2 shrink-0">
+            <div className="flex items-center gap-1">
+              <button onClick={() => toggleSection('blockreport')} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors"><MoreHorizontal className="size-4" /></button>
+            </div>
+            <ConnStatusBadge status={status} />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+          <span className="inline-flex items-center gap-1"><Calendar className="size-3.5" />{connection.date}</span>
+          <span className="inline-flex items-center gap-1"><MessageCircle className="size-3.5" />{msgs.length || (msgsLoaded ? 0 : '…')} message{msgs.length !== 1 ? 's' : ''}</span>
+          {splitDone && <span className="inline-flex items-center gap-1 text-green-700"><Check className="size-3.5" />Split confirmed</span>}
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-3 text-sm text-muted-foreground">
-        <span className="inline-flex items-center gap-1"><Calendar className="size-4" />{connection.date}</span>
-        <span className="inline-flex items-center gap-1"><MessageCircle className="size-4" />{msgs.length} messages</span>
-        {splitDone && <span className="inline-flex items-center gap-1 text-green-700"><Check className="size-4" />Split confirmed</span>}
-      </div>
-
-      <div className="flex flex-wrap gap-2">
+      {/* Action buttons */}
+      <div className="px-6 pb-4 flex flex-wrap gap-2">
         {status === 'pending' && (
           <>
             <button onClick={handleAccept} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
             <button onClick={handleDecline} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
-            <button onClick={() => toggleSection('chat')} className={`inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'border border-border text-foreground hover:bg-muted'}`}><MessageCircle className="size-4" />Message</button>
+            <button onClick={() => toggleSection('chat')} className={`relative inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'border border-border text-foreground hover:bg-muted'}`}>
+              <MessageCircle className="size-4" />Message
+              {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
+            </button>
             <button onClick={handleCancel} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-60 transition-colors">Cancel</button>
           </>
         )}
         {status === 'accepted' && (
           <>
-            <button onClick={() => toggleSection('chat')} className={`inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'bg-primary text-primary-foreground hover:bg-primary/90'}`}><MessageCircle className="size-4" />Chat</button>
+            <button onClick={() => toggleSection('chat')} className={`relative inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'bg-primary text-primary-foreground hover:bg-primary/90'}`}>
+              <MessageCircle className="size-4" />Chat
+              {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
+            </button>
+            {hasRouteCoords && (
+              <button onClick={() => onViewRoute(connection)} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
+                <Map className="size-4" />Route
+              </button>
+            )}
             <button onClick={() => toggleSection('gassplit')} className={`inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'gassplit' ? 'bg-accent/20 text-amber-800' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
-            <button onClick={handleComplete} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><Check className="size-4" />Complete Ride</button>
+            <button onClick={handleComplete} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><Check className="size-4" />Complete</button>
             <button onClick={handleCancel} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-60 transition-colors">Cancel</button>
           </>
         )}
       </div>
 
+      {/* Chat panel */}
       {expanded === 'chat' && (
-        <div className="border-t border-border pt-4 space-y-3">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">{status === 'pending' ? 'Quick messages (pending)' : 'Chat'}</p>
-          {msgs.length > 0 && (
-            <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-              {msgs.map(m => (
-                <div key={m.id} className={`flex ${m.sender_id === currentUserId ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[80%] px-3 py-2 rounded-2xl text-sm ${m.sender_id === currentUserId ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'}`}>{m.content}</div>
+        <div className="border-t border-border bg-muted/30">
+          <div className="px-6 py-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />
+              <span className="text-xs font-semibold text-foreground">{connection.withUser.name}</span>
+              <span className="text-xs text-muted-foreground">· {status === 'pending' ? 'pending connection' : 'accepted'}</span>
+            </div>
+
+            {msgs.length > 0 && (
+              <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
+                {msgs.map(m => {
+                  const isMine = m.sender_id === currentUserId
+                  return (
+                    <div key={m.id} className={`flex items-end gap-2 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
+                      {!isMine && <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />}
+                      <div className={`max-w-[75%] space-y-0.5 ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
+                        {!isMine && <span className="text-[10px] text-muted-foreground pl-1">{connection.withUser.name}</span>}
+                        <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-sm' : 'bg-card text-foreground border border-border rounded-bl-sm'}`}>
+                          {m.content}
+                        </div>
+                        <span className="text-[10px] text-muted-foreground px-1">{new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                    </div>
+                  )
+                })}
+                <div ref={msgEndRef} />
+              </div>
+            )}
+
+            {msgs.length === 0 && msgsLoaded && (
+              <p className="text-xs text-muted-foreground text-center py-4">No messages yet. Say hi!</p>
+            )}
+
+            {status === 'pending' ? (
+              <div className="space-y-2">
+                <p className="text-xs text-muted-foreground">Quick messages while connection is pending:</p>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
+                    <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-card border border-border text-sm text-foreground hover:bg-muted disabled:opacity-50 transition-colors text-left">{text}</button>
+                  ))}
                 </div>
-              ))}
-              <div ref={msgEndRef} />
-            </div>
-          )}
-          {status === 'pending' ? (
-            <div className="flex flex-wrap gap-2">
-              {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
-                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-muted text-sm text-foreground hover:bg-muted-foreground/10 disabled:opacity-50 transition-colors text-left">{text}</button>
-              ))}
-            </div>
-          ) : status === 'accepted' ? (
-            <div className="flex gap-2">
-              <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder="Type a message…" className="flex-1 px-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
-              <button onClick={sendFree} disabled={sending || !msgText.trim()} className="px-3 py-2 rounded-xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
-            </div>
-          ) : <p className="text-sm text-muted-foreground">Chat is not available in this state.</p>}
+              </div>
+            ) : status === 'accepted' ? (
+              <div className="flex gap-2">
+                <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-3.5 py-2.5 rounded-2xl bg-card border border-border text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
+                <button onClick={sendFree} disabled={sending || !msgText.trim()} className="px-3.5 py-2.5 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
+              </div>
+            ) : <p className="text-sm text-muted-foreground">Chat unavailable in this state.</p>}
+          </div>
         </div>
       )}
 
+      {/* Gas split panel */}
       {expanded === 'gassplit' && status === 'accepted' && (
-        <div className="border-t border-border pt-4 space-y-3">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Confirm Split</p>
+        <div className="border-t border-border bg-muted/30 px-6 py-4 space-y-3">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Confirm Gas Split</p>
           {gasSuggestion ? (
             <>
-              <p className="text-sm text-muted-foreground">Suggested amount: <span style={MONO} className="text-foreground font-medium">${(gasSuggestion.amount_cents / 100).toFixed(2)}</span></p>
+              <p className="text-sm text-muted-foreground">Suggested: <span style={MONO} className="text-foreground font-medium">${(gasSuggestion.amount_cents / 100).toFixed(2)}</span></p>
               {splitDone ? (
                 <p className="text-sm text-green-700 font-medium flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
               ) : (
@@ -802,7 +1028,7 @@ function ConnectionCard({
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
                     <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
                   </div>
-                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Confirm Split</button>
+                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Confirm</button>
                 </div>
               )}
               <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
@@ -811,19 +1037,20 @@ function ConnectionCard({
         </div>
       )}
 
+      {/* Block/report panel */}
       {expanded === 'blockreport' && (
-        <div className="border-t border-border pt-4 space-y-3">
+        <div className="border-t border-border bg-muted/30 px-6 py-4 space-y-3">
           {!reportMode ? (
             <div className="flex gap-2">
-              <button onClick={handleBlock} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><UserX className="size-4" />Block user</button>
-              <button onClick={() => setReportMode(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><Flag className="size-4" />Report user</button>
+              <button onClick={handleBlock} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><UserX className="size-4" />Block</button>
+              <button onClick={() => setReportMode(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><Flag className="size-4" />Report</button>
             </div>
           ) : (
             <div className="space-y-2">
-              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Report reason</label>
+              <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Reason</label>
               <input type="text" value={reportReason} onChange={e => setReportReason(e.target.value)} placeholder="Describe the issue…" className="w-full px-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
               <div className="flex gap-2">
-                <button onClick={handleReport} disabled={!reportReason.trim()} className="px-3 py-2 rounded-xl bg-destructive text-white text-sm font-medium disabled:opacity-50 transition-colors">Submit report</button>
+                <button onClick={handleReport} disabled={!reportReason.trim()} className="px-3 py-2 rounded-xl bg-destructive text-white text-sm font-medium disabled:opacity-50">Submit</button>
                 <button onClick={() => setReportMode(false)} className="px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
               </div>
             </div>
@@ -836,17 +1063,24 @@ function ConnectionCard({
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
+  onViewRoute: (conn: Connection) => void
+  onMarkRead: (id: string) => void
 }) {
+  const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
   return (
     <div className="space-y-6">
       <div>
-        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Connections</h1>
-        <p className="text-muted-foreground mt-1">Track pending offers, accepted rides, and gas split requests.</p>
+        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Inbox</h1>
+        <p className="text-muted-foreground mt-1">
+          {totalUnread > 0
+            ? <span className="text-primary font-medium">{totalUnread} unread message{totalUnread !== 1 ? 's' : ''}</span>
+            : 'Track pending offers, accepted rides, and chats.'}
+        </p>
       </div>
       {connections.length === 0 ? (
         <div className="text-center py-24 text-muted-foreground">
@@ -856,7 +1090,11 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
         </div>
       ) : (
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-          {connections.map(c => <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} />)}
+          {connections.map(c => (
+            <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
+              onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
+              showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} />
+          ))}
         </div>
       )}
     </div>
@@ -1111,23 +1349,27 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
   )
 }
 
-function BottomNav({ view, setView }: { view: View; setView: (v: View) => void }) {
-  const items = [
-    { id: 'feed' as View, label: 'Feed', Icon: Search, ariaLabel: 'Discover feed' },
-    { id: 'map' as View, label: 'Map', Icon: Map, ariaLabel: 'Live map' },
-    { id: 'pools' as View, label: 'Pools', Icon: Users, ariaLabel: 'Community pools' },
-    { id: 'post' as View, label: 'New', Icon: () => <span className="text-xl font-light leading-none">+</span>, ariaLabel: 'New listing' },
-    { id: 'connections' as View, label: 'Inbox', Icon: MessageCircle, ariaLabel: 'Connections inbox' },
-    { id: 'profile' as View, label: 'Me', Icon: () => <Shield className="size-5" />, ariaLabel: 'My account' },
-  ] as const
+function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v: View) => void; unreadMessages: number }) {
+  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
+    { id: 'feed', label: 'Feed', icon: <Search className="size-5" /> },
+    { id: 'map', label: 'Map', icon: <Map className="size-5" /> },
+    { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
+    { id: 'post', label: 'New', icon: <span className="text-xl font-light leading-none">+</span> },
+    { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
+    { id: 'profile', label: 'Me', icon: <Shield className="size-5" /> },
+  ]
   return (
     <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40">
       <div className="flex items-center justify-around px-2 h-16">
-        {items.map(({ id, label, Icon, ariaLabel }) => {
+        {items.map(({ id, label, icon }) => {
           const active = view === id
+          const badge = id === 'connections' ? unreadMessages : 0
           return (
-            <button key={id} onClick={() => setView(id)} aria-label={ariaLabel} className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
-              <Icon />
+            <button key={id} onClick={() => setView(id)} aria-label={label} className={`relative flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+              {icon}
+              {badge > 0 && (
+                <span className="absolute -top-0.5 right-1.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{badge > 9 ? '9+' : badge}</span>
+              )}
               <span className="text-[10px] font-medium">{label}</span>
             </button>
           )
@@ -1221,9 +1463,12 @@ export function Home() {
   const [myListings, setMyListings] = useState<MyListing[]>([])
 
   // ── Connections ──
-  const [connections, setConnections] = useState<Connection[]>(() => {
-    try { return JSON.parse(localStorage.getItem('carpool_connections') ?? '[]') } catch { return [] }
-  })
+  const [connections, setConnections] = useState<Connection[]>([])
+  const connectionsRef = useRef<Connection[]>([])
+  useEffect(() => { connectionsRef.current = connections }, [connections])
+
+  // ── Trip route (for Map view) ──
+  const [tripRoute, setTripRoute] = useState<TripRoute | null>(null)
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
@@ -1248,7 +1493,11 @@ export function Home() {
     const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
       if (msg.type === 'chat_message') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, unreadMessages: c.unreadMessages + 1 } : c))
-        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: 'New message', body: msg.message.content, created_at: new Date().toISOString(), read: false }, ...prev])
+        const conn = connectionsRef.current.find(c => c.id === msg.connection_id)
+        const senderName = conn?.withUser.name ?? 'Someone'
+        const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
+        showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
+        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false }, ...prev])
         setNotifRead(false)
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
@@ -1259,8 +1508,6 @@ export function Home() {
     wsRef.current = ws
     return () => { ws?.close(); wsRef.current = null }
   }, [currentUser])
-
-  useEffect(() => { localStorage.setItem('carpool_connections', JSON.stringify(connections)) }, [connections])
 
   // ── Neon session → backend sync ──
   const handleAuthenticated = useCallback(async (email: string, name: string) => {
@@ -1296,6 +1543,23 @@ export function Home() {
     if (!currentUser) return
     api.getNotifications().then(setNotifications).catch(() => {})
   }, [currentUser])
+
+  // ── Connections from API ──
+  const loadConnections = useCallback(async (userId: string) => {
+    try {
+      const conns = await api.getMyConnections()
+      setConnections(prev => {
+        const unreadMap: Record<string, number> = Object.fromEntries(prev.map(c => [c.id, c.unreadMessages]))
+        return conns.map(c => {
+          const mapped = apiConnectionToConnection(c, userId)
+          mapped.unreadMessages = unreadMap[mapped.id] ?? 0
+          return mapped
+        })
+      })
+    } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => { if (currentUser) loadConnections(currentUser.id) }, [currentUser, loadConnections])
 
   // ── My Listings ──
   const loadMyListings = useCallback(async () => {
@@ -1373,15 +1637,30 @@ export function Home() {
   const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
   const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
 
+  const onMarkRead = useCallback((id: string) => {
+    setConnections(prev => prev.map(c => c.id === id ? { ...c, unreadMessages: 0 } : c))
+  }, [])
+
+  const onViewRoute = useCallback((conn: Connection) => {
+    if (!conn.pickupLat || !conn.pickupLng || !conn.destLat || !conn.destLng) return
+    setTripRoute({
+      pickupLat: conn.pickupLat, pickupLng: conn.pickupLng, pickupLabel: conn.pickupLabel ?? 'Pickup',
+      destLat: conn.destLat, destLng: conn.destLng, destLabel: conn.destLabel ?? 'Destination',
+      partnerName: conn.withUser.name, date: conn.date,
+    })
+    setView('map')
+  }, [])
+
   const onNotifRead = useCallback(() => {
     setNotifRead(true); setNotifications(prev => prev.map(n => ({ ...n, read: true })))
   }, [])
 
   const unreadCount = notifRead ? 0 : notifications.filter(n => !n.read).length
+  const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
     authClient.signOut().catch(() => {})
-    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([])
+    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 
@@ -1421,18 +1700,18 @@ export function Home() {
             {guardedView === 'feed' && (
               <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} listings={filteredListings} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} />
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onRead={onNotifRead} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} />}
           </main>
         </div>
       </div>
 
-      <BottomNav view={guardedView} setView={setView} />
+      <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} />
     </div>
   )
 }

@@ -426,6 +426,16 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def notifications(user: CurrentUser) -> list[dict[str, Any]]:
         return [serialize(n) for n in app.state.store.get_notifications(user.id)]
 
+    # ── Public user profiles ──────────────────────────────────────────────────
+
+    @app.get("/users/{target_user_id}/profile")
+    def get_user_profile(target_user_id: str, user: CurrentUser) -> dict[str, Any]:
+        _ = user
+        profile = app.state.store.get_profile(target_user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return {"user_id": profile.user_id, "display_name": profile.display_name, "photo_url": profile.photo_url}
+
     # ── User actions ──────────────────────────────────────────────────────────
 
     @app.post("/users/{target_user_id}/block")
@@ -543,6 +553,10 @@ def serialize_connection(store: Store, connection: Any) -> dict[str, Any]:
     trip = store.get_driver_trip(connection.driver_trip_id)
     data["ride_request"] = serialize_ride_request(store, rr, exact=exact)
     data["driver_trip"] = serialize_driver_trip(store, trip, exact=exact)
+    rider_profile = store.get_profile(rr.rider_id)
+    driver_profile = store.get_profile(trip.driver_id)
+    data["rider_profile"] = serialize(rider_profile)
+    data["driver_profile"] = serialize(driver_profile)
     return data
 
 

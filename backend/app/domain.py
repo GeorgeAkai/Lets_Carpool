@@ -679,7 +679,7 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 """SELECT dt.* FROM driver_trips dt
-                   WHERE dt.status = 'open'
+                   WHERE dt.status IN ('open', 'matched')
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
                        WHERE (blocker_id = %s AND blocked_id = dt.driver_id)
@@ -697,7 +697,7 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 """SELECT rr.* FROM ride_requests rr
-                   WHERE rr.status = 'open'
+                   WHERE rr.status IN ('open', 'matched')
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
                        WHERE (blocker_id = %s AND blocked_id = rr.rider_id)
