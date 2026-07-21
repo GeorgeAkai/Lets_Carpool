@@ -70,6 +70,8 @@ export type ApiConnection = {
   ride_request: ApiRideRequest;
   driver_trip: ApiDriverTrip;
   completed_confirmed_by?: string[];
+  rider_profile?: ApiProfile | null;
+  driver_profile?: ApiProfile | null;
 };
 
 export type ApiProfile = {
@@ -342,6 +344,10 @@ export function createConnection(rideRequestId: string, driverTripId: string): P
     ride_request_id: rideRequestId,
     driver_trip_id: driverTripId,
   });
+}
+
+export function getMyConnections(): Promise<ApiConnection[]> {
+  return request<ApiConnection[]>("GET", "/me/connections");
 }
 
 export function transitionConnection(connectionId: string, action: "accept" | "decline" | "cancel" | "complete"): Promise<ApiConnection> {
