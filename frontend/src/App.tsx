@@ -3,7 +3,7 @@ import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
   Check, X, Fuel, ChevronRight, Home, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun,
 } from "lucide-react"
 import { motion } from "motion/react"
 import * as api from "./api"
@@ -1405,12 +1405,14 @@ function HomepageView({ onSignIn }: { onSignIn: (user: ApiUser) => void }) {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials }: {
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
   setView: (v: View) => void
   currentUser: ApiUser | null
   unreadCount: number
   onSignOut: () => void
   initials: string
+  darkMode: boolean
+  onToggleDark: () => void
 }) {
   return (
     <header className="sticky top-0 z-40 bg-background/90 backdrop-blur border-b border-border">
@@ -1425,6 +1427,14 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials }: {
 
         {currentUser ? (
           <div className="flex items-center gap-2">
+            <button
+              onClick={onToggleDark}
+              className="p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors"
+              aria-label="Toggle dark mode"
+            >
+              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            </button>
+
             <button
               onClick={() => setView("notifications")}
               className="relative p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors"
@@ -1457,12 +1467,21 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials }: {
             </button>
           </div>
         ) : (
-          <button
-            onClick={() => setView("home")}
-            className="px-4 py-2 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
-          >
-            Sign in
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onToggleDark}
+              className="p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors"
+              aria-label="Toggle dark mode"
+            >
+              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            </button>
+            <button
+              onClick={() => setView("home")}
+              className="px-4 py-2 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
+            >
+              Sign in
+            </button>
+          </div>
         )}
       </div>
     </header>
@@ -1571,6 +1590,13 @@ export function App() {
   // ── Auth ──────────────────────────────────────────────────────────────────
   const [currentUser, setCurrentUser] = useState<ApiUser | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
+
+  // ── Dark mode ─────────────────────────────────────────────────────────────
+  const [darkMode, setDarkMode] = useState(() => localStorage.getItem("carpool_dark") === "true")
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", darkMode)
+    localStorage.setItem("carpool_dark", String(darkMode))
+  }, [darkMode])
 
   // ── Geolocation ───────────────────────────────────────────────────────────
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null)
@@ -1780,6 +1806,8 @@ export function App() {
         unreadCount={unreadCount}
         onSignOut={onSignOut}
         initials={initials}
+        darkMode={darkMode}
+        onToggleDark={() => setDarkMode(d => !d)}
       />
 
       {authLoading ? (
