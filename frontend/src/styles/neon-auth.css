@@ -1,0 +1,59 @@
+/*
+ * Neon Auth UI theme overrides — align with app design system.
+ * Variables defined here cascade into all AuthView / AuthForm components.
+ */
+
+.neon-auth-ui {
+  /* Use app radius and font */
+  --neon-radius: var(--radius);
+  font-family: 'Outfit', sans-serif;
+
+  /* Suppress the default card shadow/bg since we wrap with our own card */
+  & [class*="card"] {
+    box-shadow: none !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+  }
+}
+
+/* Input fields — match app's input-background style */
+.neon-auth-ui input[type="email"],
+.neon-auth-ui input[type="password"],
+.neon-auth-ui input[type="text"] {
+  background-color: var(--input-background) !important;
+  border-color: transparent !important;
+  border-radius: calc(var(--radius) + 2px) !important;
+  font-family: 'Outfit', sans-serif;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.neon-auth-ui input[type="email"]:focus,
+.neon-auth-ui input[type="password"]:focus,
+.neon-auth-ui input[type="text"]:focus {
+  border-color: color-mix(in srgb, var(--primary) 30%, transparent) !important;
+  outline: none !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent) !important;
+}
+
+/* Primary button — match app's rounded-2xl primary button */
+.neon-auth-ui button[type="submit"],
+.neon-auth-ui [class*="submit"] {
+  border-radius: calc(var(--radius) + 4px) !important;
+  font-family: 'Outfit', sans-serif;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* Social buttons */
+.neon-auth-ui [class*="social"] button,
+.neon-auth-ui [class*="provider"] button {
+  border-radius: calc(var(--radius) + 4px) !important;
+  font-family: 'Outfit', sans-serif;
+}
+
+/* Links */
+.neon-auth-ui a {
+  color: var(--primary);
+  font-family: 'Outfit', sans-serif;
+}

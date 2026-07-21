@@ -1,4 +1,5 @@
-const BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const DEFAULT_BASE = "http://localhost:8000";
+const BASE = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
 const WS_BASE = BASE.replace(/^http/, "ws");
 
 function token(): string | null {
@@ -175,9 +176,19 @@ export type WsMessage =
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
-export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket {
+export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
+  if (BASE.includes("neon.tech") && !BASE.includes("localhost")) {
+    return null;
+  }
+
   const t = token();
-  const ws = new WebSocket(`${WS_BASE}/ws/${userId}${t ? `?token=${t}` : ""}`);
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(`${WS_BASE}/ws/${userId}${t ? `?token=${t}` : ""}`);
+  } catch {
+    return null;
+  }
+  ws.onerror = () => { /* WS unavailable — real-time features disabled */ };
   ws.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data) as WsMessage;
@@ -288,6 +299,10 @@ export function cancelDriverTrip(tripId: string): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/cancel`);
 }
 
+export function getMyDriverTrips(): Promise<ApiDriverTrip[]> {
+  return request<ApiDriverTrip[]>("GET", "/me/driver-trips");
+}
+
 // ─── Ride requests ────────────────────────────────────────────────────────────
 
 export function searchRideRequests(query: SearchQuery = {}): Promise<ApiRideRequest[]> {
@@ -314,6 +329,10 @@ export function createRideRequest(data: {
 
 export function cancelRideRequest(requestId: string): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", `/ride-requests/${requestId}/cancel`);
+}
+
+export function getMyRideRequests(): Promise<ApiRideRequest[]> {
+  return request<ApiRideRequest[]>("GET", "/me/ride-requests");
 }
 
 // ─── Connections ──────────────────────────────────────────────────────────────

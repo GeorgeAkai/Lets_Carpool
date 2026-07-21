@@ -4,13 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-DOCKER_COMPOSE_CMD=""
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  DOCKER_COMPOSE_CMD="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-  DOCKER_COMPOSE_CMD="docker-compose"
-fi
-
 PYTHON_CMD="python3"
 if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
   PYTHON_CMD="$ROOT_DIR/.venv/bin/python"
@@ -41,10 +34,47 @@ usage() {
 Usage: $0 <command>
 
 Commands:
-  start    Start postgres, backend, and frontend
-  stop     Stop backend, frontend, and postgres
+  start    Start backend and frontend (uses Neon via DATABASE_URL)
+  stop     Stop backend and frontend
   restart  Stop then start again
+
+Requires:
+  DATABASE_URL   Neon connection string (postgresql://... or postgres://...)
+                 Set in your shell or in backend/.env
 EOF
+}
+
+check_neon_url() {
+  # Load from backend/.env if present and DATABASE_URL not already set
+  if [ -z "${DATABASE_URL:-}" ] && [ -f "$ROOT_DIR/backend/.env" ]; then
+    set -o allexport
+    # shellcheck disable=SC1091
+    source "$ROOT_DIR/backend/.env"
+    set +o allexport
+  fi
+
+  if [ -z "${DATABASE_URL:-}" ]; then
+    echo "ERROR: DATABASE_URL is not set."
+    echo ""
+    echo "  Get your connection string from the Neon console and either:"
+    echo "    export DATABASE_URL='postgresql://...' before running this script, or"
+    echo "    add DATABASE_URL=postgresql://... to backend/.env"
+    exit 1
+  fi
+
+  if [[ "$DATABASE_URL" != postgresql://* ]] && [[ "$DATABASE_URL" != postgres://* ]]; then
+    echo "ERROR: DATABASE_URL does not look like a postgres connection string."
+    echo "  Got: $DATABASE_URL"
+    exit 1
+  fi
+
+  # Warn if it looks like a local postgres URL instead of Neon
+  if [[ "$DATABASE_URL" == *"localhost"* ]] || [[ "$DATABASE_URL" == *"127.0.0.1"* ]]; then
+    echo "Warning: DATABASE_URL points to localhost — expected a Neon cloud URL."
+  fi
+
+  SAFE_URL=$(echo "$DATABASE_URL" | sed 's|://[^:]*:[^@]*@|://***:***@|')
+  echo "Database: Neon ($SAFE_URL)"
 }
 
 ensure_backend_env() {
@@ -66,18 +96,7 @@ ensure_frontend_deps() {
 }
 
 start_services() {
-  if [ -n "$DOCKER_COMPOSE_CMD" ]; then
-    echo "Starting postgres via docker compose..."
-    if $DOCKER_COMPOSE_CMD up -d postgres; then
-      echo "Postgres is running."
-    else
-      echo "Warning: could not start postgres. Continuing without it (MVP backend uses in-memory storage)."
-    fi
-  else
-    echo "Warning: docker compose not available. Skipping postgres (MVP backend uses in-memory storage)."
-    echo "Enable Docker Desktop WSL integration, or install Docker Compose, if you need Postgres locally."
-  fi
-
+  check_neon_url
   ensure_backend_env
   ensure_frontend_deps
 
@@ -89,7 +108,10 @@ start_services() {
   fi
 
   echo "Starting backend on http://localhost:8000 ..."
-  nohup "$ROOT_DIR/.venv/bin/python" -m uvicorn backend.app.main:create_app --factory --host 0.0.0.0 --port 8000 --reload > "$LOG_DIR/backend.log" 2>&1 &
+  DATABASE_URL="$DATABASE_URL" \
+  nohup "$ROOT_DIR/.venv/bin/python" -m uvicorn backend.app.main:create_app \
+    --factory --host 0.0.0.0 --port 8000 --reload \
+    > "$LOG_DIR/backend.log" 2>&1 &
   echo $! > "$BACKEND_PID_FILE"
 
   echo "Starting frontend on http://localhost:5173 ..."
@@ -98,14 +120,17 @@ start_services() {
   echo $! > "$FRONTEND_PID_FILE"
   cd "$ROOT_DIR"
 
+  echo ""
   echo "Started all services."
-  echo "Backend PID: $(cat "$BACKEND_PID_FILE")"
-  echo "Frontend PID: $(cat "$FRONTEND_PID_FILE")"
-  echo "Logs: $LOG_DIR"
+  echo "  Backend PID : $(cat "$BACKEND_PID_FILE")"
+  echo "  Frontend PID: $(cat "$FRONTEND_PID_FILE")"
+  echo "  Logs        : $LOG_DIR"
+  echo "  Backend     : http://localhost:8000"
+  echo "  Frontend    : http://localhost:5173"
 }
 
 stop_services() {
-  echo "Stopping backend and frontend processes..."
+  echo "Stopping backend and frontend..."
   if [ -f "$BACKEND_PID_FILE" ]; then
     kill "$(cat "$BACKEND_PID_FILE")" >/dev/null 2>&1 || true
     rm -f "$BACKEND_PID_FILE"
@@ -114,12 +139,7 @@ stop_services() {
     kill "$(cat "$FRONTEND_PID_FILE")" >/dev/null 2>&1 || true
     rm -f "$FRONTEND_PID_FILE"
   fi
-
-  echo "Stopping postgres via docker compose..."
-  if [ -n "$DOCKER_COMPOSE_CMD" ]; then
-    $DOCKER_COMPOSE_CMD down >/dev/null 2>&1 || true
-  fi
-  echo "Stopped all services."
+  echo "Stopped."
 }
 
 if [ $# -ne 1 ]; then

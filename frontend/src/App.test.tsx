@@ -1,7 +1,9 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 import { App } from "./App";
+import { login } from "./api";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -10,13 +12,14 @@ function mockFetch(handlers: Record<string, unknown>) {
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
       const method = (init?.method ?? "GET").toUpperCase();
-      const key = `${method} ${url.replace("http://localhost:8000", "")}`;
+      const cleanUrl = String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "");
+      const key = `${method} ${cleanUrl}`;
       const matchKey = Object.keys(handlers).find((k) => {
         if (k === key) return true;
         // Support prefix match for dynamic routes like "POST /connections/con_123/transition"
         const [km, kp] = k.split(" ");
         if (km !== method) return false;
-        const urlPath = url.replace("http://localhost:8000", "").split("?")[0];
+        const urlPath = cleanUrl.split("?")[0];
         return urlPath.startsWith(kp);
       });
       const body = matchKey ? handlers[matchKey] : { detail: "Not found" };
@@ -72,6 +75,24 @@ const RIDE_REQUEST_1 = {
 
 // ─── tests ────────────────────────────────────────────────────────────────────
 
+describe("API configuration", () => {
+  it("uses the configured Neon API base URL by default", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ access_token: "token", token_type: "bearer", user: ME_RESPONSE }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await login("Ada", "ada@example.com");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1/auth/login",
+      expect.any(Object)
+    );
+  });
+});
+
 describe("Auth gate", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -83,7 +104,7 @@ describe("Auth gate", () => {
 
   it("shows sign-in screen when no token is stored", () => {
     mockFetch({});
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     expect(screen.getByRole("button", { name: /sign in \/ sign up/i })).toBeTruthy();
   });
 
@@ -96,7 +117,7 @@ describe("Auth gate", () => {
       "GET /ride-requests/search": [],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
     await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
@@ -115,7 +136,7 @@ describe("Auth gate", () => {
       "GET /ride-requests/search": [],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
     await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
@@ -141,7 +162,7 @@ describe("Feed view", () => {
       "GET /ride-requests/search": [],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
 
     await waitFor(() =>
       expect(screen.getByText("Logan Airport")).toBeTruthy()
@@ -155,7 +176,7 @@ describe("Feed view", () => {
       "GET /ride-requests/search": [RIDE_REQUEST_1],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
 
     await waitFor(() =>
       expect(screen.getByText("Providence, RI")).toBeTruthy()
@@ -170,7 +191,7 @@ describe("Feed view", () => {
       "GET /ride-requests/search": [RIDE_REQUEST_1],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
     // Click "Offering rides" filter — only driver trips should show
@@ -200,7 +221,7 @@ describe("Feed view", () => {
       },
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
     const connectBtn = screen.getByRole("button", { name: /request to join/i });
@@ -225,7 +246,7 @@ describe("Post listing view", () => {
     const user = userEvent.setup();
 
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-      const path = url.replace("http://localhost:8000", "");
+      const path = String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "");
       if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
       if (path.startsWith("/driver-trips/search")) return { ok: true, json: async () => [] };
       if (path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
@@ -251,7 +272,7 @@ describe("Post listing view", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
     // Navigate to Post view
@@ -271,7 +292,7 @@ describe("Post listing view", () => {
     await user.click(screen.getByRole("button", { name: /post listing/i }));
 
     await waitFor(() => {
-      const calls = fetchMock.mock.calls.map(([url]: [string]) => url.replace("http://localhost:8000", ""));
+      const calls = fetchMock.mock.calls.map(([url]: [string]) => String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", ""));
       expect(calls).toContain("/locations");
       expect(calls).toContain("/driver-trips");
     });
@@ -306,7 +327,7 @@ describe("Connections view", () => {
 
     const LOC = { id: "loc_tmp", label: "tmp", exact: true };
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-      const path = url.replace("http://localhost:8000", "");
+      const path = String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "");
       if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
       if (path.startsWith("/driver-trips/search")) return { ok: true, json: async () => [DRIVER_TRIP_1] };
       if (path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
@@ -318,7 +339,7 @@ describe("Connections view", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
     // Create a connection by clicking connect
@@ -331,7 +352,7 @@ describe("Connections view", () => {
 
     await waitFor(() => {
       const calls = fetchMock.mock.calls.map(([url]: [string]) =>
-        url.replace("http://localhost:8000", "")
+        String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "")
       );
       expect(calls.some((c) => c.includes("/transition"))).toBe(true);
     });
@@ -355,7 +376,7 @@ describe("Connections view", () => {
 
     const LOC = { id: "loc_tmp", label: "tmp", exact: true };
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
-      const path = url.replace("http://localhost:8000", "");
+      const path = String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "");
       if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
       if (path.startsWith("/driver-trips/search")) return { ok: true, json: async () => [DRIVER_TRIP_1] };
       if (path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
@@ -367,7 +388,7 @@ describe("Connections view", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
     await user.click(screen.getByRole("button", { name: /request to join/i }));
@@ -378,7 +399,7 @@ describe("Connections view", () => {
 
     await waitFor(() => {
       const calls = fetchMock.mock.calls.map(([url]: [string]) =>
-        url.replace("http://localhost:8000", "")
+        String(url).replace("https://ep-nameless-meadow-auswqft3.apirest.c-10.us-east-1.aws.neon.tech/neondb/rest/v1", "").replace("http://localhost:8000", "")
       );
       expect(calls.some((c) => c.includes("/transition"))).toBe(true);
     });
@@ -403,7 +424,7 @@ describe("Profile view", () => {
       "GET /ride-requests/search": [],
     });
 
-    render(<App />);
+    render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
     await user.click(screen.getByRole("button", { name: /profile/i }));
