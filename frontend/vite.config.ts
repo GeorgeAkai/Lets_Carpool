@@ -1,9 +1,32 @@
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { VitePWA } from "vite-plugin-pwa";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    VitePWA({
+      registerType: "autoUpdate",
+      includeAssets: ["logo.svg", "icons/favicon-16x16.png", "icons/favicon-32x32.png"],
+      manifest: {
+        name: "Let's Carpool",
+        short_name: "Carpool",
+        description: "Connect with drivers and riders near you. Split gas costs and travel smarter.",
+        start_url: "/",
+        scope: "/",
+        display: "standalone",
+        background_color: "#f2f4fd",
+        theme_color: "#2848c8",
+        icons: [
+          { src: "/icons/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "/icons/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+          { src: "/icons/maskable-icon-512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
+        ],
+      },
+    }),
+  ],
   test: {
     environment: "jsdom",
     globals: true,

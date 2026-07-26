@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2848c8" />
+      <stop offset="100%" stop-color="#132480" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)" />
+
+  <!-- route accent, kept near center so it survives circular/rounded PWA icon masks -->
+  <path d="M 130 196 Q 256 158 382 196" fill="none" stroke="#e8971c" stroke-width="9" stroke-linecap="round" stroke-dasharray="2 24" />
+  <circle cx="130" cy="196" r="8" fill="#e8971c" />
+  <circle cx="382" cy="196" r="8" fill="#e8971c" />
+
+  <!-- wordmark -->
+  <text x="256" y="266" text-anchor="middle" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-weight="500" font-size="46" fill="#dde3fc" letter-spacing="1">Let's</text>
+  <text x="256" y="338" text-anchor="middle" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-weight="800" font-size="68" fill="#ffffff" letter-spacing="0.5">Carpool</text>
+</svg>
