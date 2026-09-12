@@ -34,12 +34,46 @@ const CAR_EMOJIS: Record<string, string> = {
   suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", sedan: "🚗", other: "🚗",
 }
 
-function makeCarIcon(carType: string | null, heading: number | null) {
-  const emoji = CAR_EMOJIS[carType ?? ""] ?? "🚗"
-  const rotate = heading != null ? `transform: rotate(${heading}deg);` : ""
+// ── Marker motion interpolation (pure, unit-testable) ──────────────────────────
+// Smoothly glides a Leaflet marker between successive polled positions instead of
+// snapping, the way Uber/Google Maps animate a live driver dot.
+
+export function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t
+}
+
+export function lerpLatLng(a: [number, number], b: [number, number], t: number): [number, number] {
+  return [lerp(a[0], b[0], t), lerp(a[1], b[1], t)]
+}
+
+/** Interpolates an angle in degrees along the shortest rotational path (e.g. 350deg -> 10deg goes +20, not -340). */
+export function lerpAngle(a: number, b: number, t: number): number {
+  const diff = ((b - a + 540) % 360) - 180
+  return (a + diff * t + 360) % 360
+}
+
+interface MarkerAnimation {
+  from: [number, number]
+  to: [number, number]
+  fromHeading: number
+  toHeading: number
+  start: number
+  duration: number
+}
+
+// Slightly under the driver-list poll interval so a car is always gliding toward
+// its latest known position rather than snapping then sitting idle.
+const MARKER_ANIM_DURATION_MS = 9200
+
+function makeCarIcon(heading: number | null) {
+  const rotate = `transform: rotate(${heading ?? 0}deg);`
   return L.divIcon({
-    html: `<div style="font-size:28px;line-height:1;${rotate};filter:drop-shadow(0 2px 4px rgba(0,0,0,.35));animation:carPulse 2s ease-in-out infinite">${emoji}</div>`,
-    className: "", iconSize: [36, 36], iconAnchor: [18, 18],
+    html: `<div style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;${rotate}">
+      <svg width="26" height="26" viewBox="0 0 30 30" style="filter:drop-shadow(0 2px 5px rgba(0,0,0,.4))">
+        <path d="M15 2 L25 25 L15 19.5 L5 25 Z" fill="#2848c8" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round"/>
+      </svg>
+    </div>`,
+    className: "", iconSize: [30, 30], iconAnchor: [15, 15],
   })
 }
 
@@ -112,6 +146,9 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
   const mapRef = useRef<L.Map | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const markersRef = useRef<Record<string, L.Marker>>({})
+  const markerHeadingsRef = useRef<Record<string, number>>({})
+  const animsRef = useRef<Record<string, MarkerAnimation>>({})
+  const rafIdRef = useRef<number | null>(null)
   const userMarkerRef = useRef<L.Marker | null>(null)
   const routeLayerRef = useRef<L.Layer | null>(null)
   const pickupMarkerRef = useRef<L.Marker | null>(null)
@@ -233,20 +270,56 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
     return () => clearInterval(id)
   }, [fetchDrivers])
 
+  // ── Animate driver markers toward their latest polled position ─────────────────
+  const stepMarkerAnimations = useCallback(() => {
+    const now = performance.now()
+    let stillActive = false
+    for (const uid of Object.keys(animsRef.current)) {
+      const marker = markersRef.current[uid]
+      const anim = animsRef.current[uid]
+      if (!marker || !anim) { delete animsRef.current[uid]; continue }
+      const t = Math.min(1, (now - anim.start) / anim.duration)
+      const [lat, lng] = lerpLatLng(anim.from, anim.to, t)
+      marker.setLatLng([lat, lng])
+      const heading = lerpAngle(anim.fromHeading, anim.toHeading, t)
+      markerHeadingsRef.current[uid] = heading
+      const el = marker.getElement()
+      const inner = el?.firstElementChild as HTMLElement | null
+      if (inner) inner.style.transform = `rotate(${heading}deg)`
+      if (t < 1) stillActive = true
+      else delete animsRef.current[uid]
+    }
+    rafIdRef.current = stillActive ? requestAnimationFrame(stepMarkerAnimations) : null
+  }, [])
+
+  useEffect(() => () => {
+    if (rafIdRef.current != null) cancelAnimationFrame(rafIdRef.current)
+  }, [])
+
   // ── Update driver markers ───────────────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map || tripRoute) return
     const seen = new Set<string>()
+    const now = performance.now()
     for (const d of drivers) {
       seen.add(d.user_id)
       const marker = markersRef.current[d.user_id]
-      const icon = makeCarIcon(d.car_type, d.heading)
+      const targetHeading = d.heading ?? markerHeadingsRef.current[d.user_id] ?? 0
       if (marker) {
-        marker.setLatLng([d.latitude, d.longitude])
-        marker.setIcon(icon)
+        const prevAnim = animsRef.current[d.user_id]
+        const t = prevAnim ? Math.min(1, (now - prevAnim.start) / prevAnim.duration) : 1
+        const currentPos: [number, number] = prevAnim ? lerpLatLng(prevAnim.from, prevAnim.to, t) : (() => { const p = marker.getLatLng(); return [p.lat, p.lng] })()
+        const currentHeading = prevAnim ? lerpAngle(prevAnim.fromHeading, prevAnim.toHeading, t) : (markerHeadingsRef.current[d.user_id] ?? targetHeading)
+        animsRef.current[d.user_id] = {
+          from: currentPos, to: [d.latitude, d.longitude],
+          fromHeading: currentHeading, toHeading: targetHeading,
+          start: now, duration: MARKER_ANIM_DURATION_MS,
+        }
+        marker.setPopupContent(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`)
       } else {
-        const m = L.marker([d.latitude, d.longitude], { icon })
+        markerHeadingsRef.current[d.user_id] = targetHeading
+        const m = L.marker([d.latitude, d.longitude], { icon: makeCarIcon(targetHeading) })
           .addTo(map)
           .bindPopup(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`)
           .on("click", () => setSelected(d))
@@ -254,9 +327,17 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
       }
     }
     for (const uid of Object.keys(markersRef.current)) {
-      if (!seen.has(uid)) { markersRef.current[uid].remove(); delete markersRef.current[uid] }
+      if (!seen.has(uid)) {
+        markersRef.current[uid].remove()
+        delete markersRef.current[uid]
+        delete animsRef.current[uid]
+        delete markerHeadingsRef.current[uid]
+      }
     }
-  }, [drivers, tripRoute])
+    if (rafIdRef.current == null && Object.keys(animsRef.current).length > 0) {
+      rafIdRef.current = requestAnimationFrame(stepMarkerAnimations)
+    }
+  }, [drivers, tripRoute, stepMarkerAnimations])
 
   // ── Route to selected nearby driver ────────────────────────────────────────
   useEffect(() => {
@@ -460,7 +541,6 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
       )}
 
       <style>{`
-        @keyframes carPulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.12)} }
         @keyframes userPulse { 0%,100%{box-shadow:0 0 0 3px #2848c880} 50%{box-shadow:0 0 0 6px #2848c840} }
       `}</style>
     </div>

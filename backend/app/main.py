@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any, Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-from backend.app.auth import create_access_token, decode_access_token
+from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
 from backend.app.domain import DomainError, Store, User
 
 
@@ -23,18 +23,49 @@ class Settings(BaseSettings):
     # Space-separated list of allowed CORS origins, e.g. "https://myapp.vercel.app"
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
 
+    # Neon Auth server used to cryptographically verify sign-in tokens (must
+    # match the frontend's VITE_NEON_AUTH_URL). Required for /auth/login to work.
+    # Path confirmed against a live Neon Auth server (better-auth's plugin-
+    # specific /jwks route 404s there; the standard OAuth/OIDC well-known
+    # discovery path is what's actually served).
+    neon_auth_url: str | None = None
+    neon_auth_jwks_path: str = "/.well-known/jwks.json"
+    # Issuer/audience aren't set by default — unlike the JWKS path, I couldn't
+    # verify these against a real signed token, and guessing wrong here means
+    # every sign-in fails closed with no way to tell why (same failure mode as
+    # the wrong default JWKS path did). Signature + expiry are still verified
+    # unconditionally either way. Set these once you've confirmed the actual
+    # `iss`/`aud` claims your Neon Auth project issues (decode a real token).
+    neon_auth_issuer: str | None = None
+    neon_auth_audience: str | None = None
+
+    # Shared secret Vercel Cron sends as `Authorization: Bearer <secret>` when
+    # invoking scheduled requests. Required to trigger the /cron/expire sweep
+    # or the manual expire endpoints below.
+    cron_secret: str | None = None
+
+    @property
+    def neon_auth_jwks_url(self) -> str | None:
+        if not self.neon_auth_url:
+            return None
+        return self.neon_auth_url.rstrip("/") + self.neon_auth_jwks_path
+
 
 # ─── Request/Response models ──────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    name: str = Field(..., min_length=1, examples=["Ada Lovelace"])
-    email: str = Field(..., examples=["ada@berkeley.edu"])
+    # The raw Neon Auth session JWT (from the frontend's `authClient.getJWTToken()`),
+    # verified server-side against the Neon Auth JWKS endpoint — never a client-
+    # supplied name/email, which would let anyone authenticate as anyone.
+    neon_token: str = Field(..., min_length=1)
 
 
 class ProfileUpdate(BaseModel):
     display_name: str
     photo_url: str | None = None
     bio: str | None = None
+    interests: list[str] = Field(default_factory=list)
+    nationality: str | None = None
 
 
 class PhotoUpload(BaseModel):
@@ -115,6 +146,7 @@ class PoolCreate(BaseModel):
     name: str = Field(..., min_length=1)
     community_tag: str = "event"
     trip_date: date
+    departure_time: time
     pickup_location_id: str
     destination_location_id: str
     max_participants: int = Field(default=10, ge=2)
@@ -124,6 +156,10 @@ class PoolCreate(BaseModel):
 
 class PoolJoin(BaseModel):
     role: str = "passenger"
+
+
+class PoolMessageCreate(BaseModel):
+    content: str = Field(..., min_length=1)
 
 
 class DriverLocationUpdate(BaseModel):
@@ -199,7 +235,19 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/auth/login")
     def login(payload: LoginRequest) -> dict[str, Any]:
         settings = app.state.settings
-        user = app.state.store.authenticate_email(str(payload.email), payload.name)
+        if not settings.neon_auth_jwks_url:
+            raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
+        claims = verify_neon_auth_token(
+            payload.neon_token,
+            jwks_url=settings.neon_auth_jwks_url,
+            issuer=settings.neon_auth_issuer,
+            audience=settings.neon_auth_audience,
+        )
+        email = claims.get("email")
+        if not isinstance(email, str) or not email:
+            raise DomainError("Neon Auth token did not include an email claim", 401)
+        name = claims.get("name") or email.split("@")[0]
+        user = app.state.store.authenticate_email(email, str(name))
         access_token = create_access_token(
             user_id=user.id, email=user.email,
             secret=settings.jwt_secret, expires_minutes=settings.jwt_expires_minutes,
@@ -214,7 +262,10 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.patch("/me/profile")
     def update_profile(payload: ProfileUpdate, user: CurrentUser) -> dict[str, Any]:
-        profile = app.state.store.update_profile(user.id, payload.display_name, payload.photo_url, payload.bio)
+        profile = app.state.store.update_profile(
+            user.id, payload.display_name, payload.photo_url, payload.bio,
+            payload.interests, payload.nationality,
+        )
         return serialize(profile)
 
     @app.post("/me/photo")
@@ -280,8 +331,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return serialize_ride_request(app.state.store, request, exact=True)
 
     @app.post("/ride-requests/expire")
-    def expire_ride_requests(payload: ExpireRequest, user: CurrentUser) -> dict[str, Any]:
-        _ = user
+    def expire_ride_requests(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
         app.state.store.expire_listings(payload.today)
         return {"status": "ok"}
 
@@ -308,8 +358,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.post("/driver-trips/expire")
-    def expire_driver_trips(payload: ExpireRequest, user: CurrentUser) -> dict[str, Any]:
-        _ = user
+    def expire_driver_trips(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
         app.state.store.expire_listings(payload.today)
         return {"status": "ok"}
 
@@ -336,10 +385,18 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return serialize_connection(app.state.store, connection)
 
     @app.post("/connections/expire")
-    def expire_connections(payload: ExpireRequest, user: CurrentUser) -> dict[str, Any]:
-        _ = user
+    def expire_connections(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
         app.state.store.expire_connections(payload.today)
         return {"status": "ok"}
+
+    @app.get("/cron/expire")
+    def cron_expire(_cron: RequireCronSecret) -> dict[str, Any]:
+        # The single entry point Vercel Cron actually calls (Cron Jobs only send
+        # GET requests, so it can't hit the POST endpoints above with a body).
+        today = date.today()
+        app.state.store.expire_listings(today)
+        app.state.store.expire_connections(today)
+        return {"status": "ok", "expired_as_of": today.isoformat()}
 
     @app.get("/me/connections")
     def my_connections(user: CurrentUser) -> list[dict[str, Any]]:
@@ -420,11 +477,30 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         pool = app.state.store.get_pool(pool_id)
         return serialize_pool(app.state.store, pool)
 
+    @app.post("/pools/{pool_id}/messages")
+    def add_pool_message(pool_id: str, payload: PoolMessageCreate, user: CurrentUser) -> dict[str, Any]:
+        message = app.state.store.add_pool_message(user.id, pool_id, payload.model_dump())
+        return serialize(message)
+
+    @app.get("/pools/{pool_id}/messages")
+    def get_pool_messages(pool_id: str, user: CurrentUser) -> list[dict[str, Any]]:
+        return [serialize(m) for m in app.state.store.get_pool_messages(user.id, pool_id)]
+
     # ── Notifications ─────────────────────────────────────────────────────────
 
     @app.get("/notifications")
     def notifications(user: CurrentUser) -> list[dict[str, Any]]:
         return [serialize(n) for n in app.state.store.get_notifications(user.id)]
+
+    @app.post("/notifications/read")
+    def mark_notifications_read(user: CurrentUser) -> dict[str, str]:
+        app.state.store.mark_notifications_read(user.id)
+        return {"status": "ok"}
+
+    @app.delete("/notifications/{notification_id}")
+    def dismiss_notification(notification_id: str, user: CurrentUser) -> dict[str, str]:
+        app.state.store.dismiss_notification(user.id, notification_id)
+        return {"status": "dismissed"}
 
     # ── Public user profiles ──────────────────────────────────────────────────
 
@@ -434,7 +510,14 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         profile = app.state.store.get_profile(target_user_id)
         if not profile:
             raise HTTPException(status_code=404, detail="Profile not found")
-        return {"user_id": profile.user_id, "display_name": profile.display_name, "photo_url": profile.photo_url}
+        return {
+            "user_id": profile.user_id,
+            "display_name": profile.display_name,
+            "photo_url": profile.photo_url,
+            "photo_verified": profile.photo_verified,
+            "interests": profile.interests,
+            "nationality": profile.nationality,
+        }
 
     # ── User actions ──────────────────────────────────────────────────────────
 
@@ -520,6 +603,20 @@ def optional_user(request: Request, authorization: Annotated[str | None, Header(
 CurrentUser = Annotated[User, Depends(current_user)]
 
 
+def require_cron_secret(request: Request, authorization: Annotated[str | None, Header()] = None) -> None:
+    # Expiry sweeps act globally across all users' data, so they must never be
+    # reachable by an arbitrary signed-in user — only the scheduled Vercel Cron
+    # job (or another caller holding the same shared secret) may trigger them.
+    settings = request.app.state.settings
+    if not settings.cron_secret:
+        raise HTTPException(status_code=503, detail="Server is not configured with CRON_SECRET")
+    if authorization != f"Bearer {settings.cron_secret}":
+        raise HTTPException(status_code=401, detail="Invalid or missing cron secret")
+
+
+RequireCronSecret = Annotated[None, Depends(require_cron_secret)]
+
+
 # ─── Serializers ──────────────────────────────────────────────────────────────
 
 def serialize_user(store: Store, user: User) -> dict[str, Any]:
@@ -566,7 +663,15 @@ def serialize_pool(store: Store, pool: Any) -> dict[str, Any]:
     data["destination"] = serialize_location(store, pool.destination_location_id, exact=True)
     members = store.get_pool_members(pool.id)
     data["member_count"] = len(members)
-    data["members"] = [serialize(m) for m in members]
+    data["members"] = [_serialize_pool_member(store, m) for m in members]
+    return data
+
+
+def _serialize_pool_member(store: Store, membership: Any) -> dict[str, Any]:
+    data = serialize(membership)
+    profile = store.get_profile(membership.user_id)
+    data["display_name"] = profile.display_name if profile else None
+    data["photo_url"] = profile.photo_url if profile else None
     return data
 
 
@@ -590,6 +695,3 @@ def _authorize_connection_participant(store: Store, user_id: str, connection_id:
     trip = store.get_driver_trip(connection.driver_trip_id)
     if user_id not in {rr.rider_id, trip.driver_id}:
         raise HTTPException(status_code=403, detail="Only participants can access this connection")
-
-
-app = create_app()

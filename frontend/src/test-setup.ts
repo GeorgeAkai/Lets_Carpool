@@ -1,54 +1,61 @@
 import "@testing-library/jest-dom";
 import React from "react";
-import { vi } from "vitest";
+import { beforeEach, vi } from "vitest";
+import { setMockNeonSession } from "./test-support/neonAuthMock";
+
+// The mock session is a module-level singleton (see test-support/neonAuthMock.ts)
+// so it survives across tests unless explicitly reset — without this, a session
+// set by one test leaks into the next and causes order-dependent failures.
+// sessionStorage (e.g. carpool_mode) is real jsdom state shared across tests in
+// this file for the same reason, so it gets the same treatment.
+beforeEach(() => {
+  setMockNeonSession(null);
+  sessionStorage.clear();
+});
 
 vi.mock("@neondatabase/neon-js/auth/react", async () => {
   const React = await import("react");
-  const { createContext, useMemo, useState } = React;
+  const { createContext, useSyncExternalStore } = React;
+  const { useNavigate } = await import("react-router-dom");
+  const { getMockNeonSession, setMockNeonSession, subscribeMockNeonSession } = await import(
+    "./test-support/neonAuthMock"
+  );
+  type MockNeonSession = ReturnType<typeof getMockNeonSession>;
 
-  type MockSession = { user: { id: string; email: string; name?: string } } | null;
-
-  let currentSession: MockSession = null;
-  let triggerRender: (() => void) | null = null;
-
-  const AuthUIContext = createContext({
+  const AuthUIContext = createContext<{ hooks: { useSession: () => { data: MockNeonSession; isPending: boolean } } }>({
     hooks: {
       useSession: () => ({ data: null, isPending: false }),
     },
   });
 
   function NeonAuthUIProvider({ children }: { children: React.ReactNode }) {
-    const [, forceRender] = useState(0);
+    const session = useSyncExternalStore(subscribeMockNeonSession, getMockNeonSession);
 
-    React.useEffect(() => {
-      triggerRender = () => forceRender((value) => value + 1);
-      return () => {
-        triggerRender = null;
-      };
-    }, []);
-
-    const authValue = useMemo(() => ({
+    const authValue = React.useMemo(() => ({
       hooks: {
-        useSession: () => ({ data: currentSession, isPending: false }),
+        useSession: () => ({ data: session, isPending: false }),
       },
-    }), [currentSession]);
+    }), [session]);
 
     return React.createElement(AuthUIContext.Provider, { value: authValue }, children);
   }
 
   function AuthView({ pathname }: { pathname?: string }) {
+    const navigate = useNavigate();
     const [name, setName] = React.useState("");
     const [email, setEmail] = React.useState("");
 
     const authenticate = () => {
-      currentSession = {
+      setMockNeonSession({
         user: {
           id: "usr_test",
           email: email || "ada@example.com",
           name: name || email.split("@")[0] || "Ada Rider",
         },
-      };
-      triggerRender?.();
+      });
+      // Real Neon Auth UI redirects back to the app after sign-in; Home (and
+      // NeonAuthSync, which syncs the session to the backend) only lives at "/".
+      navigate("/", { replace: true });
     };
 
     const handleSubmit = (event: React.FormEvent) => {
@@ -83,8 +90,23 @@ vi.mock("@neondatabase/neon-js/auth/react", async () => {
 });
 
 vi.mock("@neondatabase/neon-js/auth", () => ({
-  createAuthClient: () => ({ signOut: vi.fn(async () => {}) }),
+  createAuthClient: () => ({
+    signOut: vi.fn(async () => {}),
+  }),
 }));
+
+// fetchNeonJWT (src/lib/auth.ts) does a real fetch to the Neon Auth server's
+// /token endpoint — mocked here so tests don't depend on network access, and
+// so individual test files don't each need to know about this implementation
+// detail of the auth sync flow.
+vi.mock("./lib/auth", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/auth")>();
+  return {
+    ...actual,
+    authClient: { signOut: vi.fn(async () => {}) },
+    fetchNeonJWT: vi.fn(async () => "mock.neon.jwt"),
+  };
+});
 
 class MemoryStorage {
   private store = new Map<string, string>();

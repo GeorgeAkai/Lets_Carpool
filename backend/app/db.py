@@ -60,9 +60,13 @@ def run_migrations(database_url: str) -> None:
             display_name   TEXT NOT NULL,
             photo_url      TEXT,
             bio            TEXT,
-            photo_verified BOOLEAN NOT NULL DEFAULT FALSE
+            photo_verified BOOLEAN NOT NULL DEFAULT FALSE,
+            interests      TEXT[] NOT NULL DEFAULT '{}',
+            nationality    TEXT
         )
     """)
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS interests TEXT[] NOT NULL DEFAULT '{}'")
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS nationality TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS vehicles (
@@ -78,6 +82,8 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
+    cur.execute("CREATE EXTENSION IF NOT EXISTS postgis")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS locations (
             id                TEXT PRIMARY KEY,
@@ -90,6 +96,31 @@ def run_migrations(database_url: str) -> None:
             created_at        TIMESTAMPTZ NOT NULL
         )
     """)
+    # Persisted geography point for PostGIS proximity queries (ST_DWithin) instead
+    # of fetching every open listing and filtering distance in Python. New rows
+    # populate this at insert time (see Store.create_location); this backfills
+    # any rows written before the column existed.
+    cur.execute("ALTER TABLE locations ADD COLUMN IF NOT EXISTS geog GEOGRAPHY(POINT, 4326)")
+    cur.execute("""
+        UPDATE locations SET geog = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
+        WHERE geog IS NULL
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_locations_geog ON locations USING GIST (geog)")
+
+    # Live driver location — persisted (was an in-memory dict, wiped on every
+    # serverless cold start). TTL-style staleness is enforced at query time in
+    # Store.get_nearby_drivers rather than by deleting rows, so a driver who
+    # briefly drops offline doesn't lose their last-known position outright.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS driver_locations (
+            user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            geog        GEOGRAPHY(POINT, 4326) NOT NULL,
+            heading     DOUBLE PRECISION,
+            speed_kmh   DOUBLE PRECISION,
+            updated_at  TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_driver_locations_geo ON driver_locations USING GIST (geog)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ride_requests (
@@ -173,6 +204,7 @@ def run_migrations(database_url: str) -> None:
             read       BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
+    cur.execute("ALTER TABLE notifications ADD COLUMN IF NOT EXISTS related_id TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reports (
@@ -199,6 +231,7 @@ def run_migrations(database_url: str) -> None:
             organizer_id            TEXT NOT NULL REFERENCES users(id),
             community_tag           TEXT NOT NULL,
             trip_date               DATE NOT NULL,
+            departure_time          TIME NOT NULL,
             pickup_location_id      TEXT NOT NULL REFERENCES locations(id),
             destination_location_id TEXT NOT NULL REFERENCES locations(id),
             max_participants        INTEGER NOT NULL,
@@ -208,6 +241,9 @@ def run_migrations(database_url: str) -> None:
             seats_per_vehicle       INTEGER NOT NULL DEFAULT 4
         )
     """)
+    cur.execute("""
+        ALTER TABLE pools ADD COLUMN IF NOT EXISTS departure_time TIME NOT NULL DEFAULT '00:00'
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pool_memberships (
@@ -216,6 +252,16 @@ def run_migrations(database_url: str) -> None:
             role      TEXT NOT NULL,
             joined_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (pool_id, user_id)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pool_messages (
+            id         TEXT PRIMARY KEY,
+            pool_id    TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+            sender_id  TEXT NOT NULL REFERENCES users(id),
+            content    TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
         )
     """)
 

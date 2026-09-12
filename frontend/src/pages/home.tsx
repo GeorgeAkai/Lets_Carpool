@@ -16,7 +16,7 @@ import type { ApiUser, WsMessage } from '../api'
 import { MapView } from '../MapView'
 import type { TripRoute } from '../MapView'
 import { PoolView } from '../PoolView'
-import { authClient } from '../lib/auth'
+import { authClient, fetchNeonJWT } from '../lib/auth'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -485,6 +485,336 @@ function ListingCard({ listing, onConnect, currentUserId }: { listing: Listing; 
   )
 }
 
+// ─── Algorithmic match ranking ─────────────────────────────────────────────────
+//
+// Ranks candidates using only signals that are actually available pre-connection:
+// shared profile interests, verified status, and — when the current user already
+// has an open listing of their own — closeness of target date and flexibility
+// window to it. Exact pickup coordinates are deliberately withheld pre-connection
+// (see the location privacy model), so this does not fabricate a distance/ETA
+// figure the way a full route-corridor match would.
+
+function flexibilityCloseness(a: Flexibility, b: Flexibility): number {
+  if (a === b) return 1
+  if (a === 'flexible' || b === 'flexible') return 0.6
+  return 0.2
+}
+
+function dateCloseness(a: string, b: string): number {
+  const diffDays = Math.abs((new Date(a).getTime() - new Date(b).getTime()) / 86400000)
+  if (Number.isNaN(diffDays)) return 0.5
+  if (diffDays === 0) return 1
+  if (diffDays <= 1) return 0.7
+  if (diffDays <= 3) return 0.4
+  return 0.1
+}
+
+interface EnrichedMatch {
+  listing: Listing
+  profile: api.ApiPublicProfile | null
+  sharedInterests: string[]
+  score: number
+}
+
+function useRankedMatches(
+  candidates: Listing[], referenceListing: MyListing | undefined,
+  currentUserId: string, currentUserInterests: string[],
+): { matches: EnrichedMatch[]; loading: boolean } {
+  const [matches, setMatches] = useState<EnrichedMatch[]>([])
+  const [loading, setLoading] = useState(false)
+  const candidateKey = candidates.map(c => c.id).join(',')
+
+  useEffect(() => {
+    let cancelled = false
+    const pool = candidates.filter(c => c.ownerId !== currentUserId && c.status === 'open')
+    if (pool.length === 0) { setMatches([]); return }
+
+    const preScored = pool.map(listing => {
+      const windowScore = referenceListing
+        ? 0.6 * dateCloseness(listing.date, referenceListing.date) + 0.4 * flexibilityCloseness(listing.flexibility, referenceListing.flexibility)
+        : 0.5
+      return { listing, windowScore }
+    }).sort((a, b) => b.windowScore - a.windowScore).slice(0, 8)
+
+    setLoading(true)
+    Promise.all(preScored.map(({ listing }) => api.getUserProfile(listing.ownerId).catch(() => null)))
+      .then(profiles => {
+        if (cancelled) return
+        const lowerMine = new Set(currentUserInterests.map(i => i.toLowerCase()))
+        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore }, i) => {
+          const profile = profiles[i]
+          const sharedInterests = (profile?.interests ?? []).filter(t => lowerMine.has(t.toLowerCase()))
+          const interestScore = Math.min(sharedInterests.length / 3, 1)
+          const verifiedScore = profile?.photo_verified ? 1 : 0
+          const score = 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
+          return { listing, profile, sharedInterests, score }
+        }).sort((a, b) => b.score - a.score)
+        setMatches(enriched.slice(0, 3))
+      })
+      .finally(() => { if (!cancelled) setLoading(false) })
+
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candidateKey, referenceListing?.id, currentUserId])
+
+  return { matches, loading }
+}
+
+function UserMenuButton({ targetUserId, showToast }: { targetUserId: string; showToast: (msg: string, type: 'success' | 'error') => void }) {
+  const [open, setOpen] = useState(false)
+  const [reportMode, setReportMode] = useState(false)
+  const [reason, setReason] = useState('')
+
+  const handleBlock = async () => {
+    try { await api.blockUser(targetUserId); showToast('User blocked', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to block', 'error') }
+    finally { setOpen(false) }
+  }
+  const handleReport = async () => {
+    if (!reason.trim()) return
+    try { await api.reportUser(targetUserId, reason.trim()); showToast('Report submitted', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to report', 'error') }
+    finally { setOpen(false); setReportMode(false); setReason('') }
+  }
+
+  return (
+    <div className="relative shrink-0">
+      <button onClick={() => setOpen(v => !v)} aria-label="More actions" className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors">
+        <MoreHorizontal className="size-4" />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-8 z-20 w-48 bg-card border border-border rounded-2xl shadow-lg p-2 space-y-1">
+          {!reportMode ? (
+            <>
+              <button onClick={handleBlock} className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-sm text-foreground hover:bg-muted transition-colors"><UserX className="size-3.5" />Block</button>
+              <button onClick={() => setReportMode(true)} className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-sm text-foreground hover:bg-muted transition-colors"><Flag className="size-3.5" />Report</button>
+            </>
+          ) : (
+            <div className="space-y-1.5 p-1">
+              <input autoFocus value={reason} onChange={e => setReason(e.target.value)} placeholder="Reason…" className="w-full px-2.5 py-1.5 rounded-lg bg-input-background border border-transparent text-xs focus:outline-none focus:ring-2 focus:ring-ring/20" />
+              <div className="flex gap-1.5">
+                <button onClick={handleReport} className="flex-1 px-2 py-1.5 rounded-lg bg-destructive text-white text-xs font-medium">Submit</button>
+                <button onClick={() => { setReportMode(false); setOpen(false) }} className="px-2 py-1.5 rounded-lg border border-border text-xs text-muted-foreground">Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function MatchCard({ match, rank, onConnect, showToast }: {
+  match: EnrichedMatch; rank: number
+  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const { listing, profile, sharedInterests } = match
+  const isDriverListing = listing.type === 'driver'
+  const freeSeats = isDriverListing ? (listing.seats! - (listing.seatsUsed ?? 0)) : null
+  const [expanded, setExpanded] = useState(false)
+  const [requesting, setRequesting] = useState(false)
+  const name = profile?.display_name ?? listing.user.name
+  const initials = toInitials(name)
+
+  const handleRequest = async () => {
+    setRequesting(true)
+    try { await onConnect(listing); showToast('Match requested!', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
+    finally { setRequesting(false) }
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: rank * 0.05 }}
+      className="relative bg-card rounded-[1.25rem] border border-border p-5 flex flex-col gap-4"
+    >
+      {rank === 0 && (
+        <span className="absolute -top-2.5 left-5 bg-primary text-primary-foreground text-[10px] font-bold px-2.5 py-1 rounded-full tracking-wide">TOP MATCH</span>
+      )}
+      <div className="flex items-start justify-between gap-3 mt-1">
+        <div className="flex items-center gap-3 min-w-0">
+          {profile?.photo_url ? (
+            <img src={profile.photo_url} alt="" className="size-11 rounded-full object-cover ring-1 ring-border shrink-0" />
+          ) : (
+            <div style={MONO} className="size-11 rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0">{initials}</div>
+          )}
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm font-semibold truncate">{name}</span>
+              {profile?.photo_verified && (
+                <span className="size-4 rounded-full bg-green-500 flex items-center justify-center shrink-0"><Check className="size-2.5 text-white" /></span>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-1.5 mt-1">
+              {profile?.nationality && <span className="text-[11px] px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">{profile.nationality}</span>}
+              {sharedInterests.slice(0, 2).map(tag => (
+                <span key={tag} className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{tag}</span>
+              ))}
+            </div>
+          </div>
+        </div>
+        <UserMenuButton targetUserId={listing.ownerId} showToast={showToast} />
+      </div>
+
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
+          <Calendar className="size-3" /><span>{listing.date}</span>
+          <Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        {isDriverListing ? (
+          <span className="flex items-center gap-1.5"><Users className="size-3.5" /><span style={MONO} className="text-foreground font-medium">{freeSeats}</span> of {listing.seats} seats free</span>
+        ) : (
+          <span className="flex items-center gap-1.5"><Users className="size-3.5" />{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
+        )}
+      </div>
+
+      {expanded && (
+        <div className="rounded-xl bg-muted/50 p-3 space-y-1.5 text-xs text-muted-foreground">
+          {listing.tags.length > 0 && <div className="flex gap-1.5 flex-wrap">{listing.tags.map(t => <TagPill key={t} tag={t} />)}</div>}
+          {isDriverListing && listing.carType && <p className="flex items-center gap-1.5"><Car className="size-3" />{CAR_TYPE_EMOJI[listing.carType]} {CAR_TYPE_LABELS[listing.carType]}</p>}
+          {isDriverListing && listing.luggageCapacity && listing.luggageCapacity !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</p>}
+          {!isDriverListing && listing.luggageSize && listing.luggageSize !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</p>}
+          <p>Posted {listing.postedAt}</p>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          {requesting ? 'Requesting…' : 'Instant Request Match'}
+        </button>
+        <button onClick={() => setExpanded(v => !v)} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors">
+          {expanded ? 'Hide' : 'View Route'}
+        </button>
+      </div>
+    </motion.div>
+  )
+}
+
+function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds }: {
+  listings: Listing[]; referenceListing: MyListing | undefined
+  currentUserId: string; currentUserInterests: string[]
+  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onMatchedIds: (ids: string[]) => void
+}) {
+  const candidates = useMemo(() => listings.filter(l => l.type === 'driver'), [listings])
+  const { matches, loading } = useRankedMatches(candidates, referenceListing, currentUserId, currentUserInterests)
+
+  // Let the parent exclude these from the flat feed below so the same listing
+  // doesn't render twice on screen.
+  const matchedIdsKey = matches.map(m => m.listing.id).join(',')
+  useEffect(() => { onMatchedIds(matches.map(m => m.listing.id)) }, [matchedIdsKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!loading && matches.length === 0) return null
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Best matches for you</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">Ranked by departure window and what you have in common.</p>
+      </div>
+      {loading ? (
+        <p className="text-sm text-muted-foreground animate-pulse">Finding your best matches…</p>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {matches.map((m, i) => <MatchCard key={m.listing.id} match={m} rank={i} onConnect={onConnect} showToast={showToast} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Driver-mode home ───────────────────────────────────────────────────────────
+
+function DriverHomeView({ myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView }: {
+  myOpenTrip: MyListing | undefined; listings: Listing[]
+  currentUserId: string; currentUserInterests: string[]
+  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  setView: (v: View) => void
+}) {
+  const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
+  const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Your route</h1>
+        <p className="text-muted-foreground mt-1">Publish where you're driving, then review who wants a seat.</p>
+      </div>
+
+      {myOpenTrip ? (
+        <div className="rounded-3xl bg-primary text-primary-foreground p-6">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs font-semibold uppercase tracking-wide text-primary-foreground/70">Active trip</span>
+            <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-white/15">Open</span>
+          </div>
+          <div className="flex items-center gap-2 mt-3 text-lg font-semibold">
+            <span className="truncate">{myOpenTrip.from}</span>
+            <ArrowRight className="size-4 text-primary-foreground/60 shrink-0" />
+            <span className="truncate">{myOpenTrip.to}</span>
+          </div>
+          <div className="flex items-center gap-4 mt-2 text-sm text-primary-foreground/80">
+            <span className="flex items-center gap-1.5"><Calendar className="size-3.5" />{myOpenTrip.date}</span>
+            <span className="flex items-center gap-1.5"><Users className="size-3.5" />{myOpenTrip.seats} seat{myOpenTrip.seats !== 1 ? 's' : ''}</span>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-3xl border border-dashed border-border p-6 text-center">
+          <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
+          <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between">
+        <h2 className="text-base font-semibold text-foreground">Requests along your route</h2>
+        {!loading && <span className="text-xs text-muted-foreground">{matches.length} nearby</span>}
+      </div>
+
+      {loading ? (
+        <p className="text-sm text-muted-foreground animate-pulse">Finding nearby requests…</p>
+      ) : matches.length === 0 ? (
+        <p className="text-sm text-muted-foreground py-6 text-center">No ride requests to show yet.</p>
+      ) : (
+        <div className="space-y-2.5">
+          {matches.map(m => {
+            const name = m.profile?.display_name ?? m.listing.user.name
+            return (
+              <div key={m.listing.id} className="bg-card border border-border rounded-2xl p-4 flex items-center gap-3.5">
+                {m.profile?.photo_url ? (
+                  <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
+                ) : (
+                  <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
+                )}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold">{name}</span>
+                    {m.sharedInterests.length > 0 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{m.sharedInterests[0]}</span>}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-0.5 truncate">
+                    <span>{m.listing.from}</span> → <span>{m.listing.to}</span> · {m.listing.passengers} passenger{(m.listing.passengers ?? 0) > 1 ? 's' : ''} · {m.listing.date}
+                  </p>
+                </div>
+                <UserMenuButton targetUserId={m.listing.ownerId} showToast={showToast} />
+                <button onClick={() => onConnect(m.listing).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="shrink-0 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                  Offer Ride
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Feed view ────────────────────────────────────────────────────────────────
 
 function FeedView({
@@ -579,23 +909,27 @@ function FeedView({
 
 // ─── Post view ────────────────────────────────────────────────────────────────
 
-function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null }) {
-  const [type, setType] = useState<ListingType>('driver')
+function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
+  onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null
+  defaultType: ListingType; vehicle: api.ApiVehicle
+}) {
+  const [type, setType] = useState<ListingType>(defaultType)
   const [from, setFrom] = useState<LocationValue | null>(null)
   const [to, setTo] = useState<LocationValue | null>(null)
   const [date, setDate] = useState('')
   const [flexibility, setFlexibility] = useState<Flexibility>('morning')
-  const [seats, setSeats] = useState('3')
+  const [seats, setSeats] = useState(myVehicle?.seats ? String(myVehicle.seats) : '3')
   const [passengers, setPassengers] = useState('1')
   const [gasEstimate, setGasEstimate] = useState('')
   const [tags, setTags] = useState<Set<RideTag>>(new Set())
-  const [vehicle, setVehicle] = useState('')
-  const [carType, setCarType] = useState<CarType | ''>('')
+  const [vehicle, setVehicle] = useState(myVehicle ? [myVehicle.color, myVehicle.make, myVehicle.model].filter(Boolean).join(' ') : '')
+  const [carType, setCarType] = useState<CarType | ''>((myVehicle?.car_type as CarType) ?? '')
   const [luggageSize, setLuggageSize] = useState<LuggageSize>('none')
   const [luggageCapacity, setLuggageCapacity] = useState<LuggageSize>('medium')
   const [declared, setDeclared] = useState(false)
   const [submitted, setSubmitted] = useState(false)
   const [error, setError] = useState('')
+  const autoFilledFromProfile = !!myVehicle
 
   const toggleTag = (tag: RideTag) => setTags(prev => { const n = new Set(prev); n.has(tag) ? n.delete(tag) : n.add(tag); return n })
 
@@ -638,7 +972,7 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
 
       <div className="flex rounded-xl bg-muted p-1 gap-1 mb-8">
         {(['driver', 'rider'] as ListingType[]).map(t => (
-          <button key={t} type="button" onClick={() => setType(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${type === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+          <button key={t} type="button" aria-pressed={type === t} onClick={() => setType(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${type === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
             {t === 'driver' ? "I'm offering a ride" : 'I need a ride'}
           </button>
         ))}
@@ -682,7 +1016,9 @@ function PostView({ onPost, userCoords }: { onPost: (listing: MyListing) => void
 
         {type === 'driver' && (
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Vehicle</label>
+            <label className="text-sm font-medium">
+              Vehicle{autoFilledFromProfile && <span className="text-muted-foreground font-normal"> · auto-filled from your profile</span>}
+            </label>
             <input value={vehicle} onChange={e => setVehicle(e.target.value)} placeholder="e.g. Subaru Outback '23" className={inputCls} />
           </div>
         )}
@@ -809,6 +1145,7 @@ function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onC
 
 function ConnectionCard({
   connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead,
+  autoOpen,
 }: {
   connection: Connection; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
@@ -816,6 +1153,7 @@ function ConnectionCard({
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onMarkRead: (id: string) => void
+  autoOpen?: 'chat' | 'gassplit' | null
 }) {
   const [expanded, setExpanded] = useState<'chat' | 'gassplit' | 'blockreport' | null>(null)
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
@@ -829,6 +1167,7 @@ function ConnectionCard({
   const [reportMode, setReportMode] = useState(false)
   const [busy, setBusy] = useState(false)
   const msgEndRef = useRef<HTMLDivElement>(null)
+  const cardRef = useRef<HTMLDivElement>(null)
 
   const toggleSection = async (section: 'chat' | 'gassplit' | 'blockreport') => {
     const next = expanded === section ? null : section
@@ -844,6 +1183,14 @@ function ConnectionCard({
       try { const s = await api.suggestGasSplit(connection.id); setGasSuggestion(s); setSplitAmount(String((s.amount_cents / 100).toFixed(2))) } catch { /* ignore */ }
     }
   }
+
+  // Deep link from a notification: open the right panel and scroll to this card.
+  useEffect(() => {
+    if (!autoOpen) return
+    cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    toggleSection(autoOpen)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpen])
 
   // Append incoming WS messages from parent-updated connection (via unreadMessages bump)
   const prevUnread = useRef(connection.unreadMessages)
@@ -893,7 +1240,7 @@ function ConnectionCard({
   const hasRouteCoords = !!(connection.pickupLat && connection.destLat)
 
   return (
-    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className="bg-card rounded-3xl border border-border overflow-hidden">
+    <motion.div ref={cardRef} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className={`bg-card rounded-3xl border overflow-hidden transition-colors ${autoOpen ? 'border-primary/50 ring-2 ring-primary/20' : 'border-border'}`}>
       {/* Header strip */}
       <div className="px-6 pt-6 pb-4 space-y-4">
         <div className="flex items-start justify-between gap-4">
@@ -1063,13 +1410,14 @@ function ConnectionCard({
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onMarkRead: (id: string) => void
+  deepLink?: { connectionId: string; section: 'chat' | 'gassplit' } | null
 }) {
   const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
   return (
@@ -1093,7 +1441,8 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} />
+              showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead}
+              autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null} />
           ))}
         </div>
       )}
@@ -1103,8 +1452,27 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
 
 // ─── Notifications view ───────────────────────────────────────────────────────
 
-function NotificationsView({ notifications, onRead }: { notifications: api.ApiNotification[]; onRead: () => void }) {
-  useEffect(() => { onRead() }, [onRead])
+type NotifCategory = 'all' | 'connections' | 'chat' | 'payments'
+
+function notifCategory(type: string): Exclude<NotifCategory, 'all'> {
+  if (type === 'chat_message') return 'chat'
+  if (type === 'gas_split_confirmed') return 'payments'
+  return 'connections'
+}
+
+const NOTIF_FILTERS: { id: NotifCategory; label: string }[] = [
+  { id: 'all', label: 'All' }, { id: 'connections', label: 'Connections' },
+  { id: 'chat', label: 'Chat' }, { id: 'payments', label: 'Payments' },
+]
+
+function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate }: {
+  notifications: api.ApiNotification[]
+  onMarkAllRead: () => void
+  onDismiss: (id: string) => void
+  onNavigate: (n: api.ApiNotification) => void
+}) {
+  const [filter, setFilter] = useState<NotifCategory>('all')
+
   const iconForType = (type: string) => {
     if (type.includes('connection_received')) return <UserPlus className="size-4 text-primary" />
     if (type.includes('accepted') || type.includes('chat_unlocked')) return <Check className="size-4 text-green-600" />
@@ -1113,13 +1481,33 @@ function NotificationsView({ notifications, onRead }: { notifications: api.ApiNo
     if (type.includes('declined') || type.includes('cancelled')) return <X className="size-4 text-red-500" />
     return <Bell className="size-4 text-muted-foreground" />
   }
+
+  const unreadCount = notifications.filter(n => !n.read).length
+  const visible = [...notifications].reverse().filter(n => filter === 'all' || notifCategory(n.type) === filter)
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Notifications</h1>
-        <p className="text-muted-foreground mt-1">Stay up to date on your connections and activity.</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Notifications</h1>
+          <p className="text-muted-foreground mt-1">Stay up to date on your connections and activity.</p>
+        </div>
+        {unreadCount > 0 && (
+          <button onClick={onMarkAllRead} className="shrink-0 text-sm font-semibold text-primary hover:underline">
+            Mark all as read
+          </button>
+        )}
       </div>
-      {notifications.length === 0 ? (
+
+      <div className="flex flex-wrap gap-2">
+        {NOTIF_FILTERS.map(f => (
+          <button key={f.id} onClick={() => setFilter(f.id)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filter === f.id ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {visible.length === 0 ? (
         <div className="text-center py-24 text-muted-foreground">
           <Bell className="size-10 mx-auto mb-4 opacity-20" />
           <p className="font-medium">No notifications</p>
@@ -1127,14 +1515,26 @@ function NotificationsView({ notifications, onRead }: { notifications: api.ApiNo
         </div>
       ) : (
         <div className="space-y-2">
-          {[...notifications].reverse().map(n => (
-            <motion.div key={n.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} className={`flex items-start gap-4 p-4 rounded-2xl border border-border ${n.read ? 'bg-card' : 'bg-primary/5'}`}>
+          {visible.map(n => (
+            <motion.div
+              key={n.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
+              onClick={() => onNavigate(n)}
+              className={`relative flex items-start gap-3 p-4 pl-5 rounded-2xl border cursor-pointer transition-colors ${n.read ? 'bg-card border-border hover:bg-muted/50' : 'bg-primary/10 border-primary/25 hover:bg-primary/15'}`}
+            >
+              {!n.read && <span className="absolute top-5 left-1.5 size-1.5 rounded-full bg-primary" aria-hidden />}
               <div className="mt-0.5 shrink-0">{iconForType(n.type)}</div>
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-semibold text-foreground">{n.title}</p>
                 <p className="text-sm text-muted-foreground mt-0.5">{n.body}</p>
               </div>
               <span className="text-xs text-muted-foreground shrink-0">{relativeTime(n.created_at)}</span>
+              <button
+                onClick={e => { e.stopPropagation(); onDismiss(n.id) }}
+                aria-label="Dismiss notification"
+                className="shrink-0 p-1 rounded-lg text-muted-foreground/50 hover:text-foreground hover:bg-muted transition-colors"
+              >
+                <X className="size-3.5" />
+              </button>
             </motion.div>
           ))}
         </div>
@@ -1150,8 +1550,18 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
   const vehicle = currentUser.vehicle
   const [displayName, setDisplayName] = useState(profile.display_name)
   const [bio, setBio] = useState(profile.bio ?? '')
+  const [interests, setInterests] = useState<string[]>(profile.interests ?? [])
+  const [interestDraft, setInterestDraft] = useState('')
+  const [nationality, setNationality] = useState(profile.nationality ?? '')
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileMsg, setProfileMsg] = useState<{ text: string; ok: boolean } | null>(null)
+
+  const addInterest = () => {
+    const tag = interestDraft.trim()
+    if (tag && !interests.includes(tag)) setInterests(prev => [...prev, tag])
+    setInterestDraft('')
+  }
+  const removeInterest = (tag: string) => setInterests(prev => prev.filter(t => t !== tag))
   const [make, setMake] = useState(vehicle?.make ?? '')
   const [model, setModel] = useState(vehicle?.model ?? '')
   const [color, setColor] = useState(vehicle?.color ?? '')
@@ -1166,8 +1576,11 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
   const saveProfile = async () => {
     setProfileSaving(true); setProfileMsg(null)
     try {
-      const updated = await api.updateProfile(displayName, null, bio || null)
-      onProfileUpdate({ ...currentUser, profile: { ...profile, display_name: updated.display_name, bio: updated.bio } })
+      const updated = await api.updateProfile(displayName, profile.photo_url, bio || null, interests, nationality || null)
+      onProfileUpdate({
+        ...currentUser,
+        profile: { ...profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality },
+      })
       setProfileMsg({ text: 'Profile saved', ok: true })
     } catch (e) { setProfileMsg({ text: e instanceof Error ? e.message : 'Failed to save', ok: false }) }
     finally { setProfileSaving(false) }
@@ -1229,6 +1642,29 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
         <div className="space-y-3">
           <div className="space-y-1.5"><label className="text-sm font-medium">Display name</label><input value={displayName} onChange={e => setDisplayName(e.target.value)} className={inputCls} /></div>
           <div className="space-y-1.5"><label className="text-sm font-medium">Bio</label><textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tell others a bit about yourself…" className={`${inputCls} resize-none`} /></div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">Nationality <span className="text-muted-foreground font-normal">(optional)</span></label>
+            <input value={nationality} onChange={e => setNationality(e.target.value)} placeholder="e.g. Kenyan" className={inputCls} />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">Interests <span className="text-muted-foreground font-normal">(optional icebreakers, e.g. "Loves Afrobeat")</span></label>
+            {interests.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-1">
+                {interests.map(tag => (
+                  <span key={tag} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-muted text-muted-foreground font-medium">
+                    {tag}
+                    <button type="button" onClick={() => removeInterest(tag)} aria-label={`Remove ${tag}`} className="hover:text-foreground"><X className="size-3" /></button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <input
+              value={interestDraft} onChange={e => setInterestDraft(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addInterest() } }}
+              onBlur={addInterest}
+              placeholder="Type an interest and press Enter…" className={inputCls}
+            />
+          </div>
         </div>
         <div className="flex items-center gap-3">
           <button onClick={saveProfile} disabled={profileSaving} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{profileSaving ? 'Saving…' : 'Save profile'}</button>
@@ -1286,9 +1722,12 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
 
 // ─── Neon ↔ Backend session sync ─────────────────────────────────────────────
 
-function NeonAuthSync({ onAuthenticated, onUnauthenticated }: {
-  onAuthenticated: (email: string, name: string) => Promise<void>
+const AUTH_TOKEN_RETRY_LIMIT = 3
+
+function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
+  onAuthenticated: (neonToken: string) => Promise<void>
   onUnauthenticated: () => void
+  onAuthError: (message: string) => void
 }) {
   const ctx = useContext(AuthUIContext)
   const { data: session, isPending } = ctx.hooks.useSession()
@@ -1305,43 +1744,74 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated }: {
     }
     const uid = session.user.id
     if (lastSyncedId.current === uid) return
-    lastSyncedId.current = uid
-    const email = session.user.email
-    const name = (session.user as { name?: string }).name || email.split('@')[0]
-    onAuthenticated(email, name).catch(() => { lastSyncedId.current = null })
-  }, [session?.user?.id, isPending, onAuthenticated, onUnauthenticated])
+
+    // The backend verifies this token's signature itself — it never trusts a
+    // client-supplied email/name (that would let anyone authenticate as anyone).
+    // fetchNeonJWT can reject or resolve null (e.g. the Neon Auth server is
+    // briefly unreachable) — retry a few times with backoff, and surface an
+    // error instead of hanging on "Loading…" forever if it never recovers.
+    let cancelled = false
+
+    const attempt = async (attemptNumber: number): Promise<void> => {
+      try {
+        const token = await fetchNeonJWT()
+        if (cancelled) return
+        if (!token) throw new Error('Neon Auth returned no token')
+        lastSyncedId.current = uid
+        await onAuthenticated(token)
+      } catch {
+        if (cancelled) return
+        if (attemptNumber < AUTH_TOKEN_RETRY_LIMIT) {
+          setTimeout(() => { if (!cancelled) attempt(attemptNumber + 1) }, 1000 * attemptNumber)
+        } else {
+          onAuthError('Could not verify your session. Check your connection and try again.')
+        }
+      }
+    }
+    attempt(1)
+
+    return () => { cancelled = true }
+  }, [session?.user?.id, isPending, onAuthenticated, onUnauthenticated, onAuthError])
 
   return null
 }
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode, onSetMode }: {
   setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
   onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
+  mode: ListingType; onSetMode: (m: ListingType) => void
 }) {
   return (
-    <header className="sticky top-0 z-40 bg-background/90 backdrop-blur border-b border-border">
+    <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
       <div className="max-w-[1240px] mx-auto px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
-        <button onClick={() => setView('feed')} className="text-sm font-semibold text-foreground hover:text-primary transition-colors xl:text-base">Let's Carpool</button>
+        <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors" aria-label="Toggle dark mode">
+            <div className="flex rounded-xl bg-sidebar-accent p-0.5 gap-0.5 mr-1" role="group" aria-label="Passenger or Driver mode">
+              {(['rider', 'driver'] as ListingType[]).map(m => (
+                <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${mode === m ? 'bg-white text-sidebar shadow-sm' : 'text-sidebar-foreground/65 hover:text-sidebar-foreground'}`}>
+                  {m === 'rider' ? 'Passenger' : 'Driver'}
+                </button>
+              ))}
+            </div>
+            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
             </button>
-            <button onClick={() => setView('notifications')} className="relative p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors" aria-label="Notifications">
+            <button onClick={() => setView('notifications')} className="relative p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Notifications">
               <Bell className="size-5" />
               {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[10px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-secondary text-secondary-foreground text-xs font-semibold flex items-center justify-center hover:ring-2 hover:ring-primary/20 transition-all" aria-label="Account" style={MONO}>{initials}</button>
-            <button onClick={onSignOut} className="hidden xl:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors" aria-label="Sign out"><LogOut className="size-4" /><span>Sign out</span></button>
+            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-sidebar-accent text-sidebar-foreground text-xs font-semibold flex items-center justify-center hover:ring-2 hover:ring-sidebar-primary/40 transition-all" aria-label="Account" style={MONO}>{initials}</button>
+            <button onClick={onSignOut} className="hidden xl:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent transition-colors" aria-label="Sign out"><LogOut className="size-4" /><span>Sign out</span></button>
           </div>
         ) : (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-muted text-muted-foreground transition-colors" aria-label="Toggle dark mode">
+            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
             </button>
-            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Sign in</button>
+            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-2xl bg-sidebar-primary text-white text-sm font-semibold hover:opacity-90 transition-colors">Sign in</button>
           </div>
         )}
       </div>
@@ -1389,18 +1859,18 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
     <aside className="bg-sidebar border border-sidebar-border rounded-[2rem] p-6 xl:h-fit">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <p className="text-sm text-muted-foreground">Carpooling app</p>
-          <h1 className="mt-2 text-2xl font-semibold text-foreground">Let's Carpool</h1>
+          <p className="text-sm text-sidebar-foreground/60">Carpooling app</p>
+          <h1 className="mt-2 text-2xl font-semibold text-sidebar-foreground">Let's Carpool</h1>
         </div>
-        <div className="rounded-3xl bg-primary px-3 py-2 text-primary-foreground text-xs font-semibold">MVP</div>
+        <div className="rounded-3xl bg-sidebar-primary px-3 py-2 text-white text-xs font-semibold">MVP</div>
       </div>
       <div className="mt-8 space-y-1.5">
         {items.map(item => (
-          <button key={item.id} type="button" onClick={() => setView(item.id)} className={`w-full rounded-3xl px-4 py-3 text-left text-sm font-medium transition-all ${view === item.id ? 'bg-primary text-primary-foreground shadow-lg shadow-primary/10' : 'text-muted-foreground hover:bg-muted'}`}>
+          <button key={item.id} type="button" onClick={() => setView(item.id)} className={`w-full rounded-3xl px-4 py-3 text-left text-sm font-medium transition-all ${view === item.id ? 'bg-sidebar-primary text-white shadow-lg shadow-sidebar-primary/20' : 'text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
             {item.label}
           </button>
         ))}
-        <button type="button" onClick={onSignOut} className="w-full rounded-3xl px-4 py-3 text-left text-sm font-medium text-muted-foreground hover:bg-muted transition-all flex items-center gap-2"><LogOut className="size-4" />Sign out</button>
+        <button type="button" onClick={onSignOut} className="w-full rounded-3xl px-4 py-3 text-left text-sm font-medium text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-all flex items-center gap-2"><LogOut className="size-4" />Sign out</button>
       </div>
       <div className="mt-8 rounded-[2rem] bg-card p-6 shadow-[0_36px_60px_-40px_rgba(0,0,0,0.18)]">
         <div className="flex items-center gap-3">
@@ -1428,6 +1898,8 @@ export function Home() {
   // ── Auth ──
   const [currentUser, setCurrentUser] = useState<ApiUser | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('carpool_dark') === 'true')
@@ -1450,6 +1922,10 @@ export function Home() {
   // ── Navigation ──
   const [view, setView] = useState<View>('feed')
 
+  // ── Passenger/Driver mode ── persists per session; switches primary actions/views
+  const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
+  useEffect(() => { sessionStorage.setItem('carpool_mode', mode) }, [mode])
+
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
   const [filterType, setFilterType] = useState<'all' | 'driver' | 'rider'>('all')
@@ -1457,6 +1933,7 @@ export function Home() {
   const [filterCarType, setFilterCarType] = useState<'' | CarType>('')
   const [filterLuggage, setFilterLuggage] = useState<'' | LuggageSize>('')
   const [allListings, setAllListings] = useState<Listing[]>([])
+  const [matchedListingIds, setMatchedListingIds] = useState<string[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
 
   // ── My Listings ──
@@ -1472,7 +1949,7 @@ export function Home() {
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
-  const [notifRead, setNotifRead] = useState(false)
+  const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'chat' | 'gassplit' } | null>(null)
 
   // ── WebSocket ──
   const wsRef = useRef<WebSocket | null>(null)
@@ -1497,8 +1974,7 @@ export function Home() {
         const senderName = conn?.withUser.name ?? 'Someone'
         const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
         showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
-        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false }, ...prev])
-        setNotifRead(false)
+        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
       } else if (msg.type === 'driver_nearby') {
@@ -1510,20 +1986,31 @@ export function Home() {
   }, [currentUser])
 
   // ── Neon session → backend sync ──
-  const handleAuthenticated = useCallback(async (email: string, name: string) => {
+  const handleAuthenticated = useCallback(async (neonToken: string) => {
     try {
       const existingToken = localStorage.getItem('carpool_token')
       if (existingToken) {
         try { const user = await api.getMe(); setCurrentUser(user); requestLocation(); return }
         catch { localStorage.removeItem('carpool_token') }
       }
-      const user = await api.login(name, email)
+      const user = await api.login(neonToken)
       setCurrentUser(user); requestLocation()
+      setAuthError(null)
     } finally { setAuthLoading(false) }
   }, [requestLocation])
 
   const handleUnauthenticated = useCallback(() => {
-    api.logout(); setCurrentUser(null); setAuthLoading(false)
+    api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
+  }, [])
+
+  // Fires only after NeonAuthSync exhausts its retries — e.g. the Neon Auth
+  // server is unreachable — so the UI never hangs on "Loading…" forever.
+  const handleAuthError = useCallback((message: string) => {
+    setAuthError(message); setAuthLoading(false)
+  }, [])
+
+  const retryAuth = useCallback(() => {
+    setAuthError(null); setAuthLoading(true); setAuthRetryNonce(n => n + 1)
   }, [])
 
   // ── Redirect when not authenticated ──
@@ -1651,11 +2138,34 @@ export function Home() {
     setView('map')
   }, [])
 
-  const onNotifRead = useCallback(() => {
-    setNotifRead(true); setNotifications(prev => prev.map(n => ({ ...n, read: true })))
+  const onMarkAllReadNotifs = useCallback(() => {
+    setNotifications(prev => prev.map(n => ({ ...n, read: true })))
+    api.markNotificationsRead().catch(() => {})
   }, [])
 
-  const unreadCount = notifRead ? 0 : notifications.filter(n => !n.read).length
+  const onDismissNotif = useCallback((id: string) => {
+    setNotifications(prev => prev.filter(n => n.id !== id))
+    if (!id.startsWith('ws_')) api.dismissNotification(id).catch(() => {})
+  }, [])
+
+  const onNotifNavigate = useCallback((n: api.ApiNotification) => {
+    setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
+    if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
+      setConnDeepLink({ connectionId: n.related_id, section: 'chat' })
+      setView('connections')
+    } else if (n.related_id && n.type === 'gas_split_confirmed') {
+      setConnDeepLink({ connectionId: n.related_id, section: 'gassplit' })
+      setView('connections')
+    } else if (n.type === 'pool_joined') {
+      setConnDeepLink(null)
+      setView('pools')
+    } else {
+      setConnDeepLink(null)
+      setView('connections')
+    }
+  }, [])
+
+  const unreadCount = notifications.filter(n => !n.read).length
   const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
@@ -1664,16 +2174,38 @@ export function Home() {
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 
+  // Switching into Driver mode without a vehicle on file routes into the
+  // existing vehicle setup form (on the Profile view) instead of silently
+  // switching modes with nothing for the user to actually do as a driver yet.
+  const handleSetMode = useCallback((m: ListingType) => {
+    setMode(m)
+    if (m === 'driver' && !currentUser?.vehicle) setView('profile')
+  }, [currentUser?.vehicle])
+
   const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools']
   const guardedView: View = !currentUser && AUTH_VIEWS.includes(view) ? 'feed' : view
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
 
+  // Session verification failed after retrying — never leave the user stuck
+  // on an infinite "Loading…" spinner with no way forward.
+  if (authError) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-4 px-6 text-center">
+        <p className="text-sm text-muted-foreground max-w-xs">{authError}</p>
+        <div className="flex items-center gap-3">
+          <button onClick={retryAuth} className="px-4 py-2 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Retry</button>
+          <button onClick={onSignOut} className="px-4 py-2 rounded-2xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Sign out</button>
+        </div>
+      </div>
+    )
+  }
+
   // Show loading while session is resolving
   if (authLoading) {
     return (
       <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <NeonAuthSync onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} />
+        <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
       </div>
     )
@@ -1681,15 +2213,15 @@ export function Home() {
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <NeonAuthSync onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} />
+    return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
-      <NeonAuthSync onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} />
+      <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
-      <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setDarkMode(d => !d)} />
+      <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setDarkMode(d => !d)} mode={mode} onSetMode={handleSetMode} />
 
       <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
         <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
@@ -1698,14 +2230,30 @@ export function Home() {
           </div>
           <main className="min-w-0">
             {guardedView === 'feed' && (
-              <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} listings={filteredListings} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} />
+              mode === 'driver' ? (
+                <DriverHomeView
+                  myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
+                  listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
+                  onConnect={onConnect} showToast={showToast} setView={setView}
+                />
+              ) : (
+                <div className="space-y-8">
+                  <BestMatches
+                    listings={allListings}
+                    referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
+                    currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
+                    onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds}
+                  />
+                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} />
+                </div>
+              )
             )}
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
-            {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} />}
+            {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} />}
-            {guardedView === 'notifications' && <NotificationsView notifications={notifications} onRead={onNotifRead} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} deepLink={connDeepLink} />}
+            {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} />}
           </main>
         </div>
