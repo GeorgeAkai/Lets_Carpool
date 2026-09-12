@@ -322,6 +322,47 @@ def test_riders_and_drivers_publish_searchable_one_off_listings() -> None:
     assert requests[0]["id"] == ride_request["id"]
 
 
+def test_search_excludes_listings_with_a_past_target_date() -> None:
+    # Search must never show a stale listing on its own, regardless of
+    # whether the hourly expire sweep has run yet — a driver/rider shouldn't
+    # see (or be offered) a ride for a date that's already passed.
+    api = client()
+    _, rider_headers = auth(api, "past-rider@example.edu", "Past Rider")
+    _, driver_headers = auth(api, "past-driver@example.com", "Past Driver")
+    pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
+    destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    past_request = api.post(
+        "/ride-requests", headers=rider_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": yesterday, "flexibility": "morning", "passenger_count": 1, "tags": [],
+        },
+    ).json()
+    past_trip = api.post(
+        "/driver-trips", headers=driver_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": yesterday, "flexibility": "morning", "seats_available": 2, "tags": [],
+        },
+    ).json()
+
+    trips = api.get("/driver-trips/search", headers=rider_headers).json()
+    requests = api.get("/ride-requests/search", headers=driver_headers).json()
+
+    assert past_trip["id"] not in {t["id"] for t in trips}
+    assert past_request["id"] not in {r["id"] for r in requests}
+
+    # Search should also actually archive them (flip status), not just hide
+    # them from this result set — so it doesn't depend on the hourly cron
+    # sweep having run to keep "My Listings" and other views honest too.
+    my_trips = api.get("/me/driver-trips", headers=driver_headers).json()
+    my_requests = api.get("/me/ride-requests", headers=rider_headers).json()
+    assert next(t for t in my_trips if t["id"] == past_trip["id"])["status"] == "expired"
+    assert next(r for r in my_requests if r["id"] == past_request["id"])["status"] == "expired"
+
+
 def test_search_excludes_driver_trips_outside_the_destination_radius() -> None:
     api = client()
     _, rider_headers, _, _, _, driver_trip = make_request_and_trip(api)

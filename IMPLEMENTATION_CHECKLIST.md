@@ -15,6 +15,16 @@ Found after the initial Phase 0–3 pass shipped, from a real user report. Root 
 
 30/30 backend tests, 24/24 frontend tests passing (backend suite has occasional single-test flakiness from this sandbox's clock jumping mid-session, documented above — not a code issue, reruns clean).
 
+## 🔴 Post-ship fix: stale listings stayed in the feed indefinitely
+
+`search_driver_trips`/`search_ride_requests` had **no date filter at all** — they returned any `open`/`matched` listing regardless of `target_date`, relying entirely on the hourly `/cron/expire` sweep (issue 25) to flip old ones to `expired` before they'd disappear. Since that sweep depends on an external scheduler actually being wired up (Vercel Cron / GCP Cloud Scheduler / the Azure timer — still in flux per the recent deployment discussion), past-dated listings could sit visible in the feed indefinitely in the meantime.
+
+Fixed with two changes in `backend/app/domain.py`:
+1. Both search queries now filter `target_date >= CURRENT_DATE` directly in SQL — the feed is correct immediately, independent of whether any cron is actually running.
+2. Both search calls now also call `expire_listings()` themselves first (idempotent, cheap — matches ~0 rows once a listing is already archived) — so listings actually get archived (`status = 'expired'`, visible as such in "My Listings") just from normal app usage, not only when/if the external scheduler fires.
+
+2 new backend tests: one confirms past-dated listings never appear in search, the other confirms they're actually archived (status flips to `expired`) as a side effect. 31/31 backend tests passing.
+
 ## Phase 0 — Design system foundation
 - [x] 34. Apply navy/sky-blue design tokens (`frontend/src/styles/theme.css`); reskinned `TopBar`/`Sidebar` to navy structural surfaces via the existing `--sidebar-*` token family
 

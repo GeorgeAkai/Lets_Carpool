@@ -1,0 +1,27 @@
+# Only backend/, api/, and requirements.txt actually go into the image
+# (see Dockerfile) — everything else here is excluded from the build context.
+frontend/
+node_modules/
+.venv/
+.git/
+.github/
+azure/
+docs/
+*.md
+backend/tests/
+backend/migrations/
+backend/.env
+backend/.env.example
+.env
+.env.*
+.run_logs/
+*.pid
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+*.egg-info/
+Dockerfile
+.dockerignore

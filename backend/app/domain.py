@@ -705,6 +705,12 @@ class Store:
     # ─── Search ───────────────────────────────────────────────────────────────
 
     def search_driver_trips(self, user_id: str, query: dict[str, Any]) -> list[DriverTrip]:
+        # Actually archive stale listings here too, not just filter them out of
+        # this result set — search is the one path guaranteed to run on every
+        # page load, so it doesn't depend on the cron sweep (GET /cron/expire)
+        # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
+        # once a listing has already been archived once.
+        self.expire_listings(now_utc().date())
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "dt.destination_location_id", "dt.pickup_location_id",
         )
@@ -714,6 +720,7 @@ class Store:
                 f"""SELECT dt.* FROM driver_trips dt
                    {joins}
                    WHERE dt.status IN ('open', 'matched')
+                   AND dt.target_date >= CURRENT_DATE
                    {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
@@ -728,6 +735,7 @@ class Store:
         return [t for t in trips if self._listing_matches_query(t, query)]
 
     def search_ride_requests(self, user_id: str, query: dict[str, Any]) -> list[RideRequest]:
+        self.expire_listings(now_utc().date())
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "rr.destination_location_id", "rr.pickup_location_id",
         )
@@ -737,6 +745,7 @@ class Store:
                 f"""SELECT rr.* FROM ride_requests rr
                    {joins}
                    WHERE rr.status IN ('open', 'matched')
+                   AND rr.target_date >= CURRENT_DATE
                    {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
