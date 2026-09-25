@@ -633,6 +633,8 @@ def serialize_ride_request(store: Store, request: Any, exact: bool) -> dict[str,
     data = serialize(request)
     data["pickup"] = serialize_location(store, request.pickup_location_id, exact)
     data["destination"] = serialize_location(store, request.destination_location_id, exact)
+    rider_profile = store.get_profile(request.rider_id)
+    data["rider_name"] = rider_profile.display_name if rider_profile else None
     return data
 
 
@@ -640,6 +642,8 @@ def serialize_driver_trip(store: Store, trip: Any, exact: bool) -> dict[str, Any
     data = serialize(trip)
     data["pickup"] = serialize_location(store, trip.pickup_location_id, exact)
     data["destination"] = serialize_location(store, trip.destination_location_id, exact)
+    driver_profile = store.get_profile(trip.driver_id)
+    data["driver_name"] = driver_profile.display_name if driver_profile else None
     return data
 
 

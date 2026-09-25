@@ -31,6 +31,7 @@ export type LocationView = { id: string; label: string; exact: boolean; latitude
 export type ApiDriverTrip = {
   id: string;
   driver_id: string;
+  driver_name: string | null;
   pickup: LocationView;
   destination: LocationView;
   target_date: string;
@@ -47,6 +48,7 @@ export type ApiDriverTrip = {
 export type ApiRideRequest = {
   id: string;
   rider_id: string;
+  rider_name: string | null;
   pickup: LocationView;
   destination: LocationView;
   target_date: string;

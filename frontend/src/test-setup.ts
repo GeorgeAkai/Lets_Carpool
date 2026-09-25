@@ -137,3 +137,9 @@ Object.defineProperty(window, "matchMedia", {
     dispatchEvent: () => false,
   }),
 });
+
+// jsdom doesn't implement scrollIntoView at all — several chat/auto-scroll
+// call sites use it as a fire-and-forget UX nicety (msgEndRef.current?.scrollIntoView(...)).
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}

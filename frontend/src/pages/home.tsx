@@ -11,6 +11,7 @@ import {
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
 import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
+import { useTheme } from '@neondatabase/auth-ui'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView } from '../MapView'
@@ -244,9 +245,10 @@ function apiFlexibility(f: string): Flexibility {
 const VALID_RIDE_TAGS = new Set(['airport', 'student', 'church', 'college', 'work', 'event'])
 
 function tripToListing(trip: api.ApiDriverTrip): Listing {
+  const name = trip.driver_name ?? 'Driver'
   return {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
-    user: { name: 'Driver', initials: 'DR', verified: false },
+    user: { name, initials: toInitials(name), verified: false },
     from: trip.pickup.label, to: trip.destination.label,
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
@@ -259,9 +261,10 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
 }
 
 function requestToListing(req: api.ApiRideRequest): Listing {
+  const name = req.rider_name ?? 'Rider'
   return {
     id: req.id, type: 'rider', apiId: req.id, ownerId: req.rider_id,
-    user: { name: 'Rider', initials: 'RD', verified: false },
+    user: { name, initials: toInitials(name), verified: false },
     from: req.pickup.label, to: req.destination.label,
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
@@ -1145,7 +1148,7 @@ function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onC
 
 function ConnectionCard({
   connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead,
-  autoOpen,
+  autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
@@ -1154,8 +1157,16 @@ function ConnectionCard({
   onViewRoute: (conn: Connection) => void
   onMarkRead: (id: string) => void
   autoOpen?: 'chat' | 'gassplit' | null
+  isActive: boolean
+  onActivate: () => void
 }) {
   const [expanded, setExpanded] = useState<'chat' | 'gassplit' | 'blockreport' | null>(null)
+
+  // Another card became the active one — collapse this one so only a single
+  // panel is ever open across the inbox at a time.
+  useEffect(() => {
+    if (!isActive) setExpanded(null)
+  }, [isActive])
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
   const [msgsLoaded, setMsgsLoaded] = useState(false)
   const [msgText, setMsgText] = useState('')
@@ -1172,6 +1183,7 @@ function ConnectionCard({
   const toggleSection = async (section: 'chat' | 'gassplit' | 'blockreport') => {
     const next = expanded === section ? null : section
     setExpanded(next)
+    if (next !== null) onActivate()
     if (next === 'chat') {
       onMarkRead(connection.id)
       if (!msgsLoaded) {
@@ -1420,6 +1432,10 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
   deepLink?: { connectionId: string; section: 'chat' | 'gassplit' } | null
 }) {
   const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
+  // Only one card's chat/gas-split/report panel stays open at a time — opening
+  // a different one collapses whatever was open before, instead of letting
+  // several expand simultaneously and cluttering the inbox.
+  const [openConnectionId, setOpenConnectionId] = useState<string | null>(null)
   return (
     <div className="space-y-6">
       <div>
@@ -1442,7 +1458,8 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
               showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead}
-              autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null} />
+              autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
+              isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
         </div>
       )}
@@ -1902,11 +1919,13 @@ export function Home() {
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
-  const [darkMode, setDarkMode] = useState(() => localStorage.getItem('carpool_dark') === 'true')
-  useEffect(() => {
-    document.documentElement.classList.toggle('dark', darkMode)
-    localStorage.setItem('carpool_dark', String(darkMode))
-  }, [darkMode])
+  // Driven by next-themes (via NeonAuthUIProvider in App.tsx), not a separate
+  // mechanism of our own — it already owns the `class` on <html>, persists to
+  // localStorage, and is active on every route (Home never having mounted was
+  // exactly why the old carpool_dark-based toggle didn't survive across pages:
+  // NeonAuthUIProvider wraps every route and would silently overwrite it).
+  const { resolvedTheme, setTheme } = useTheme()
+  const darkMode = resolvedTheme === 'dark'
 
   // ── Geolocation ──
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null)
@@ -2014,11 +2033,16 @@ export function Home() {
   }, [])
 
   // ── Redirect when not authenticated ──
+  // Must not fire when authError is set — otherwise this immediately bounces
+  // the user to the plain sign-in form before they ever see the "couldn't
+  // verify your session" screen (with its Retry/Sign out actions) below,
+  // since authLoading and currentUser==null are both already true at that
+  // point too.
   useEffect(() => {
-    if (!authLoading && !currentUser) {
+    if (!authLoading && !currentUser && !authError) {
       navigate('/auth/sign-in', { replace: true })
     }
-  }, [authLoading, currentUser, navigate])
+  }, [authLoading, currentUser, authError, navigate])
 
   useEffect(() => {
     if (!authLoading && currentUser && window.location.pathname.startsWith('/auth/')) {
@@ -2221,7 +2245,7 @@ export function Home() {
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
-      <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setDarkMode(d => !d)} mode={mode} onSetMode={handleSetMode} />
+      <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} onSetMode={handleSetMode} />
 
       <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
         <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
