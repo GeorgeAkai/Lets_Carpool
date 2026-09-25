@@ -87,7 +87,7 @@ describe("API configuration", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await login("Ada", "ada@example.com");
+    await login("mock.neon.jwt");
 
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.any(Object));
   });
@@ -96,6 +96,11 @@ describe("API configuration", () => {
 describe("Auth gate", () => {
   beforeEach(() => {
     localStorage.clear();
+    // Guards against the "retryable error" test below leaking its rejected
+    // mock into every later test if it ever fails before reaching its own
+    // cleanup line — vi.restoreAllMocks() doesn't reset plain vi.fn() mocks
+    // created inside vi.mock(), only ones made with vi.spyOn().
+    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
   });
 
   afterEach(() => {
@@ -330,7 +335,7 @@ describe("Post listing view", () => {
     await user.click(screen.getByRole("button", { name: /post listing/i }));
 
     await waitFor(() => {
-      const calls = fetchMock.mock.calls.map(([url]: [string]) => String(url).replace(BASE, ""));
+      const calls = fetchMock.mock.calls.map(([url]: unknown[]) => String(url).replace(BASE, ""));
       expect(calls).toContain("/locations");
       expect(calls).toContain("/driver-trips");
     });
@@ -468,7 +473,7 @@ describe("Connections view", () => {
     await user.click(acceptBtn);
 
     await waitFor(() => {
-      const calls = fetchMock.mock.calls.map(([url]: [string]) =>
+      const calls = fetchMock.mock.calls.map(([url]: unknown[]) =>
         String(url).replace(BASE, "")
       );
       expect(calls.some((c) => c.includes("/transition"))).toBe(true);
@@ -515,11 +520,54 @@ describe("Connections view", () => {
     await user.click(declineBtn);
 
     await waitFor(() => {
-      const calls = fetchMock.mock.calls.map(([url]: [string]) =>
+      const calls = fetchMock.mock.calls.map(([url]: unknown[]) =>
         String(url).replace(BASE, "")
       );
       expect(calls.some((c) => c.includes("/transition"))).toBe(true);
     });
+  });
+
+  it("keeps only one connection's chat open at a time, to avoid inbox clutter", async () => {
+    const user = userEvent.setup();
+
+    const makeConnection = (id: string, driverId: string, driverName: string) => ({
+      id, ride_request_id: `rrq_${id}`, driver_trip_id: `trp_${id}`,
+      initiator_user_id: "usr_abc", status: "accepted",
+      created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z",
+      ride_request: { ...RIDE_REQUEST_1, id: `rrq_${id}`, rider_id: "usr_abc" },
+      driver_trip: { ...DRIVER_TRIP_1, id: `trp_${id}`, driver_id: driverId },
+      driver_profile: { user_id: driverId, display_name: driverName, photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+    });
+    const connectionA = makeConnection("con_a", "usr_driver_a", "Driver Alpha");
+    const connectionB = makeConnection("con_b", "usr_driver_b", "Driver Beta");
+
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/connections": [connectionA, connectionB],
+      "GET /connections/con_a/messages": [
+        { id: "msg_a", connection_id: "con_a", sender_id: "usr_driver_a", content: "Message from Alpha", kind: "free_text", created_at: "2026-05-24T00:00:00Z" },
+      ],
+      "GET /connections/con_b/messages": [
+        { id: "msg_b", connection_id: "con_b", sender_id: "usr_driver_b", content: "Message from Beta", kind: "free_text", created_at: "2026-05-24T00:00:00Z" },
+      ],
+    });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/find your ride/i));
+
+    await user.click(screen.getByRole("button", { name: /inbox/i }));
+    await waitFor(() => screen.getByText("Driver Alpha"));
+    expect(screen.getByText("Driver Beta")).toBeTruthy();
+
+    const chatButtons = screen.getAllByRole("button", { name: /^chat$/i });
+    await user.click(chatButtons[0]);
+    await waitFor(() => screen.getByText("Message from Alpha"));
+
+    await user.click(chatButtons[1]);
+    await waitFor(() => screen.getByText("Message from Beta"));
+    expect(screen.queryByText("Message from Alpha")).toBeNull();
   });
 });
 

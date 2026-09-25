@@ -321,30 +321,37 @@ def test_riders_and_drivers_publish_searchable_one_off_listings() -> None:
     assert trips[0]["destination"]["exact"] is False
     assert requests[0]["id"] == ride_request["id"]
 
+    # Search/listing cards must show the actual poster's name, not a generic
+    # "Driver"/"Rider" placeholder.
+    assert trips[0]["driver_name"] == "Dee Driver"
+    assert requests[0]["rider_name"] == "Riley Rider"
+
 
 def test_search_excludes_listings_with_a_past_target_date() -> None:
     # Search must never show a stale listing on its own, regardless of
     # whether the hourly expire sweep has run yet — a driver/rider shouldn't
-    # see (or be offered) a ride for a date that's already passed.
+    # see (or be offered) a ride for a date that's already passed. Use a date
+    # unambiguously outside the 1-day timezone-safety grace period (see the
+    # next test for why exactly "yesterday" is deliberately still visible).
     api = client()
     _, rider_headers = auth(api, "past-rider@example.edu", "Past Rider")
     _, driver_headers = auth(api, "past-driver@example.com", "Past Driver")
     pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
     destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    clearly_past = (date.today() - timedelta(days=3)).isoformat()
 
     past_request = api.post(
         "/ride-requests", headers=rider_headers,
         json={
             "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
-            "target_date": yesterday, "flexibility": "morning", "passenger_count": 1, "tags": [],
+            "target_date": clearly_past, "flexibility": "morning", "passenger_count": 1, "tags": [],
         },
     ).json()
     past_trip = api.post(
         "/driver-trips", headers=driver_headers,
         json={
             "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
-            "target_date": yesterday, "flexibility": "morning", "seats_available": 2, "tags": [],
+            "target_date": clearly_past, "flexibility": "morning", "seats_available": 2, "tags": [],
         },
     ).json()
 
@@ -361,6 +368,34 @@ def test_search_excludes_listings_with_a_past_target_date() -> None:
     my_requests = api.get("/me/ride-requests", headers=rider_headers).json()
     assert next(t for t in my_trips if t["id"] == past_trip["id"])["status"] == "expired"
     assert next(r for r in my_requests if r["id"] == past_request["id"])["status"] == "expired"
+
+
+def test_search_keeps_yesterdays_listings_visible_as_a_timezone_safety_buffer() -> None:
+    # Regression test: a listing dated "yesterday" by the DB server's (UTC)
+    # clock can still be "today" for a rider/driver west of UTC — which is
+    # every US timezone. Without this buffer, refreshing the page in the
+    # evening could make a same-day listing vanish (and get archived) purely
+    # from a UTC-vs-local date mismatch, not because it actually expired.
+    api = client()
+    _, rider_headers = auth(api, "tz-rider@example.edu", "TZ Rider")
+    _, driver_headers = auth(api, "tz-driver@example.com", "TZ Driver")
+    pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
+    destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    trip = api.post(
+        "/driver-trips", headers=driver_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": yesterday, "flexibility": "morning", "seats_available": 2, "tags": [],
+        },
+    ).json()
+
+    trips = api.get("/driver-trips/search", headers=rider_headers).json()
+    my_trips = api.get("/me/driver-trips", headers=driver_headers).json()
+
+    assert trip["id"] in {t["id"] for t in trips}
+    assert next(t for t in my_trips if t["id"] == trip["id"])["status"] == "open"
 
 
 def test_search_excludes_driver_trips_outside_the_destination_radius() -> None:
@@ -480,7 +515,10 @@ def test_listings_can_be_cancelled_and_expired_out_of_discovery() -> None:
         json={
             "pickup_location_id": pickup["id"],
             "destination_location_id": destination["id"],
-            "target_date": (date.today() - timedelta(days=1)).isoformat(),
+            # A day-old listing sits inside the timezone-safety grace period
+            # (expire_listings only archives things more than 1 day past) —
+            # use a date unambiguously outside that window instead.
+            "target_date": (date.today() - timedelta(days=3)).isoformat(),
             "flexibility": "yesterday",
             "passenger_count": 1,
             "tags": ["student"],

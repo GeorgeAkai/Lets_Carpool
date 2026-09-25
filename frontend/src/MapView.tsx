@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
+import { useTheme } from "@neondatabase/auth-ui"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
 import { MapPin, Navigation, Clock, Ruler, DollarSign, X } from "lucide-react"
@@ -34,6 +35,16 @@ const CAR_EMOJIS: Record<string, string> = {
   suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", sedan: "🚗", other: "🚗",
 }
 
+// ── Theme-aware map tiles ───────────────────────────────────────────────────
+// CartoDB's Voyager/Dark Matter basemaps are a big visual step up from plain
+// OSM tiles and give us a clean light + dark pair that tracks the app theme.
+const TILE_URL_LIGHT = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+const TILE_URL_DARK = "https://{s}.basemaps.cartocdn.com/rastertiles/dark_matter/{z}/{x}/{y}{r}.png"
+const TILE_ATTRIBUTION =
+  '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>'
+const ACCENT_LIGHT = "#0284c7"
+const ACCENT_DARK = "#38bdf8"
+
 // ── Marker motion interpolation (pure, unit-testable) ──────────────────────────
 // Smoothly glides a Leaflet marker between successive polled positions instead of
 // snapping, the way Uber/Google Maps animate a live driver dot.
@@ -52,6 +63,16 @@ export function lerpAngle(a: number, b: number, t: number): number {
   return (a + diff * t + 360) % 360
 }
 
+/** Compass bearing in degrees from one lat/lng point to another (0 = north, 90 = east). */
+export function bearingDegrees(from: [number, number], to: [number, number]): number {
+  const lat1 = (from[0] * Math.PI) / 180
+  const lat2 = (to[0] * Math.PI) / 180
+  const dLon = ((to[1] - from[1]) * Math.PI) / 180
+  const y = Math.sin(dLon) * Math.cos(lat2)
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon)
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360
+}
+
 interface MarkerAnimation {
   from: [number, number]
   to: [number, number]
@@ -65,21 +86,24 @@ interface MarkerAnimation {
 // its latest known position rather than snapping then sitting idle.
 const MARKER_ANIM_DURATION_MS = 9200
 
-function makeCarIcon(heading: number | null) {
-  const rotate = `transform: rotate(${heading ?? 0}deg);`
+// A live-tracking car marker in the spirit of Uber's driver dot: an emoji badge
+// with a small compass wedge that rotates to the driver's heading, plus a
+// pulsing halo while it's actively "en route" toward the selected rider.
+function makeCarIcon(heading: number | null, opts: { tracking?: boolean; accent?: string } = {}) {
+  const rotate = heading ?? 0
+  const accent = opts.accent ?? ACCENT_LIGHT
   return L.divIcon({
-    html: `<div style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;${rotate}">
-      <svg width="26" height="26" viewBox="0 0 30 30" style="filter:drop-shadow(0 2px 5px rgba(0,0,0,.4))">
-        <path d="M15 2 L25 25 L15 19.5 L5 25 Z" fill="#2848c8" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round"/>
-      </svg>
+    html: `<div class="carpool-car-icon${opts.tracking ? " tracking" : ""}" style="--carpool-accent:${accent}">
+      <div class="carpool-car-heading" style="transform:rotate(${rotate}deg)"></div>
+      <div class="carpool-car-emoji">🚗</div>
     </div>`,
-    className: "", iconSize: [30, 30], iconAnchor: [15, 15],
+    className: "", iconSize: [38, 38], iconAnchor: [19, 19],
   })
 }
 
-function makeUserIcon() {
+function makeUserIcon(accent: string = ACCENT_LIGHT) {
   return L.divIcon({
-    html: `<div style="width:14px;height:14px;border-radius:50%;background:#2848c8;border:3px solid #fff;box-shadow:0 0 0 3px #2848c880;animation:userPulse 2s ease-in-out infinite"></div>`,
+    html: `<div style="width:14px;height:14px;border-radius:50%;background:${accent};border:3px solid #fff;box-shadow:0 0 0 3px ${accent}80;animation:userPulse 2s ease-in-out infinite"></div>`,
     className: "", iconSize: [14, 14], iconAnchor: [7, 7],
   })
 }
@@ -143,8 +167,13 @@ interface Props {
 }
 
 export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: Props) {
+  const { resolvedTheme } = useTheme()
+  const isDark = resolvedTheme === "dark"
+  const accentColor = isDark ? ACCENT_DARK : ACCENT_LIGHT
+
   const mapRef = useRef<L.Map | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const tileLayerRef = useRef<L.TileLayer | null>(null)
   const markersRef = useRef<Record<string, L.Marker>>({})
   const markerHeadingsRef = useRef<Record<string, number>>({})
   const animsRef = useRef<Record<string, MarkerAnimation>>({})
@@ -167,13 +196,18 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
     if (!containerRef.current || mapRef.current) return
     const center: L.LatLngTuple = userCoords ? [userCoords.lat, userCoords.lng] : [37.7749, -122.4194]
     const map = L.map(containerRef.current, { zoomControl: true, attributionControl: true }).setView(center, 13)
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    tileLayerRef.current = L.tileLayer(isDark ? TILE_URL_DARK : TILE_URL_LIGHT, {
+      attribution: TILE_ATTRIBUTION,
       maxZoom: 19,
     }).addTo(map)
     mapRef.current = map
-    return () => { map.remove(); mapRef.current = null }
+    return () => { map.remove(); mapRef.current = null; tileLayerRef.current = null }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Swap tile theme when the app's light/dark mode changes ─────────────────
+  useEffect(() => {
+    tileLayerRef.current?.setUrl(isDark ? TILE_URL_DARK : TILE_URL_LIGHT)
+  }, [isDark])
 
   // ── User marker ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -182,11 +216,11 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
     if (userMarkerRef.current) {
       userMarkerRef.current.setLatLng([userCoords.lat, userCoords.lng])
     } else {
-      userMarkerRef.current = L.marker([userCoords.lat, userCoords.lng], { icon: makeUserIcon(), zIndexOffset: 1000 })
+      userMarkerRef.current = L.marker([userCoords.lat, userCoords.lng], { icon: makeUserIcon(accentColor), zIndexOffset: 1000 })
         .addTo(map).bindPopup("You are here")
       map.setView([userCoords.lat, userCoords.lng], 13)
     }
-  }, [userCoords, tripRoute])
+  }, [userCoords, tripRoute, accentColor])
 
   // ── Trip route mode ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -227,7 +261,7 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
       if (result) {
         // Draw the road route
         const geoLayer = L.geoJSON(result.geometry as GeoJSON.GeoJsonObject, {
-          style: { color: "#2848c8", weight: 5, opacity: 0.9, lineCap: "round", lineJoin: "round" },
+          style: { color: accentColor, weight: 5, opacity: 0.9, lineCap: "round", lineJoin: "round" },
         }).addTo(mapRef.current)
         routeLayerRef.current = geoLayer
         mapRef.current.fitBounds(geoLayer.getBounds(), { padding: [60, 60] })
@@ -235,7 +269,7 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
       } else {
         // Fallback: straight-line dashed route
         const line = L.polyline([[pickupLat, pickupLng], [destLat, destLng]], {
-          color: "#2848c8", weight: 4, dashArray: "10 8", opacity: 0.7,
+          color: accentColor, weight: 4, dashArray: "10 8", opacity: 0.7,
         }).addTo(mapRef.current)
         routeLayerRef.current = line
       }
@@ -247,13 +281,13 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
     if (!tripRoute && mapRef.current && userCoords) {
       // Re-add user marker
       if (!userMarkerRef.current) {
-        userMarkerRef.current = L.marker([userCoords.lat, userCoords.lng], { icon: makeUserIcon(), zIndexOffset: 1000 })
+        userMarkerRef.current = L.marker([userCoords.lat, userCoords.lng], { icon: makeUserIcon(accentColor), zIndexOffset: 1000 })
           .addTo(mapRef.current).bindPopup("You are here")
       } else {
         userMarkerRef.current.addTo(mapRef.current)
       }
     }
-  }, [tripRoute, userCoords])
+  }, [tripRoute, userCoords, accentColor])
 
   // ── Fetch nearby drivers (only in normal mode) ──────────────────────────────
   const fetchDrivers = useCallback(async () => {
@@ -297,6 +331,9 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
   }, [])
 
   // ── Update driver markers ───────────────────────────────────────────────────
+  // The selected driver's heading is overridden to point straight at the rider
+  // (Uber-style "driver en route to you"), rather than its raw GPS heading.
+  const trackingRef = useRef<Record<string, boolean>>({})
   useEffect(() => {
     const map = mapRef.current
     if (!map || tripRoute) return
@@ -305,7 +342,10 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
     for (const d of drivers) {
       seen.add(d.user_id)
       const marker = markersRef.current[d.user_id]
-      const targetHeading = d.heading ?? markerHeadingsRef.current[d.user_id] ?? 0
+      const tracking = selected?.user_id === d.user_id
+      const targetHeading = tracking && userCoords
+        ? bearingDegrees([d.latitude, d.longitude], [userCoords.lat, userCoords.lng])
+        : (d.heading ?? markerHeadingsRef.current[d.user_id] ?? 0)
       if (marker) {
         const prevAnim = animsRef.current[d.user_id]
         const t = prevAnim ? Math.min(1, (now - prevAnim.start) / prevAnim.duration) : 1
@@ -316,10 +356,16 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
           fromHeading: currentHeading, toHeading: targetHeading,
           start: now, duration: MARKER_ANIM_DURATION_MS,
         }
+        if (trackingRef.current[d.user_id] !== tracking) {
+          trackingRef.current[d.user_id] = tracking
+          marker.setIcon(makeCarIcon(currentHeading, { tracking, accent: accentColor }))
+          marker.setZIndexOffset(tracking ? 800 : 0)
+        }
         marker.setPopupContent(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`)
       } else {
+        trackingRef.current[d.user_id] = tracking
         markerHeadingsRef.current[d.user_id] = targetHeading
-        const m = L.marker([d.latitude, d.longitude], { icon: makeCarIcon(targetHeading) })
+        const m = L.marker([d.latitude, d.longitude], { icon: makeCarIcon(targetHeading, { tracking, accent: accentColor }), zIndexOffset: tracking ? 800 : 0 })
           .addTo(map)
           .bindPopup(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`)
           .on("click", () => setSelected(d))
@@ -332,12 +378,13 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
         delete markersRef.current[uid]
         delete animsRef.current[uid]
         delete markerHeadingsRef.current[uid]
+        delete trackingRef.current[uid]
       }
     }
     if (rafIdRef.current == null && Object.keys(animsRef.current).length > 0) {
       rafIdRef.current = requestAnimationFrame(stepMarkerAnimations)
     }
-  }, [drivers, tripRoute, stepMarkerAnimations])
+  }, [drivers, tripRoute, stepMarkerAnimations, selected, userCoords, accentColor])
 
   // ── Route to selected nearby driver ────────────────────────────────────────
   useEffect(() => {
@@ -350,14 +397,20 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
         setNearbyRoute(r)
         const line = L.polyline(
           [[userCoords.lat, userCoords.lng], [selected.latitude, selected.longitude]],
-          { color: "#2848c8", weight: 3, dashArray: "8 6", opacity: 0.8 },
+          { color: accentColor, weight: 3, dashArray: "10 9", opacity: 0.85, className: "carpool-flow-line" },
         ).addTo(mapRef.current!)
         routeLayerRef.current = line
         mapRef.current!.fitBounds(line.getBounds(), { padding: [40, 40] })
+        userMarkerRef.current
+          ?.bindTooltip(`🚗 ${r.duration_minutes} min away`, {
+            permanent: true, direction: "top", offset: [0, -10], className: "carpool-eta-tooltip",
+          })
+          .openTooltip()
       })
       .catch(() => {})
       .finally(() => setLoadingRoute(false))
-  }, [selected, userCoords, tripRoute])
+    return () => { userMarkerRef.current?.unbindTooltip() }
+  }, [selected, userCoords, tripRoute, accentColor])
 
   // ── Share my location as a driver ───────────────────────────────────────────
   const toggleSharing = useCallback(() => {
@@ -491,7 +544,7 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
               <h3 className="text-lg font-semibold">{selected.display_name}</h3>
               <p className="text-sm text-muted-foreground">{selected.vehicle ?? selected.car_type ?? "Unknown vehicle"} · {selected.distance_meters}m away</p>
             </div>
-            <button onClick={() => { setSelected(null); routeLayerRef.current?.remove(); routeLayerRef.current = null }} className="text-muted-foreground hover:text-foreground text-sm">✕</button>
+            <button onClick={() => { setSelected(null); routeLayerRef.current?.remove(); routeLayerRef.current = null; userMarkerRef.current?.unbindTooltip() }} className="text-muted-foreground hover:text-foreground text-sm">✕</button>
           </div>
           {loadingRoute && <p className="text-sm text-muted-foreground animate-pulse">Calculating route…</p>}
           {nearbyRoute && (
@@ -541,7 +594,50 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
       )}
 
       <style>{`
-        @keyframes userPulse { 0%,100%{box-shadow:0 0 0 3px #2848c880} 50%{box-shadow:0 0 0 6px #2848c840} }
+        @keyframes userPulse { 0%,100%{box-shadow:0 0 0 3px ${accentColor}80} 50%{box-shadow:0 0 0 6px ${accentColor}40} }
+
+        /* Car marker: emoji badge + rotating heading wedge, Uber-style */
+        .carpool-car-icon { position:relative; width:38px; height:38px; }
+        .carpool-car-icon::before {
+          content:""; position:absolute; inset:0; border-radius:50%; background:var(--carpool-accent); opacity:0;
+        }
+        .carpool-car-icon.tracking::before { animation: carpoolTrackPulse 1.6s ease-out infinite; }
+        .carpool-car-heading { position:absolute; inset:0; transform-origin:50% 50%; }
+        .carpool-car-heading::after {
+          content:""; position:absolute; top:-2px; left:50%; margin-left:-5px;
+          width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent;
+          border-bottom:9px solid var(--carpool-accent); filter:drop-shadow(0 1px 1px rgba(0,0,0,.4));
+        }
+        .carpool-car-emoji {
+          position:absolute; inset:0; margin:auto; width:30px; height:30px; font-size:18px; line-height:1;
+          display:flex; align-items:center; justify-content:center; border-radius:50%; background:#fff;
+          box-shadow:0 2px 8px rgba(0,0,0,.35), 0 0 0 2px var(--carpool-accent);
+        }
+        .carpool-car-icon.tracking .carpool-car-emoji { box-shadow:0 2px 10px rgba(0,0,0,.4), 0 0 0 3px var(--carpool-accent); }
+        .dark .carpool-car-emoji { background:#111a2e; }
+        @keyframes carpoolTrackPulse {
+          0% { opacity:.35; transform:scale(1); }
+          100% { opacity:0; transform:scale(2.6); }
+        }
+
+        /* Flowing dashed route line between a tracked driver and the rider */
+        .carpool-flow-line { animation: carpoolFlow 0.9s linear infinite; }
+        @keyframes carpoolFlow { to { stroke-dashoffset: -19px; } }
+
+        /* ETA tooltip pinned above the rider marker while tracking a driver */
+        .carpool-eta-tooltip {
+          background: var(--card, #fff); color: var(--foreground, #0f172a);
+          border: 1px solid var(--border, rgba(15,23,42,.1)); border-radius: 10px;
+          font-size: 12px; font-weight: 600; padding: 4px 8px; box-shadow: 0 2px 8px rgba(0,0,0,.15);
+        }
+        .carpool-eta-tooltip::before { border-top-color: var(--card, #fff); }
+
+        /* Dark-mode Leaflet chrome so it doesn't look like a light-mode overlay */
+        .dark .leaflet-control-zoom a { background:#111a2e; color:#e2e8f0; border-color:rgba(148,163,184,.16); }
+        .dark .leaflet-control-zoom a:hover { background:#1e293b; }
+        .dark .leaflet-control-attribution { background:rgba(11,18,32,.75); color:#94a3b8; }
+        .dark .leaflet-control-attribution a { color:#38bdf8; }
+        .dark .leaflet-popup-content-wrapper, .dark .leaflet-popup-tip { background:#111a2e; color:#e2e8f0; }
       `}</style>
     </div>
   )

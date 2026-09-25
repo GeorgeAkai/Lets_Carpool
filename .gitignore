@@ -25,3 +25,5 @@ carpool.egg-info/
 htmlcov/
 .ruff_cache/
 .mypy_cache/
+azure/cron-expire-function/local.settings.json
+azure/cron-expire-function/.python_packages/
