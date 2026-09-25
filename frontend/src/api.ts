@@ -1,5 +1,5 @@
 const DEFAULT_BASE = "http://localhost:8000";
-const BASE = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
+export const BASE = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_BASE).replace(/\/+$/, "");
 const WS_BASE = BASE.replace(/^http/, "ws");
 
 function token(): string | null {
@@ -80,6 +80,8 @@ export type ApiProfile = {
   photo_url: string | null;
   bio: string | null;
   photo_verified: boolean;
+  interests: string[];
+  nationality: string | null;
 };
 
 export type ApiVehicle = {
@@ -128,6 +130,7 @@ export type ApiPool = {
   community_tag: string;
   description: string | null;
   trip_date: string;
+  departure_time: string;
   pickup: LocationView;
   destination: LocationView;
   max_participants: number;
@@ -143,6 +146,16 @@ export type ApiPoolMembership = {
   user_id: string;
   role: string;
   joined_at: string;
+  display_name: string | null;
+  photo_url: string | null;
+};
+
+export type ApiPoolMessage = {
+  id: string;
+  pool_id: string;
+  sender_id: string;
+  content: string;
+  created_at: string;
 };
 
 export type NearbyDriver = {
@@ -179,7 +192,7 @@ export type WsMessage =
   | { type: "pong" };
 
 export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
-  if (BASE.includes("neon.tech") && !BASE.includes("localhost")) {
+  if (!BASE.includes("localhost") && !BASE.includes("127.0.0.1")) {
     return null;
   }
 
@@ -207,8 +220,8 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(name: string, email: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { name, email });
+export async function login(neonToken: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }
@@ -223,8 +236,17 @@ export function getMe(): Promise<ApiUser> {
   return request<ApiUser>("GET", "/me");
 }
 
-export function updateProfile(displayName: string, photoUrl?: string | null, bio?: string | null): Promise<ApiProfile> {
-  return request<ApiProfile>("PATCH", "/me/profile", { display_name: displayName, photo_url: photoUrl, bio });
+export function updateProfile(
+  displayName: string,
+  photoUrl?: string | null,
+  bio?: string | null,
+  interests?: string[],
+  nationality?: string | null,
+): Promise<ApiProfile> {
+  return request<ApiProfile>("PATCH", "/me/profile", {
+    display_name: displayName, photo_url: photoUrl, bio,
+    interests: interests ?? [], nationality: nationality ?? null,
+  });
 }
 
 export function uploadPhoto(photoDataUrl: string): Promise<ApiProfile> {
@@ -418,6 +440,7 @@ export function createPool(data: {
   name: string;
   community_tag: string;
   trip_date: string;
+  departure_time: string;
   pickup_location_id: string;
   destination_location_id: string;
   max_participants: number;
@@ -435,7 +458,28 @@ export function leavePool(poolId: string): Promise<{ status: string }> {
   return request<{ status: string }>("POST", `/pools/${poolId}/leave`);
 }
 
+export function getPoolMessages(poolId: string): Promise<ApiPoolMessage[]> {
+  return request<ApiPoolMessage[]>("GET", `/pools/${poolId}/messages`);
+}
+
+export function sendPoolMessage(poolId: string, content: string): Promise<ApiPoolMessage> {
+  return request<ApiPoolMessage>("POST", `/pools/${poolId}/messages`, { content });
+}
+
 // ─── Users ────────────────────────────────────────────────────────────────────
+
+export type ApiPublicProfile = {
+  user_id: string;
+  display_name: string;
+  photo_url: string | null;
+  photo_verified: boolean;
+  interests: string[];
+  nationality: string | null;
+};
+
+export function getUserProfile(targetUserId: string): Promise<ApiPublicProfile> {
+  return request<ApiPublicProfile>("GET", `/users/${targetUserId}/profile`);
+}
 
 export function blockUser(targetUserId: string): Promise<{ status: string }> {
   return request<{ status: string }>("POST", `/users/${targetUserId}/block`);
@@ -455,10 +499,19 @@ export type ApiNotification = {
   body: string;
   created_at: string;
   read: boolean;
+  related_id: string | null;
 };
 
 export function getNotifications(): Promise<ApiNotification[]> {
   return request<ApiNotification[]>("GET", "/notifications");
+}
+
+export function markNotificationsRead(): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", "/notifications/read");
+}
+
+export function dismissNotification(notificationId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("DELETE", `/notifications/${notificationId}`);
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from math import asin, cos, radians, sin, sqrt
 from typing import Any, Literal
 from uuid import uuid4
 
 import psycopg2.extras
 
-from backend.app.db import get_conn, init_pool, run_migrations
+from backend.app.db import close_pool, get_conn, init_pool, run_migrations
 
 
 ListingStatus = Literal["open", "expired", "matched", "cancelled", "completed"]
@@ -89,6 +89,8 @@ class Profile:
     photo_url: str | None = None
     bio: str | None = None
     photo_verified: bool = False
+    interests: list[str] = field(default_factory=list)
+    nationality: str | None = None
 
 
 @dataclass
@@ -196,6 +198,7 @@ class Notification:
     body: str
     created_at: datetime
     read: bool = False
+    related_id: str | None = None
 
 
 @dataclass
@@ -214,6 +217,7 @@ class Pool:
     organizer_id: str
     community_tag: str
     trip_date: date
+    departure_time: time
     pickup_location_id: str
     destination_location_id: str
     max_participants: int
@@ -229,6 +233,15 @@ class PoolMembership:
     user_id: str
     role: str
     joined_at: datetime
+
+
+@dataclass
+class PoolMessage:
+    id: str
+    pool_id: str
+    sender_id: str
+    content: str
+    created_at: datetime
 
 
 @dataclass
@@ -255,6 +268,7 @@ def _row_to_profile(r: dict) -> Profile:
         user_id=r["user_id"], display_name=r["display_name"],
         photo_url=r["photo_url"], bio=r["bio"],
         photo_verified=r["photo_verified"],
+        interests=list(r["interests"] or []), nationality=r["nationality"],
     )
 
 def _row_to_vehicle(r: dict) -> Vehicle:
@@ -335,13 +349,14 @@ def _row_to_notification(r: dict) -> Notification:
     return Notification(
         id=r["id"], user_id=r["user_id"], type=r["type"],
         title=r["title"], body=r["body"], created_at=r["created_at"],
-        read=r["read"],
+        read=r["read"], related_id=r["related_id"],
     )
 
 def _row_to_pool(r: dict) -> Pool:
     return Pool(
         id=r["id"], name=r["name"], organizer_id=r["organizer_id"],
         community_tag=r["community_tag"], trip_date=r["trip_date"],
+        departure_time=r["departure_time"],
         pickup_location_id=r["pickup_location_id"],
         destination_location_id=r["destination_location_id"],
         max_participants=r["max_participants"], status=r["status"],
@@ -355,15 +370,23 @@ def _row_to_membership(r: dict) -> PoolMembership:
         role=r["role"], joined_at=r["joined_at"],
     )
 
+def _row_to_pool_message(r: dict) -> PoolMessage:
+    return PoolMessage(
+        id=r["id"], pool_id=r["pool_id"], sender_id=r["sender_id"],
+        content=r["content"], created_at=r["created_at"],
+    )
+
 
 # ─── Store ────────────────────────────────────────────────────────────────────
 
 class Store:
     def __init__(self, database_url: str) -> None:
         run_migrations(database_url)
+        # Closes any pool from a previous Store instance in this process before
+        # opening a new one — otherwise each new Store() (every test's client())
+        # leaks the old pool's connections instead of releasing them.
+        close_pool()
         init_pool(database_url)
-        # driver_locations stay in-memory — they're ephemeral live GPS data
-        self.driver_locations: dict[str, DriverLocation] = {}
 
     def _cur(self, conn):
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -411,17 +434,22 @@ class Store:
 
     # ─── Profile ──────────────────────────────────────────────────────────────
 
-    def update_profile(self, user_id: str, display_name: str, photo_url: str | None, bio: str | None) -> Profile:
+    def update_profile(
+        self, user_id: str, display_name: str, photo_url: str | None, bio: str | None,
+        interests: list[str] | None = None, nationality: str | None = None,
+    ) -> Profile:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                """INSERT INTO profiles (user_id, display_name, photo_url, bio)
-                   VALUES (%s, %s, %s, %s)
+                """INSERT INTO profiles (user_id, display_name, photo_url, bio, interests, nationality)
+                   VALUES (%s, %s, %s, %s, %s, %s)
                    ON CONFLICT (user_id) DO UPDATE
                    SET display_name = EXCLUDED.display_name,
                        photo_url    = EXCLUDED.photo_url,
-                       bio          = EXCLUDED.bio""",
-                (user_id, display_name, photo_url, bio),
+                       bio          = EXCLUDED.bio,
+                       interests    = EXCLUDED.interests,
+                       nationality  = EXCLUDED.nationality""",
+                (user_id, display_name, photo_url, bio, interests or [], nationality),
             )
             cur.execute("SELECT * FROM profiles WHERE user_id = %s", (user_id,))
             return _row_to_profile(cur.fetchone())
@@ -502,10 +530,12 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 """INSERT INTO locations (id, label, latitude, longitude, provider,
-                       provider_place_id, metadata, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                       provider_place_id, metadata, created_at, geog)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                           ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography)""",
                 (loc.id, loc.label, loc.latitude, loc.longitude, loc.provider,
-                 loc.provider_place_id, json.dumps(loc.metadata), loc.created_at),
+                 loc.provider_place_id, json.dumps(loc.metadata), loc.created_at,
+                 loc.longitude, loc.latitude),
             )
         return loc
 
@@ -675,40 +705,86 @@ class Store:
     # ─── Search ───────────────────────────────────────────────────────────────
 
     def search_driver_trips(self, user_id: str, query: dict[str, Any]) -> list[DriverTrip]:
+        # Actually archive stale listings here too, not just filter them out of
+        # this result set — search is the one path guaranteed to run on every
+        # page load, so it doesn't depend on the cron sweep (GET /cron/expire)
+        # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
+        # once a listing has already been archived once.
+        self.expire_listings(now_utc().date())
+        joins, geo_conditions, geo_params = self._geo_search_clauses(
+            query, "dt.destination_location_id", "dt.pickup_location_id",
+        )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                """SELECT dt.* FROM driver_trips dt
+                f"""SELECT dt.* FROM driver_trips dt
+                   {joins}
                    WHERE dt.status IN ('open', 'matched')
+                   AND dt.target_date >= CURRENT_DATE
+                   {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
                        WHERE (blocker_id = %s AND blocked_id = dt.driver_id)
                           OR (blocker_id = dt.driver_id AND blocked_id = %s)
                    )
                    ORDER BY dt.created_at DESC""",
-                (user_id, user_id),
+                (*geo_params, user_id, user_id),
             )
             trips = [_row_to_driver_trip(r) for r in cur.fetchall()]
 
         return [t for t in trips if self._listing_matches_query(t, query)]
 
     def search_ride_requests(self, user_id: str, query: dict[str, Any]) -> list[RideRequest]:
+        self.expire_listings(now_utc().date())
+        joins, geo_conditions, geo_params = self._geo_search_clauses(
+            query, "rr.destination_location_id", "rr.pickup_location_id",
+        )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                """SELECT rr.* FROM ride_requests rr
+                f"""SELECT rr.* FROM ride_requests rr
+                   {joins}
                    WHERE rr.status IN ('open', 'matched')
+                   AND rr.target_date >= CURRENT_DATE
+                   {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
                        WHERE (blocker_id = %s AND blocked_id = rr.rider_id)
                           OR (blocker_id = rr.rider_id AND blocked_id = %s)
                    )
                    ORDER BY rr.created_at DESC""",
-                (user_id, user_id),
+                (*geo_params, user_id, user_id),
             )
             requests = [_row_to_ride_request(r) for r in cur.fetchall()]
 
         return [r for r in requests if self._listing_matches_query(r, query)]
+
+    @staticmethod
+    def _geo_search_clauses(
+        query: dict[str, Any], destination_fk: str, pickup_fk: str,
+    ) -> tuple[str, str, list[Any]]:
+        """Builds the JOIN/WHERE fragments and params for PostGIS ST_DWithin
+        radius filtering, pushed into SQL instead of fetched-then-Python-filtered.
+        Fragment strings are static (never built from request input); only the
+        bind parameters carry request-supplied values."""
+        joins: list[str] = []
+        conditions: list[str] = []
+        params: list[Any] = []
+        if query.get("destination_latitude") is not None:
+            joins.append(f"JOIN locations dest_loc ON dest_loc.id = {destination_fk}")
+            conditions.append("AND ST_DWithin(dest_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)")
+            params += [
+                query["destination_longitude"], query["destination_latitude"],
+                query.get("destination_radius_meters", 1000),
+            ]
+        if query.get("pickup_latitude") is not None:
+            joins.append(f"JOIN locations pickup_loc ON pickup_loc.id = {pickup_fk}")
+            conditions.append("AND ST_DWithin(pickup_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)")
+            params += [
+                query["pickup_longitude"], query["pickup_latitude"],
+                query.get("pickup_radius_meters", 5000),
+            ]
+        return " ".join(joins), " ".join(conditions), params
 
     # ─── Connections ──────────────────────────────────────────────────────────
 
@@ -742,7 +818,7 @@ class Store:
             )
         recipient = trip.driver_id if user_id == rr.rider_id else rr.rider_id
         self.notify(recipient, "connection_received", "New carpool interest",
-                    "You have a new pending connection.")
+                    "You have a new pending connection.", related_id=conn_obj.id)
         return conn_obj
 
     def get_connection(self, connection_id: str) -> Connection:
@@ -793,11 +869,11 @@ class Store:
                 )
             connection.status = "accepted"
             self.notify(connection.initiator_user_id, "connection_accepted",
-                        "Connection accepted", "Your carpool connection was accepted.")
+                        "Connection accepted", "Your carpool connection was accepted.", related_id=connection.id)
             self.notify(rr.rider_id, "chat_unlocked", "Chat unlocked",
-                        "Full chat is available for your accepted connection.")
+                        "Full chat is available for your accepted connection.", related_id=connection.id)
             self.notify(trip.driver_id, "chat_unlocked", "Chat unlocked",
-                        "Full chat is available for your accepted connection.")
+                        "Full chat is available for your accepted connection.", related_id=connection.id)
 
         elif action == "decline":
             if connection.status != "pending":
@@ -841,6 +917,7 @@ class Store:
                 cur.execute("UPDATE ride_requests SET status = 'completed' WHERE id = %s", (rr.id,))
                 cur.execute("UPDATE driver_trips SET status = 'completed' WHERE id = %s", (trip.id,))
             connection.status = "completed"
+            connection.completed_confirmed_by = confirmed
         else:
             raise DomainError(f"Unsupported connection action: {action}")
 
@@ -896,7 +973,7 @@ class Store:
                 (msg.id, msg.connection_id, msg.sender_id, msg.content, msg.kind, msg.created_at),
             )
         other_id = trip.driver_id if user_id == rr.rider_id else rr.rider_id
-        self.notify(other_id, "chat_message", "New chat message", content)
+        self.notify(other_id, "chat_message", "New chat message", content, related_id=msg.connection_id)
         return msg
 
     def get_messages(self, connection_id: str) -> list[Message]:
@@ -961,7 +1038,7 @@ class Store:
             )
         other_id = trip.driver_id if user_id == rr.rider_id else rr.rider_id
         self.notify(other_id, "gas_split_confirmed", "Gas split confirmed",
-                    "A participant confirmed the gas split.")
+                    "A participant confirmed the gas split.", related_id=confirmation.connection_id)
         return confirmation
 
     def get_gas_splits(self, connection_id: str) -> list[GasSplitConfirmation]:
@@ -988,6 +1065,7 @@ class Store:
         pool = Pool(
             id=new_id("pol"), name=name, organizer_id=organizer_id,
             community_tag=community_tag, trip_date=data["trip_date"],
+            departure_time=data["departure_time"],
             pickup_location_id=data["pickup_location_id"],
             destination_location_id=data["destination_location_id"],
             max_participants=max_participants, status="open",
@@ -998,11 +1076,11 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 """INSERT INTO pools (id, name, organizer_id, community_tag, trip_date,
-                       pickup_location_id, destination_location_id, max_participants,
+                       departure_time, pickup_location_id, destination_location_id, max_participants,
                        status, created_at, description, seats_per_vehicle)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (pool.id, pool.name, pool.organizer_id, pool.community_tag,
-                 pool.trip_date, pool.pickup_location_id, pool.destination_location_id,
+                 pool.trip_date, pool.departure_time, pool.pickup_location_id, pool.destination_location_id,
                  pool.max_participants, pool.status, pool.created_at,
                  pool.description, pool.seats_per_vehicle),
             )
@@ -1052,7 +1130,7 @@ class Store:
             if count + 1 >= pool.max_participants:
                 cur.execute("UPDATE pools SET status = 'full' WHERE id = %s", (pool_id,))
         self.notify(pool.organizer_id, "pool_joined", "New pool member",
-                    f"Someone joined your pool: {pool.name}")
+                    f"Someone joined your pool: {pool.name}", related_id=pool_id)
         return membership
 
     def leave_pool(self, user_id: str, pool_id: str) -> None:
@@ -1096,7 +1174,50 @@ class Store:
             )
             return [_row_to_membership(r) for r in cur.fetchall()]
 
-    # ─── Driver Location Tracking (in-memory — ephemeral live GPS) ────────────
+    def is_pool_member(self, user_id: str, pool_id: str) -> bool:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "SELECT 1 FROM pool_memberships WHERE pool_id = %s AND user_id = %s",
+                (pool_id, user_id),
+            )
+            return cur.fetchone() is not None
+
+    def add_pool_message(self, user_id: str, pool_id: str, data: dict[str, Any]) -> PoolMessage:
+        if not self.is_pool_member(user_id, pool_id):
+            raise DomainError("Only pool members can message", 403)
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise DomainError("Message content is required")
+        msg = PoolMessage(
+            id=new_id("pmsg"), pool_id=pool_id, sender_id=user_id,
+            content=content, created_at=now_utc(),
+        )
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "INSERT INTO pool_messages (id, pool_id, sender_id, content, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (msg.id, msg.pool_id, msg.sender_id, msg.content, msg.created_at),
+            )
+        return msg
+
+    def get_pool_messages(self, user_id: str, pool_id: str) -> list[PoolMessage]:
+        if not self.is_pool_member(user_id, pool_id):
+            raise DomainError("Only pool members can read messages", 403)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "SELECT * FROM pool_messages WHERE pool_id = %s ORDER BY created_at ASC",
+                (pool_id,),
+            )
+            return [_row_to_pool_message(r) for r in cur.fetchall()]
+
+    # ─── Driver Location Tracking (Postgres + PostGIS — persists across cold starts) ──
+
+    # Locations older than this are treated as stale and excluded from nearby
+    # results, rather than deleted outright, so a driver who briefly drops
+    # offline doesn't lose their last-known position for no reason.
+    DRIVER_LOCATION_TTL_MINUTES = 5
 
     def update_driver_location(self, user_id: str, data: dict[str, Any]) -> DriverLocation:
         loc = DriverLocation(
@@ -1107,29 +1228,52 @@ class Store:
             speed_kmh=data.get("speed_kmh"),
             updated_at=now_utc(),
         )
-        self.driver_locations[user_id] = loc
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO driver_locations (user_id, geog, heading, speed_kmh, updated_at)
+                   VALUES (%s, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET geog = EXCLUDED.geog, heading = EXCLUDED.heading,
+                       speed_kmh = EXCLUDED.speed_kmh, updated_at = EXCLUDED.updated_at""",
+                (user_id, loc.longitude, loc.latitude, loc.heading, loc.speed_kmh, loc.updated_at),
+            )
         return loc
 
     def get_nearby_drivers(self, lat: float, lng: float, radius_meters: float = 10000) -> list[dict[str, Any]]:
+        stale_before = now_utc() - timedelta(minutes=self.DRIVER_LOCATION_TTL_MINUTES)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT dl.user_id, ST_Y(dl.geog::geometry) AS latitude, ST_X(dl.geog::geometry) AS longitude,
+                          dl.heading, dl.speed_kmh, dl.updated_at,
+                          ST_Distance(dl.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography) AS distance_meters,
+                          p.display_name, v.car_type, v.make, v.model
+                   FROM driver_locations dl
+                   LEFT JOIN profiles p ON p.user_id = dl.user_id
+                   LEFT JOIN vehicles v ON v.user_id = dl.user_id
+                   WHERE dl.updated_at > %s
+                     AND ST_DWithin(dl.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+                   ORDER BY distance_meters ASC""",
+                (lng, lat, stale_before, lng, lat, radius_meters),
+            )
+            rows = cur.fetchall()
+
         results = []
-        for user_id, loc in self.driver_locations.items():
-            dist = haversine_meters(lat, lng, loc.latitude, loc.longitude)
-            if dist <= radius_meters:
-                profile = self.get_profile(user_id)
-                vehicle = self.get_vehicle(user_id)
-                results.append({
-                    "user_id": user_id,
-                    "display_name": profile.display_name if profile else "Driver",
-                    "latitude": loc.latitude,
-                    "longitude": loc.longitude,
-                    "heading": loc.heading,
-                    "speed_kmh": loc.speed_kmh,
-                    "distance_meters": round(dist),
-                    "car_type": vehicle.car_type if vehicle else None,
-                    "vehicle": f"{vehicle.make or ''} {vehicle.model or ''}".strip() if vehicle else None,
-                    "updated_at": loc.updated_at.isoformat(),
-                })
-        results.sort(key=lambda r: r["distance_meters"])
+        for r in rows:
+            vehicle_str = f"{r['make'] or ''} {r['model'] or ''}".strip()
+            results.append({
+                "user_id": r["user_id"],
+                "display_name": r["display_name"] or "Driver",
+                "latitude": r["latitude"],
+                "longitude": r["longitude"],
+                "heading": r["heading"],
+                "speed_kmh": r["speed_kmh"],
+                "distance_meters": round(r["distance_meters"]),
+                "car_type": r["car_type"],
+                "vehicle": vehicle_str or None,
+                "updated_at": r["updated_at"].isoformat(),
+            })
         return results
 
     def suggest_route(self, pickup_lat: float, pickup_lng: float,
@@ -1153,17 +1297,18 @@ class Store:
 
     # ─── Notifications ────────────────────────────────────────────────────────
 
-    def notify(self, user_id: str, type_: str, title: str, body: str) -> Notification:
+    def notify(self, user_id: str, type_: str, title: str, body: str, related_id: str | None = None) -> Notification:
         notification = Notification(
             id=new_id("ntf"), user_id=user_id, type=type_,
-            title=title, body=body, created_at=now_utc(),
+            title=title, body=body, created_at=now_utc(), related_id=related_id,
         )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                "INSERT INTO notifications (id, user_id, type, title, body, created_at, read) VALUES (%s, %s, %s, %s, %s, %s, FALSE)",
+                "INSERT INTO notifications (id, user_id, type, title, body, created_at, read, related_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, FALSE, %s)",
                 (notification.id, notification.user_id, notification.type,
-                 notification.title, notification.body, notification.created_at),
+                 notification.title, notification.body, notification.created_at, notification.related_id),
             )
         return notification
 
@@ -1183,6 +1328,16 @@ class Store:
                 "UPDATE notifications SET read = TRUE WHERE user_id = %s AND read = FALSE",
                 (user_id,),
             )
+
+    def dismiss_notification(self, user_id: str, notification_id: str) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "DELETE FROM notifications WHERE id = %s AND user_id = %s",
+                (notification_id, user_id),
+            )
+            if cur.rowcount == 0:
+                raise DomainError("Notification not found", 404)
 
     # ─── Blocks / Reports ─────────────────────────────────────────────────────
 
@@ -1247,6 +1402,8 @@ class Store:
         return sorted(set(tags))
 
     def _listing_matches_query(self, listing: RideRequest | DriverTrip, query: dict[str, Any]) -> bool:
+        # Destination/pickup radius filtering happens in SQL via ST_DWithin
+        # (see _geo_search_clauses) before rows ever reach this method.
         if query.get("target_date") and listing.target_date != query["target_date"]:
             return False
         if query.get("tag") and query["tag"] not in listing.tags:
@@ -1261,20 +1418,4 @@ class Store:
                 capacity = luggage_order.index(listing.luggage_capacity)
                 if capacity < needed:
                     return False
-        destination = self.get_location(listing.destination_location_id)
-        pickup = self.get_location(listing.pickup_location_id)
-        if query.get("destination_latitude") is not None:
-            dist = haversine_meters(
-                destination.latitude, destination.longitude,
-                query["destination_latitude"], query["destination_longitude"],
-            )
-            if dist > query.get("destination_radius_meters", 1000):
-                return False
-        if query.get("pickup_latitude") is not None:
-            dist = haversine_meters(
-                pickup.latitude, pickup.longitude,
-                query["pickup_latitude"], query["pickup_longitude"],
-            )
-            if dist > query.get("pickup_radius_meters", 5000):
-                return False
         return True
