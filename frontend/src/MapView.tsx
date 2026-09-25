@@ -38,8 +38,15 @@ const CAR_EMOJIS: Record<string, string> = {
 // ── Theme-aware map tiles ───────────────────────────────────────────────────
 // CartoDB's Voyager/Dark Matter basemaps are a big visual step up from plain
 // OSM tiles and give us a clean light + dark pair that tracks the app theme.
-const TILE_URL_LIGHT = "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
-const TILE_URL_DARK = "https://{s}.basemaps.cartocdn.com/rastertiles/dark_matter/{z}/{x}/{y}{r}.png"
+// CARTO began requiring an API key on these as of Sept 2026 — without one,
+// tiles still load but get an "API KEY REQUIRED" watermark. It ships in the
+// client bundle (Vite only exposes VITE_-prefixed vars), which is expected
+// for a browser map key: restrict it by domain in the CARTO dashboard rather
+// than treating it as secret.
+const CARTO_API_KEY = import.meta.env.VITE_CARTO_API_KEY as string | undefined
+const CARTO_KEY_PARAM = CARTO_API_KEY ? `?key=${CARTO_API_KEY}` : ""
+const TILE_URL_LIGHT = `https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png${CARTO_KEY_PARAM}`
+const TILE_URL_DARK = `https://basemaps.cartocdn.com/rastertiles/dark_all/{z}/{x}/{y}{r}.png${CARTO_KEY_PARAM}`
 const TILE_ATTRIBUTION =
   '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>'
 const ACCENT_LIGHT = "#0284c7"
