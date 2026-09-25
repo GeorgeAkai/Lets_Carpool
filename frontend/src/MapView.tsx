@@ -639,6 +639,17 @@ export function MapView({ userCoords, currentUserId, tripRoute, onClearRoute }: 
         }
         .carpool-eta-tooltip::before { border-top-color: var(--card, #fff); }
 
+        /* CARTO's dark_all tiles are neutral black/gray on their own — this tints
+           them toward the deep navy blue of Google Maps' night mode instead.
+           Scoped to the tile pane only, so markers/routes/UI keep their own
+           colors. (sepia introduces color into otherwise near-grayscale tiles;
+           hue-rotate then swings that tint into blue — hue-rotate alone barely
+           affects desaturated pixels.) */
+        .dark .leaflet-tile-pane {
+          filter: sepia(0.6) hue-rotate(195deg) saturate(2.6) brightness(1.1) contrast(0.88);
+          transition: filter 0.2s ease;
+        }
+
         /* Dark-mode Leaflet chrome so it doesn't look like a light-mode overlay */
         .dark .leaflet-control-zoom a { background:#111a2e; color:#e2e8f0; border-color:rgba(148,163,184,.16); }
         .dark .leaflet-control-zoom a:hover { background:#1e293b; }
