@@ -1759,10 +1759,11 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin, onSignOut }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
   onOpenAdmin: () => void
+  onSignOut: () => void
 }) {
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
@@ -1980,6 +1981,13 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
           <ChevronRight className="size-4 text-muted-foreground" />
         </button>
       )}
+
+      <button
+        type="button" onClick={onSignOut}
+        className="w-full flex items-center justify-center gap-2 rounded-3xl border border-border p-4 text-sm font-semibold text-muted-foreground hover:text-destructive hover:border-destructive/30 transition-colors"
+      >
+        <LogOut className="size-4" />Sign out
+      </button>
     </div>
   )
 }
@@ -2264,6 +2272,40 @@ export function Home() {
   const openChatConnectionIdRef = useRef<string | null>(null)
   useEffect(() => { openChatConnectionIdRef.current = openChatConnectionId }, [openChatConnectionId])
   const [incomingChatMessage, setIncomingChatMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
+
+  // ── Back-button history sync ──────────────────────────────────────────────
+  // The app switches between "pages" (view, plus the full-screen chat overlay
+  // above) via plain React state rather than routes, so none of that ever
+  // touched browser history — on mobile (especially installed as a PWA), the
+  // phone's back button would then immediately exit the app instead of
+  // stepping back to the previous in-app screen, since there was no history
+  // entry to pop first. Fixed by pushing one history entry per navigation and
+  // restoring (view, chatId) from it on `popstate`, so back walks the app's
+  // own screen stack before it ever reaches the browser/OS boundary.
+  const skipNextHistoryPushRef = useRef(true)
+  const isPoppingHistoryRef = useRef(false)
+
+  useEffect(() => {
+    window.history.replaceState({ carpoolView: view, carpoolChatId: openChatConnectionId }, '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (skipNextHistoryPushRef.current) { skipNextHistoryPushRef.current = false; return }
+    if (isPoppingHistoryRef.current) { isPoppingHistoryRef.current = false; return }
+    window.history.pushState({ carpoolView: view, carpoolChatId: openChatConnectionId }, '')
+  }, [view, openChatConnectionId])
+
+  useEffect(() => {
+    const onPopState = (e: PopStateEvent) => {
+      const state = e.state as { carpoolView?: View; carpoolChatId?: string | null } | null
+      isPoppingHistoryRef.current = true
+      setView(state?.carpoolView ?? 'feed')
+      setOpenChatConnectionId(state?.carpoolChatId ?? null)
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
 
   // ── WebSocket ──
   const wsRef = useRef<WebSocket | null>(null)
@@ -2669,7 +2711,7 @@ export function Home() {
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} />}
             {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} />}
+            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}
           </main>
         </div>
