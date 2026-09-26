@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     # or the manual expire endpoints below.
     cron_secret: str | None = None
 
+    # Space-separated allowlist of emails granted access to /admin/* endpoints
+    # (see AdminUser below), matched case-insensitively.
+    admin_emails: str = "ageorge@akihlee.com"
+
+    @property
+    def admin_email_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.admin_emails.split() if e.strip()}
+
     @property
     def neon_auth_jwks_url(self) -> str | None:
         if not self.neon_auth_url:
@@ -169,6 +177,14 @@ class DriverLocationUpdate(BaseModel):
     speed_kmh: float | None = None
 
 
+class SuspendUserRequest(BaseModel):
+    reason: str | None = None
+
+
+class WarnUserRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
 # ─── WebSocket connection manager ─────────────────────────────────────────────
 
 class ConnectionManager:
@@ -233,21 +249,32 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     @app.post("/auth/login")
-    def login(payload: LoginRequest) -> dict[str, Any]:
+    def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         settings = app.state.settings
+        ip = client_ip(request)
         if not settings.neon_auth_jwks_url:
             raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
-        claims = verify_neon_auth_token(
-            payload.neon_token,
-            jwks_url=settings.neon_auth_jwks_url,
-            issuer=settings.neon_auth_issuer,
-            audience=settings.neon_auth_audience,
-        )
+        try:
+            claims = verify_neon_auth_token(
+                payload.neon_token,
+                jwks_url=settings.neon_auth_jwks_url,
+                issuer=settings.neon_auth_issuer,
+                audience=settings.neon_auth_audience,
+            )
+        except DomainError as exc:
+            app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": str(exc)})
+            raise
         email = claims.get("email")
         if not isinstance(email, str) or not email:
+            app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": "missing email claim"})
             raise DomainError("Neon Auth token did not include an email claim", 401)
         name = claims.get("name") or email.split("@")[0]
-        user = app.state.store.authenticate_email(email, str(name))
+        user, is_new = app.state.store.authenticate_email(email, str(name))
+        if user.status == "suspended":
+            app.state.store.log_audit("LOGIN_FAILED", user.id, user.email, ip, {"reason": "account suspended"})
+            raise DomainError("Your account has been suspended", 403)
+        if is_new:
+            app.state.store.log_audit("USER_REGISTERED", user.id, user.email, ip)
         access_token = create_access_token(
             user_id=user.id, email=user.email,
             secret=settings.jwt_secret, expires_minutes=settings.jwt_expires_minutes,
@@ -326,8 +353,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Ride requests ─────────────────────────────────────────────────────────
 
     @app.post("/ride-requests")
-    def create_ride_request(payload: RideRequestCreate, user: CurrentUser) -> dict[str, Any]:
+    def create_ride_request(payload: RideRequestCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
         request = app.state.store.create_ride_request(user.id, payload.model_dump())
+        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "ride_request", "id": request.id})
         return serialize_ride_request(app.state.store, request, exact=True)
 
     @app.post("/ride-requests/expire")
@@ -353,8 +381,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Driver trips ──────────────────────────────────────────────────────────
 
     @app.post("/driver-trips")
-    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser) -> dict[str, Any]:
+    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
         trip = app.state.store.create_driver_trip(user.id, payload.model_dump())
+        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": trip.id})
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.post("/driver-trips/expire")
@@ -531,6 +560,89 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         report = app.state.store.report_user(user.id, target_user_id, payload.reason)
         return serialize(report)
 
+    # ── Admin ─────────────────────────────────────────────────────────────────
+
+    @app.get("/admin/stats")
+    def admin_stats(_admin: AdminUser) -> dict[str, Any]:
+        return app.state.store.get_admin_stats()
+
+    @app.get("/admin/users")
+    def admin_list_users(
+        _admin: AdminUser, search: str | None = None, status: str | None = None,
+        limit: int = 50, offset: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "users": [serialize(u) for u in app.state.store.list_users(search, status, limit, offset)],
+            "total": app.state.store.count_users(search, status),
+        }
+
+    @app.post("/admin/users/{target_user_id}/suspend")
+    def admin_suspend_user(target_user_id: str, payload: SuspendUserRequest, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        user = app.state.store.suspend_user(admin.id, target_user_id, payload.reason)
+        app.state.store.log_audit("USER_BLOCKED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id, "reason": payload.reason})
+        return serialize(user)
+
+    @app.post("/admin/users/{target_user_id}/unsuspend")
+    def admin_unsuspend_user(target_user_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        user = app.state.store.unsuspend_user(target_user_id)
+        app.state.store.log_audit("USER_UNBLOCKED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id})
+        return serialize(user)
+
+    @app.post("/admin/users/{target_user_id}/warn")
+    def admin_warn_user(target_user_id: str, payload: WarnUserRequest, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        notification = app.state.store.notify(target_user_id, "admin_warning", "Warning from Let's Carpool", payload.message)
+        app.state.store.log_audit("WARNING_SENT", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id, "message": payload.message})
+        return serialize(notification)
+
+    @app.get("/admin/reports")
+    def admin_list_reports(_admin: AdminUser, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        return [serialize_report(app.state.store, r) for r in app.state.store.list_reports(status, limit)]
+
+    @app.post("/admin/reports/{report_id}/dismiss")
+    def admin_dismiss_report(report_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        report = app.state.store.dismiss_report(report_id)
+        app.state.store.log_audit("REPORT_DISMISSED", admin.id, admin.email, client_ip(http_request), {"report_id": report_id})
+        return serialize_report(app.state.store, report)
+
+    @app.post("/admin/reports/{report_id}/block")
+    def admin_block_from_report(report_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        report = app.state.store.mark_report_actioned(report_id)
+        user = app.state.store.suspend_user(admin.id, report.reported_user_id, f"Reported: {report.reason}")
+        ip = client_ip(http_request)
+        app.state.store.log_audit("REPORT_ACTIONED", admin.id, admin.email, ip, {"report_id": report_id})
+        app.state.store.log_audit("USER_BLOCKED", admin.id, admin.email, ip, {"target_user_id": user.id, "reason": f"Reported: {report.reason}"})
+        return serialize(user)
+
+    @app.get("/admin/destinations/popular")
+    def admin_popular_destinations(_admin: AdminUser, limit: int = 10) -> list[dict[str, Any]]:
+        return app.state.store.popular_destinations(limit)
+
+    @app.get("/admin/routes/active")
+    def admin_active_routes(_admin: AdminUser, limit: int = 200) -> dict[str, Any]:
+        return {
+            "driver_trips": [serialize(t) for t in app.state.store.list_active_driver_trips(limit)],
+            "ride_requests": [serialize(r) for r in app.state.store.list_active_ride_requests(limit)],
+        }
+
+    @app.post("/admin/routes/ride-requests/{request_id}/remove")
+    def admin_remove_ride_request(request_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        rr = app.state.store.admin_remove_ride_request(request_id)
+        app.state.store.log_audit("LISTING_REMOVED", admin.id, admin.email, client_ip(http_request), {"kind": "ride_request", "id": request_id})
+        return serialize(rr)
+
+    @app.post("/admin/routes/driver-trips/{trip_id}/remove")
+    def admin_remove_driver_trip(trip_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        trip = app.state.store.admin_remove_driver_trip(trip_id)
+        app.state.store.log_audit("LISTING_REMOVED", admin.id, admin.email, client_ip(http_request), {"kind": "driver_trip", "id": trip_id})
+        return serialize(trip)
+
+    @app.get("/admin/audit-logs")
+    def admin_audit_logs(
+        _admin: AdminUser, event_type: str | None = None, actor_email: str | None = None,
+        date_from: datetime | None = None, date_to: datetime | None = None, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return [serialize(l) for l in app.state.store.list_audit_logs(event_type, actor_email, date_from, date_to, limit)]
+
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
     @app.websocket("/ws/{user_id}")
@@ -589,9 +701,14 @@ def current_user(request: Request, authorization: Annotated[str | None, Header()
     settings = request.app.state.settings
     try:
         user_id = decode_access_token(token, settings.jwt_secret)
-        return request.app.state.store.user_for_id(user_id)
+        user = request.app.state.store.user_for_id(user_id)
     except DomainError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    # Suspended accounts are locked out of every authenticated route, not just
+    # blocked from publishing — a still-valid JWT shouldn't outlive a ban.
+    if user.status == "suspended":
+        raise HTTPException(status_code=403, detail="Your account has been suspended")
+    return user
 
 
 def optional_user(request: Request, authorization: Annotated[str | None, Header()] = None) -> User | None:
@@ -601,6 +718,19 @@ def optional_user(request: Request, authorization: Annotated[str | None, Header(
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+def admin_user(user: CurrentUser, request: Request) -> User:
+    if user.email.strip().lower() not in request.app.state.settings.admin_email_set:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+AdminUser = Annotated[User, Depends(admin_user)]
+
+
+def client_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
 
 
 def require_cron_secret(request: Request, authorization: Annotated[str | None, Header()] = None) -> None:
@@ -627,6 +757,20 @@ def serialize_user(store: Store, user: User) -> dict[str, Any]:
 
 def serialize_location(store: Store, location_id: str, exact: bool) -> dict[str, Any]:
     return store.location_view(location_id, exact=exact)
+
+
+def serialize_report(store: Store, report: Any) -> dict[str, Any]:
+    data = serialize(report)
+    reporter = store.get_profile(report.reporter_id)
+    reported = store.get_profile(report.reported_user_id)
+    reporter_user = store.user_for_id(report.reporter_id)
+    reported_user = store.user_for_id(report.reported_user_id)
+    data["reporter_name"] = reporter.display_name if reporter else None
+    data["reporter_email"] = reporter_user.email
+    data["reported_name"] = reported.display_name if reported else None
+    data["reported_email"] = reported_user.email
+    data["reported_status"] = reported_user.status
+    return data
 
 
 def serialize_ride_request(store: Store, request: Any, exact: bool) -> dict[str, Any]:

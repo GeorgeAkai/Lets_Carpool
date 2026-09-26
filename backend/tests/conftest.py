@@ -12,6 +12,7 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 TABLES = [
+    "audit_logs",
     "pool_memberships",
     "pools",
     "blocks",

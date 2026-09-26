@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import {
   Search, SlidersHorizontal, X, MapPin, ArrowRight, Users, Package,
-  Pencil, Map as MapIcon, Plus,
+  Pencil, Map as MapIcon, Plus, Check,
 } from 'lucide-react'
 import {
   Avatar, FLEX_LABEL, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
@@ -156,8 +156,9 @@ export function SectionHeader({ label, count, noun }: { label: string; count: nu
   )
 }
 
-export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn }: {
+export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected }: {
   listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; onEditOwn: () => void
+  alreadyConnected: boolean
 }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -209,12 +210,18 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
       </div>
 
       {!isOwn && (
-        <button
-          onClick={() => onConnect(listing)}
-          className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
-        >
-          Request Ride
-        </button>
+        alreadyConnected ? (
+          <div className="mt-1 w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
+            <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
+          </div>
+        ) : (
+          <button
+            onClick={() => onConnect(listing)}
+            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
+          >
+            {isDriver ? 'Request to join' : 'Offer a ride'}
+          </button>
+        )
       )}
     </div>
   )

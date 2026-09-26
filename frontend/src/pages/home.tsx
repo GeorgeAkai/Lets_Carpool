@@ -23,10 +23,11 @@ import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
   ViewToggleFab, OfferRideFab,
 } from './discover-mobile'
+import { AdminView } from './admin'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools'
+type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -236,7 +237,7 @@ export function toInitials(name: string): string {
   return name.split(' ').map(w => w[0]?.toUpperCase() ?? '').join('').slice(0, 2)
 }
 
-function relativeTime(iso: string): string {
+export function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
   const h = Math.floor(diff / 3600000)
   if (h < 1) return 'just now'
@@ -400,7 +401,7 @@ function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' 
 
 // ─── Listing card ─────────────────────────────────────────────────────────────
 
-function ListingCard({ listing, onConnect, currentUserId }: { listing: Listing; onConnect: (l: Listing) => void; currentUserId: string }) {
+function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; alreadyConnected: boolean }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
@@ -483,6 +484,10 @@ function ListingCard({ listing, onConnect, currentUserId }: { listing: Listing; 
       {isOwn ? (
         <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
           Your post
+        </div>
+      ) : alreadyConnected ? (
+        <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
+          <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
         </div>
       ) : (
         <button
@@ -616,9 +621,10 @@ function UserMenuButton({ targetUserId, showToast }: { targetUserId: string; sho
   )
 }
 
-function MatchCard({ match, rank, onConnect, showToast }: {
+function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   match: EnrichedMatch; rank: number
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  alreadyConnected: boolean
 }) {
   const { listing, profile, sharedInterests } = match
   const isDriverListing = listing.type === 'driver'
@@ -700,9 +706,15 @@ function MatchCard({ match, rank, onConnect, showToast }: {
       )}
 
       <div className="flex gap-2">
-        <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
-          {requesting ? 'Requesting…' : 'Instant Request Match'}
-        </button>
+        {alreadyConnected ? (
+          <div className="flex-1 py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
+            <Check className="size-4" />Request sent
+          </div>
+        ) : (
+          <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+            {requesting ? 'Requesting…' : 'Instant Request Match'}
+          </button>
+        )}
         <button onClick={() => setExpanded(v => !v)} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors">
           {expanded ? 'Hide' : 'View Route'}
         </button>
@@ -711,11 +723,12 @@ function MatchCard({ match, rank, onConnect, showToast }: {
   )
 }
 
-function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds }: {
+function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
   listings: Listing[]; referenceListing: MyListing | undefined
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
   onMatchedIds: (ids: string[]) => void
+  connectedListingIds: Set<string>
 }) {
   const candidates = useMemo(() => listings.filter(l => l.type === 'driver'), [listings])
   const { matches, loading } = useRankedMatches(candidates, referenceListing, currentUserId, currentUserInterests)
@@ -737,7 +750,7 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
         <p className="text-sm text-muted-foreground animate-pulse">Finding your best matches…</p>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          {matches.map((m, i) => <MatchCard key={m.listing.id} match={m} rank={i} onConnect={onConnect} showToast={showToast} />)}
+          {matches.map((m, i) => <MatchCard key={m.listing.id} match={m} rank={i} onConnect={onConnect} showToast={showToast} alreadyConnected={connectedListingIds.has(m.listing.apiId)} />)}
         </div>
       )}
     </div>
@@ -751,7 +764,7 @@ function DriverHomeView({
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
-  filterSheetOpen, setFilterSheetOpen,
+  filterSheetOpen, setFilterSheetOpen, connectedListingIds,
 }: {
   myOpenTrip: MyListing | undefined; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
@@ -765,6 +778,7 @@ function DriverHomeView({
   quickDateFilter: 'today' | 'any'; setQuickDateFilter: (v: 'today' | 'any') => void
   seatsNeeded: number | null; setSeatsNeeded: (v: number | null) => void
   filterSheetOpen: boolean; setFilterSheetOpen: (v: boolean) => void
+  connectedListingIds: Set<string>
 }) {
   const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
   const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
@@ -811,7 +825,7 @@ function DriverHomeView({
         ) : mobileMatches.length > 0 ? (
           <div className="space-y-3">
             {mobileMatches.map(m => (
-              <MobileListingCard key={m.listing.id} listing={m.listing} onConnect={l => { onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error')) }} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} />
+              <MobileListingCard key={m.listing.id} listing={m.listing} onConnect={l => { onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error')) }} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} alreadyConnected={connectedListingIds.has(m.listing.apiId)} />
             ))}
           </div>
         ) : (
@@ -892,9 +906,13 @@ function DriverHomeView({
                   </p>
                 </div>
                 <UserMenuButton targetUserId={m.listing.ownerId} showToast={showToast} />
-                <button onClick={() => onConnect(m.listing).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="shrink-0 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                  Offer Ride
-                </button>
+                {connectedListingIds.has(m.listing.apiId) ? (
+                  <span className="shrink-0 px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center gap-1.5"><Check className="size-4" />Offered</span>
+                ) : (
+                  <button onClick={() => onConnect(m.listing).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="shrink-0 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                    Offer Ride
+                  </button>
+                )}
               </div>
             )
           })}
@@ -911,7 +929,7 @@ function FeedView({
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
-  listings, onConnect, loading, currentUserId, setView,
+  listings, onConnect, loading, currentUserId, setView, connectedListingIds,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
@@ -923,6 +941,7 @@ function FeedView({
   filterSheetOpen: boolean; setFilterSheetOpen: (v: boolean) => void
   listings: Listing[]; onConnect: (l: Listing) => void; loading: boolean; currentUserId: string
   setView: (v: View) => void
+  connectedListingIds: Set<string>
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const isMobile = useIsMobile()
@@ -944,7 +963,7 @@ function FeedView({
         ) : listings.length > 0 ? (
           <div className="space-y-3">
             {listings.map(l => (
-              <MobileListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} />
+              <MobileListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} alreadyConnected={connectedListingIds.has(l.apiId)} />
             ))}
           </div>
         ) : (
@@ -1028,7 +1047,7 @@ function FeedView({
 
       {!loading && listings.length > 0 ? (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} />)}
+          {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} alreadyConnected={connectedListingIds.has(l.apiId)} />)}
         </div>
       ) : !loading ? (
         <div className="text-center py-24 text-muted-foreground">
@@ -1047,7 +1066,11 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null
   defaultType: ListingType; vehicle: api.ApiVehicle
 }) {
-  const [type, setType] = useState<ListingType>(defaultType)
+  // Locked to the app-wide mode (chosen at login / switched deliberately from
+  // Profile) rather than an independent in-form toggle — posting the "other"
+  // type while in Rider/Driver mode is exactly the kind of mixed-page
+  // behavior the mode gate exists to remove.
+  const type = defaultType
   const [from, setFrom] = useState<LocationValue | null>(null)
   const [to, setTo] = useState<LocationValue | null>(null)
   const [date, setDate] = useState('')
@@ -1104,12 +1127,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         <p className="text-muted-foreground mt-1">Share your trip or request a ride.</p>
       </div>
 
-      <div className="flex rounded-xl bg-muted p-1 gap-1 mb-8">
-        {(['driver', 'rider'] as ListingType[]).map(t => (
-          <button key={t} type="button" aria-pressed={type === t} onClick={() => setType(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${type === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-            {t === 'driver' ? "I'm offering a ride" : 'I need a ride'}
-          </button>
-        ))}
+      <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-muted text-sm font-medium text-foreground mb-8">
+        {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-5">
@@ -1213,21 +1232,24 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
 // ─── My Listings view ─────────────────────────────────────────────────────────
 
-function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast }: {
+function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast, mode }: {
   myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void>
   userCoords: { lat: number; lng: number } | null; currentUserId: string
   showToast: (msg: string, type: 'success' | 'error') => void
+  mode: ListingType
 }) {
   const isMobile = useIsMobile()
-  const [tab, setTab] = useState<'driver' | 'rider' | 'pools'>('driver')
+  // Only the listing type matching the current app-wide mode is shown — no
+  // mixed pages, matching Discover and Post. Pools is a standalone Sidebar
+  // entry on desktop already; only surface it as a second tab here on
+  // mobile, where the bottom nav was trimmed to 4 tabs.
+  const [tab, setTab] = useState<ListingType | 'pools'>(mode)
   const [cancelling, setCancelling] = useState<string | null>(null)
   const shown = myListings.filter(l => l.type === tab)
   const handleCancel = async (listing: MyListing) => {
     setCancelling(listing.id); try { await onCancel(listing) } finally { setCancelling(null) }
   }
-  // Pools is a standalone Sidebar entry on desktop already — only surface it
-  // as a third tab here on mobile, where the bottom nav was trimmed to 4 tabs.
-  const tabs = isMobile ? (['driver', 'rider', 'pools'] as const) : (['driver', 'rider'] as const)
+  const tabs = isMobile ? ([mode, 'pools'] as const) : ([mode] as const)
   return (
     <div className="space-y-6">
       <div>
@@ -1288,7 +1310,7 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
 // ─── Connection card ──────────────────────────────────────────────────────────
 
 function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onMarkRead,
+  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat,
   autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
@@ -1297,77 +1319,43 @@ function ConnectionCard({
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
-  onMarkRead: (id: string) => void
-  autoOpen?: 'chat' | 'gassplit' | null
+  onOpenChat: (conn: Connection) => void
+  autoOpen?: 'gassplit' | null
   isActive: boolean
   onActivate: () => void
 }) {
-  const [expanded, setExpanded] = useState<'chat' | 'gassplit' | 'blockreport' | null>(null)
+  const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | null>(null)
 
   // Another card became the active one — collapse this one so only a single
   // panel is ever open across the inbox at a time.
   useEffect(() => {
     if (!isActive) setExpanded(null)
   }, [isActive])
-  const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
-  const [msgsLoaded, setMsgsLoaded] = useState(false)
-  const [msgText, setMsgText] = useState('')
-  const [sending, setSending] = useState(false)
   const [gasSuggestion, setGasSuggestion] = useState<api.GasSplitSuggestion | null>(null)
   const [splitAmount, setSplitAmount] = useState('')
   const [splitDone, setSplitDone] = useState(connection.splitConfirmed)
   const [reportReason, setReportReason] = useState('')
   const [reportMode, setReportMode] = useState(false)
   const [busy, setBusy] = useState(false)
-  const msgEndRef = useRef<HTMLDivElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
 
-  const toggleSection = async (section: 'chat' | 'gassplit' | 'blockreport') => {
+  const toggleSection = async (section: 'gassplit' | 'blockreport') => {
     const next = expanded === section ? null : section
     setExpanded(next)
     if (next !== null) onActivate()
-    if (next === 'chat') {
-      onMarkRead(connection.id)
-      if (!msgsLoaded) {
-        try { const fetched = await api.getMessages(connection.id); setMsgs(fetched); setMsgsLoaded(true) } catch { /* ignore */ }
-      }
-      setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100)
-    }
     if (next === 'gassplit' && !gasSuggestion) {
       try { const s = await api.suggestGasSplit(connection.id); setGasSuggestion(s); setSplitAmount(String((s.amount_cents / 100).toFixed(2))) } catch { /* ignore */ }
     }
   }
 
   // Deep link from a notification: open the right panel and scroll to this card.
+  // (Chat deep links skip this entirely — they open the full-screen chat instead.)
   useEffect(() => {
     if (!autoOpen) return
     cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
     toggleSection(autoOpen)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoOpen])
-
-  // Append incoming WS messages from parent-updated connection (via unreadMessages bump)
-  const prevUnread = useRef(connection.unreadMessages)
-  useEffect(() => {
-    if (connection.unreadMessages > prevUnread.current && expanded !== 'chat') {
-      // message arrived while chat closed — will show count on badge
-    }
-    prevUnread.current = connection.unreadMessages
-  }, [connection.unreadMessages, expanded])
-
-  const sendCanned = async (key: string) => {
-    setSending(true)
-    try { const msg = await api.sendCannedMessage(connection.id, key); setMsgs(prev => [...prev, msg]); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
-    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
-    finally { setSending(false) }
-  }
-
-  const sendFree = async () => {
-    if (!msgText.trim()) return; setSending(true)
-    try { const msg = await api.sendMessage(connection.id, msgText.trim()); setMsgs(prev => [...prev, msg]); setMsgText(''); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
-    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
-    finally { setSending(false) }
-  }
 
   const confirmSplit = async () => {
     const cents = Math.round(parseFloat(splitAmount) * 100)
@@ -1425,7 +1413,6 @@ function ConnectionCard({
 
         <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
           <span className="inline-flex items-center gap-1"><Calendar className="size-3.5" />{connection.date}</span>
-          <span className="inline-flex items-center gap-1"><MessageCircle className="size-3.5" />{msgs.length || (msgsLoaded ? 0 : '…')} message{msgs.length !== 1 ? 's' : ''}</span>
           {splitDone && <span className="inline-flex items-center gap-1 text-green-700"><Check className="size-3.5" />Split confirmed</span>}
         </div>
       </div>
@@ -1436,7 +1423,7 @@ function ConnectionCard({
           <>
             <button onClick={handleAccept} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
             <button onClick={handleDecline} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
-            <button onClick={() => toggleSection('chat')} className={`relative inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'border border-border text-foreground hover:bg-muted'}`}>
+            <button onClick={() => onOpenChat(connection)} className="relative inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
               <MessageCircle className="size-4" />Message
               {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
             </button>
@@ -1445,7 +1432,7 @@ function ConnectionCard({
         )}
         {status === 'accepted' && (
           <>
-            <button onClick={() => toggleSection('chat')} className={`relative inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'chat' ? 'bg-primary/10 text-primary' : 'bg-primary text-primary-foreground hover:bg-primary/90'}`}>
+            <button onClick={() => onOpenChat(connection)} className="relative inline-flex items-center gap-1.5 rounded-2xl bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 transition-colors">
               <MessageCircle className="size-4" />Chat
               {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
             </button>
@@ -1465,60 +1452,6 @@ function ConnectionCard({
           </>
         )}
       </div>
-
-      {/* Chat panel */}
-      {expanded === 'chat' && (
-        <div className="border-t border-border bg-muted/30">
-          <div className="px-6 py-4 space-y-3">
-            <div className="flex items-center gap-2">
-              <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />
-              <span className="text-xs font-semibold text-foreground">{connection.withUser.name}</span>
-              <span className="text-xs text-muted-foreground">· {status === 'pending' ? 'pending connection' : 'accepted'}</span>
-            </div>
-
-            {msgs.length > 0 && (
-              <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
-                {msgs.map(m => {
-                  const isMine = m.sender_id === currentUserId
-                  return (
-                    <div key={m.id} className={`flex items-end gap-2 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
-                      {!isMine && <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />}
-                      <div className={`max-w-[75%] space-y-0.5 ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
-                        {!isMine && <span className="text-[10px] text-muted-foreground pl-1">{connection.withUser.name}</span>}
-                        <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-sm' : 'bg-card text-foreground border border-border rounded-bl-sm'}`}>
-                          {m.content}
-                        </div>
-                        <span className="text-[10px] text-muted-foreground px-1">{new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                      </div>
-                    </div>
-                  )
-                })}
-                <div ref={msgEndRef} />
-              </div>
-            )}
-
-            {msgs.length === 0 && msgsLoaded && (
-              <p className="text-xs text-muted-foreground text-center py-4">No messages yet. Say hi!</p>
-            )}
-
-            {status === 'pending' ? (
-              <div className="space-y-2">
-                <p className="text-xs text-muted-foreground">Quick messages while connection is pending:</p>
-                <div className="flex flex-wrap gap-2">
-                  {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
-                    <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-card border border-border text-sm text-foreground hover:bg-muted disabled:opacity-50 transition-colors text-left">{text}</button>
-                  ))}
-                </div>
-              </div>
-            ) : status === 'accepted' ? (
-              <div className="flex gap-2">
-                <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-3.5 py-2.5 rounded-2xl bg-card border border-border text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
-                <button onClick={sendFree} disabled={sending || !msgText.trim()} className="px-3.5 py-2.5 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
-              </div>
-            ) : <p className="text-sm text-muted-foreground">Chat unavailable in this state.</p>}
-          </div>
-        </div>
-      )}
 
       {/* Gas split panel */}
       {expanded === 'gassplit' && status === 'accepted' && (
@@ -1568,17 +1501,132 @@ function ConnectionCard({
   )
 }
 
+// ─── Full-screen chat ─────────────────────────────────────────────────────────
+// Its own dedicated screen rather than an accordion panel wedged inside a card
+// already crowded with route/gas-split/complete/cancel buttons — the chat
+// itself is the thing people spend the most time in, so it gets the room.
+
+function FullScreenChatView({ connection, currentUserId, onClose, showToast, incomingMessage }: {
+  connection: Connection; currentUserId: string
+  onClose: () => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+  incomingMessage: { connectionId: string; message: api.ApiMessage } | null
+}) {
+  const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [msgText, setMsgText] = useState('')
+  const [sending, setSending] = useState(false)
+  const msgEndRef = useRef<HTMLDivElement>(null)
+  const { status } = connection
+
+  useEffect(() => {
+    let cancelled = false
+    api.getMessages(connection.id).then(fetched => {
+      if (cancelled) return
+      setMsgs(fetched); setLoaded(true)
+      setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'auto' }), 50)
+    }).catch(() => setLoaded(true))
+    return () => { cancelled = true }
+  }, [connection.id])
+
+  // Live-append a message that arrives over the websocket while this chat is
+  // already open, instead of only reflecting it as an unread-count bump.
+  useEffect(() => {
+    if (!incomingMessage || incomingMessage.connectionId !== connection.id) return
+    setMsgs(prev => prev.some(m => m.id === incomingMessage.message.id) ? prev : [...prev, incomingMessage.message])
+    setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
+  }, [incomingMessage, connection.id])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const sendCanned = async (key: string) => {
+    setSending(true)
+    try { const msg = await api.sendCannedMessage(connection.id, key); setMsgs(prev => [...prev, msg]); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
+    finally { setSending(false) }
+  }
+
+  const sendFree = async () => {
+    if (!msgText.trim()) return; setSending(true)
+    try { const msg = await api.sendMessage(connection.id, msgText.trim()); setMsgs(prev => [...prev, msg]); setMsgText(''); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
+    finally { setSending(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-background flex flex-col" role="dialog" aria-modal="true" aria-label={`Chat with ${connection.withUser.name}`}>
+      {/* Header */}
+      <div className="shrink-0 flex items-center gap-3 px-4 py-3 border-b border-border">
+        <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-foreground transition-colors">
+          <X className="size-5" />
+        </button>
+        <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
+        <div className="min-w-0">
+          <h2 className="text-base font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+          <p className="text-xs text-muted-foreground truncate">{connection.route} · {status === 'pending' ? 'Pending connection' : 'Accepted'}</p>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2.5 max-w-2xl w-full mx-auto">
+        {msgs.map(m => {
+          const isMine = m.sender_id === currentUserId
+          return (
+            <div key={m.id} className={`flex items-end gap-2 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
+              {!isMine && <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />}
+              <div className={`max-w-[75%] space-y-0.5 ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
+                {!isMine && <span className="text-[10px] text-muted-foreground pl-1">{connection.withUser.name}</span>}
+                <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-sm' : 'bg-card text-foreground border border-border rounded-bl-sm'}`}>
+                  {m.content}
+                </div>
+                <span className="text-[10px] text-muted-foreground px-1">{new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              </div>
+            </div>
+          )
+        })}
+        {msgs.length === 0 && loaded && (
+          <p className="text-sm text-muted-foreground text-center py-10">No messages yet. Say hi!</p>
+        )}
+        <div ref={msgEndRef} />
+      </div>
+
+      {/* Composer */}
+      <div className="shrink-0 border-t border-border p-4 max-w-2xl w-full mx-auto">
+        {status === 'pending' ? (
+          <div className="space-y-2">
+            <p className="text-xs text-muted-foreground">Quick messages while connection is pending:</p>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
+                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-muted border border-border text-sm text-foreground hover:bg-muted/70 disabled:opacity-50 transition-colors text-left">{text}</button>
+              ))}
+            </div>
+          </div>
+        ) : status === 'accepted' ? (
+          <div className="flex gap-2">
+            <input type="text" autoFocus value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-3.5 py-2.5 rounded-2xl bg-muted border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
+            <button onClick={sendFree} disabled={sending || !msgText.trim()} className="px-3.5 py-2.5 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
+          </div>
+        ) : <p className="text-sm text-muted-foreground text-center">Chat unavailable in this state.</p>}
+      </div>
+    </div>
+  )
+}
+
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onMarkRead, deepLink }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
-  onMarkRead: (id: string) => void
-  deepLink?: { connectionId: string; section: 'chat' | 'gassplit' } | null
+  onOpenChat: (conn: Connection) => void
+  deepLink?: { connectionId: string; section: 'gassplit' } | null
 }) {
   const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
   // Only one card's chat/gas-split/report panel stays open at a time — opening
@@ -1606,7 +1654,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
+              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat}
               autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
               isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
@@ -1711,9 +1759,10 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
+  onOpenAdmin: () => void
 }) {
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
@@ -1724,6 +1773,8 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
   const [nationality, setNationality] = useState(profile.nationality ?? '')
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileMsg, setProfileMsg] = useState<{ text: string; ok: boolean } | null>(null)
+  const [confirmingModeSwitch, setConfirmingModeSwitch] = useState(false)
+  const otherMode: ListingType = mode === 'rider' ? 'driver' : 'rider'
 
   const addInterest = () => {
     const tag = interestDraft.trim()
@@ -1809,15 +1860,29 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
       <div className="rounded-3xl bg-card border border-border p-6 space-y-3">
         <div>
           <h3 className="text-base font-semibold text-foreground">Riding as</h3>
-          <p className="text-sm text-muted-foreground mt-0.5">Switch between browsing as a passenger looking for a ride, or a driver offering one.</p>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
+          </p>
         </div>
-        <div className="flex rounded-xl bg-muted p-1 gap-1" role="group" aria-label="Passenger or Driver mode">
-          {(['rider', 'driver'] as ListingType[]).map(m => (
-            <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`flex-1 py-2.5 rounded-lg text-sm font-semibold transition-colors ${mode === m ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-              {m === 'rider' ? 'Passenger' : 'Driver'}
-            </button>
-          ))}
-        </div>
+        {!confirmingModeSwitch ? (
+          <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="w-full py-2.5 rounded-xl border border-border text-sm font-semibold text-foreground hover:bg-muted transition-colors">
+            Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
+          </button>
+        ) : (
+          <div className="rounded-2xl bg-muted p-4 space-y-3">
+            <p className="text-sm text-foreground">
+              Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
+            </p>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                Confirm switch
+              </button>
+              <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
@@ -1899,6 +1964,22 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
           {currentUser.email_domain ? `Verified domain: ${currentUser.email_domain}` : 'Use a verified email domain to establish trust.'}
         </p>
       </div>
+
+      {api.isAdminUser(currentUser) && (
+        <button
+          type="button" onClick={onOpenAdmin}
+          className="w-full flex items-center justify-between gap-3 rounded-3xl bg-card border border-border p-5 text-left hover:border-primary/30 transition-colors"
+        >
+          <span className="flex items-center gap-3">
+            <span className="rounded-2xl bg-primary/10 p-2.5 text-primary"><Shield className="size-4" /></span>
+            <span>
+              <span className="block text-sm font-semibold text-foreground">Admin Panel</span>
+              <span className="block text-xs text-muted-foreground mt-0.5">Analytics, moderation, and audit logs</span>
+            </span>
+          </span>
+          <ChevronRight className="size-4 text-muted-foreground" />
+        </button>
+      )}
     </div>
   )
 }
@@ -1961,10 +2042,9 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode, onSetMode }: {
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
   setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
   onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
-  mode: ListingType; onSetMode: (m: ListingType) => void
 }) {
   return (
     <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
@@ -1972,14 +2052,6 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
         <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            {/* Relocated to Profile on mobile — this screen is too cramped for it, and it's a settings-style choice, not a per-screen action. */}
-            <div className="hidden xl:flex rounded-xl bg-sidebar-accent p-0.5 gap-0.5 mr-1" role="group" aria-label="Passenger or Driver mode">
-              {(['rider', 'driver'] as ListingType[]).map(m => (
-                <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${mode === m ? 'bg-white text-sidebar shadow-sm' : 'text-sidebar-foreground/65 hover:text-sidebar-foreground'}`}>
-                  {m === 'rider' ? 'Passenger' : 'Driver'}
-                </button>
-              ))}
-            </div>
             <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
             </button>
@@ -2074,6 +2146,40 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
   )
 }
 
+// ─── Mode choice gate ───────────────────────────────────────────────────────
+// Shown once per session, before any Discover content — replaces the old
+// anytime toggle with an explicit up-front choice so Rider/Driver stop
+// feeling like two variants of one mixed page.
+
+function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
+  const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
+    { mode: 'rider', icon: <Users className="size-7" />, title: 'I need a ride', desc: 'Find drivers heading your way.' },
+    { mode: 'driver', icon: <Car className="size-7" />, title: "I'm offering a ride", desc: 'Publish your route and find riders.' },
+  ]
+  return (
+    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-8 px-6 py-12 text-center">
+      <div>
+        <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground">How are you riding today?</h1>
+        <p className="mt-2 text-muted-foreground max-w-sm mx-auto">Choose how you'll use Carpool this session — you can switch anytime from Profile.</p>
+      </div>
+      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+        {options.map(({ mode: m, icon, title, desc }) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => onChoose(m)}
+            className="flex-1 rounded-3xl border border-border bg-card p-6 text-left hover:border-primary/40 hover:shadow-lg transition-all"
+          >
+            <span className="inline-flex rounded-2xl bg-primary/10 p-3 text-primary">{icon}</span>
+            <h2 className="mt-4 text-lg font-semibold text-foreground">{title}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{desc}</p>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ─── Home (carpool app) ───────────────────────────────────────────────────────
 
 export function Home() {
@@ -2113,6 +2219,13 @@ export function Home() {
   const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
   useEffect(() => { sessionStorage.setItem('carpool_mode', mode) }, [mode])
 
+  // Gate Discover behind an explicit one-time choice instead of defaulting
+  // silently to Passenger — sessionStorage having no value yet means this is
+  // a fresh session that hasn't chosen. Once chosen, this stays closed for
+  // the rest of the session; switching later is a deliberate action in
+  // Profile, not this gate reappearing.
+  const [modeGateOpen, setModeGateOpen] = useState(() => sessionStorage.getItem('carpool_mode') === null)
+
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
   const [filterType, setFilterType] = useState<'all' | 'driver' | 'rider'>('all')
@@ -2144,7 +2257,13 @@ export function Home() {
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
-  const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'chat' | 'gassplit' } | null>(null)
+  const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'gassplit' } | null>(null)
+
+  // ── Full-screen chat ──
+  const [openChatConnectionId, setOpenChatConnectionId] = useState<string | null>(null)
+  const openChatConnectionIdRef = useRef<string | null>(null)
+  useEffect(() => { openChatConnectionIdRef.current = openChatConnectionId }, [openChatConnectionId])
+  const [incomingChatMessage, setIncomingChatMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
 
   // ── WebSocket ──
   const wsRef = useRef<WebSocket | null>(null)
@@ -2164,12 +2283,19 @@ export function Home() {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
     const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
       if (msg.type === 'chat_message') {
-        setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, unreadMessages: c.unreadMessages + 1 } : c))
-        const conn = connectionsRef.current.find(c => c.id === msg.connection_id)
-        const senderName = conn?.withUser.name ?? 'Someone'
-        const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
-        showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
-        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
+        const chatIsOpenForThis = openChatConnectionIdRef.current === msg.connection_id
+        if (chatIsOpenForThis) {
+          // Already looking at this conversation — live-append instead of
+          // bumping an unread badge and popping a toast over its own screen.
+          setIncomingChatMessage({ connectionId: msg.connection_id, message: msg.message })
+        } else {
+          setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, unreadMessages: c.unreadMessages + 1 } : c))
+          const conn = connectionsRef.current.find(c => c.id === msg.connection_id)
+          const senderName = conn?.withUser.name ?? 'Someone'
+          const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
+          showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
+          setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
+        }
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
       } else if (msg.type === 'driver_nearby') {
@@ -2290,6 +2416,23 @@ export function Home() {
     })
   }, [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Listings the current user has already acted on ──────────────────────────
+  // onConnect always creates a fresh ride_request/driver_trip on our side, so
+  // the only way to recognize "I already requested/offered on this listing" is
+  // by the OTHER party's id it points at: a rider's connection records the
+  // driver's trip id, a driver's connection records the rider's request id —
+  // which is exactly listing.apiId for that listing either way. Only pending/
+  // accepted count: once declined/cancelled/expired, the listing is fair game
+  // again instead of being permanently stuck.
+  const connectedListingIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const c of connections) {
+      if (c.status !== 'pending' && c.status !== 'accepted') continue
+      ids.add(c.myRole === 'rider' ? c.driverTripId : c.rideRequestId)
+    }
+    return ids
+  }, [connections])
+
   // ── Handlers ──
   const onConnect = useCallback(async (listing: Listing) => {
     try {
@@ -2334,6 +2477,13 @@ export function Home() {
     setConnections(prev => prev.map(c => c.id === id ? { ...c, unreadMessages: 0 } : c))
   }, [])
 
+  const onOpenChat = useCallback((conn: Connection) => {
+    setOpenChatConnectionId(conn.id)
+    onMarkRead(conn.id)
+  }, [onMarkRead])
+
+  const onCloseChat = useCallback(() => setOpenChatConnectionId(null), [])
+
   const onViewRoute = useCallback((conn: Connection) => {
     if (!conn.pickupLat || !conn.pickupLng || !conn.destLat || !conn.destLng) return
     setDrivingTo(null)
@@ -2373,15 +2523,19 @@ export function Home() {
   const onNotifNavigate = useCallback((n: api.ApiNotification) => {
     setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
     if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
-      setConnDeepLink({ connectionId: n.related_id, section: 'chat' })
+      setConnDeepLink(null)
+      setOpenChatConnectionId(n.related_id)
       setView('connections')
     } else if (n.related_id && n.type === 'gas_split_confirmed') {
+      setOpenChatConnectionId(null)
       setConnDeepLink({ connectionId: n.related_id, section: 'gassplit' })
       setView('connections')
     } else if (n.type === 'pool_joined') {
+      setOpenChatConnectionId(null)
       setConnDeepLink(null)
       setView('pools')
     } else {
+      setOpenChatConnectionId(null)
       setConnDeepLink(null)
       setView('connections')
     }
@@ -2392,7 +2546,7 @@ export function Home() {
 
   const onSignOut = useCallback(() => {
     authClient.signOut().catch(() => {})
-    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
+    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null); setOpenChatConnectionId(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 
@@ -2404,8 +2558,11 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools']
-  const guardedView: View = !currentUser && AUTH_VIEWS.includes(view) ? 'feed' : view
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin']
+  const guardedView: View =
+    !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
+    : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
+    : view
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
 
@@ -2438,15 +2595,29 @@ export function Home() {
     return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
+  // One-time choice before Discover — see the modeGateOpen comment above.
+  // Goes through handleSetMode so the existing "Driver with no vehicle on
+  // file routes to Profile" behavior applies to this first choice too.
+  if (modeGateOpen) {
+    return <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
+      {(() => {
+        const openChatConnection = connections.find(c => c.id === openChatConnectionId)
+        return openChatConnection ? (
+          <FullScreenChatView connection={openChatConnection} currentUserId={currentUser.id} onClose={onCloseChat} showToast={showToast} incomingMessage={incomingChatMessage} />
+        ) : null
+      })()}
+
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
       <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
-        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} onSetMode={handleSetMode} />
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} />
       </div>
 
       <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
@@ -2460,7 +2631,7 @@ export function Home() {
                 <DriverHomeView
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
-                  onConnect={onConnect} showToast={showToast} setView={setView}
+                  onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
                   filterType={filterType} setFilterType={setFilterType}
                   filterTag={filterTag} setFilterTag={setFilterTag}
@@ -2479,10 +2650,10 @@ export function Home() {
                       listings={allListings}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
-                      onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds}
+                      onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
                     />
                   )}
-                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} />
+                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} />
                 </div>
               )
             )}
@@ -2495,10 +2666,11 @@ export function Home() {
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
-            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead} deepLink={connDeepLink} />}
+            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} />}
+            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} />}
+            {guardedView === 'admin' && <AdminView showToast={showToast} />}
           </main>
         </div>
       </div>
