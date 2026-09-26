@@ -15,30 +15,35 @@ import { useTheme } from '@neondatabase/auth-ui'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView } from '../MapView'
-import type { TripRoute } from '../MapView'
+import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
 import { authClient, fetchNeonJWT } from '../lib/auth'
+import { useIsMobile } from '../lib/useIsMobile'
+import {
+  MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
+  ViewToggleFab, OfferRideFab,
+} from './discover-mobile'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools'
 type ListingType = 'driver' | 'rider'
-type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
-type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
-type CarType = 'sedan' | 'suv' | 'van' | 'minivan' | 'truck' | 'other'
-type Flexibility = 'morning' | 'afternoon' | 'evening' | 'flexible'
+export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
+export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
+export type CarType = 'sedan' | 'suv' | 'van' | 'minivan' | 'truck' | 'other'
+export type Flexibility = 'morning' | 'afternoon' | 'evening' | 'flexible'
 type ConnStatus = 'pending' | 'accepted' | 'declined' | 'completed' | 'cancelled' | 'expired'
 
-interface Listing {
+export interface Listing {
   id: string; type: ListingType; apiId: string; ownerId: string
-  user: { name: string; initials: string; verified: boolean }
+  user: { name: string; initials: string; verified: boolean; photoUrl?: string | null }
   from: string; to: string; date: string; flexibility: Flexibility
   seats?: number; seatsUsed?: number; passengers?: number; estimatedGas?: number
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
 }
 
-interface MyListing {
+export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
   flexibility: Flexibility; seats?: number; passengers?: number; tags: RideTag[]
   status: string; createdAt: string
@@ -58,6 +63,7 @@ interface Connection {
   rideRequestId: string
   pickupLat?: number; pickupLng?: number; pickupLabel?: string
   destLat?: number; destLng?: number; destLabel?: string
+  riderPickupLat?: number; riderPickupLng?: number; riderPickupLabel?: string
 }
 
 interface LocationValue {
@@ -199,7 +205,7 @@ function LocationInput({
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const FLEX_LABEL: Record<Flexibility, string> = {
+export const FLEX_LABEL: Record<Flexibility, string> = {
   morning: 'Morning', afternoon: 'Afternoon', evening: 'Evening', flexible: 'Flexible',
 }
 
@@ -209,24 +215,24 @@ const CANNED_MESSAGES: Record<string, string> = {
   luggage: 'I have a luggage question.',
 }
 
-const LUGGAGE_LABELS: Record<LuggageSize, string> = {
+export const LUGGAGE_LABELS: Record<LuggageSize, string> = {
   none: 'No luggage', small: 'Small bag', medium: 'Medium bag', large: 'Large bag', oversized: 'Oversized',
 }
 
-const CAR_TYPE_LABELS: Record<CarType, string> = {
+export const CAR_TYPE_LABELS: Record<CarType, string> = {
   sedan: 'Sedan', suv: 'SUV', van: 'Van', minivan: 'Minivan', truck: 'Truck', other: 'Other',
 }
 
-const CAR_TYPE_EMOJI: Record<CarType, string> = {
+export const CAR_TYPE_EMOJI: Record<CarType, string> = {
   sedan: '🚗', suv: '🚙', van: '🚐', minivan: '🚐', truck: '🚚', other: '🚗',
 }
 
-const SERIF: CSSProperties = { fontFamily: "'DM Serif Display', serif" }
-const MONO: CSSProperties = { fontFamily: "'DM Mono', monospace" }
+export const SERIF: CSSProperties = { fontFamily: "'DM Serif Display', serif" }
+export const MONO: CSSProperties = { fontFamily: "'DM Mono', monospace" }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function toInitials(name: string): string {
+export function toInitials(name: string): string {
   return name.split(' ').map(w => w[0]?.toUpperCase() ?? '').join('').slice(0, 2)
 }
 
@@ -248,7 +254,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
   const name = trip.driver_name ?? 'Driver'
   return {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
-    user: { name, initials: toInitials(name), verified: false },
+    user: { name, initials: toInitials(name), verified: false, photoUrl: trip.driver_photo_url },
     from: trip.pickup.label, to: trip.destination.label,
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
@@ -264,7 +270,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
   const name = req.rider_name ?? 'Rider'
   return {
     id: req.id, type: 'rider', apiId: req.id, ownerId: req.rider_id,
-    user: { name, initials: toInitials(name), verified: false },
+    user: { name, initials: toInitials(name), verified: false, photoUrl: req.rider_photo_url },
     from: req.pickup.label, to: req.destination.label,
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
@@ -319,12 +325,15 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
     destLat: trip.destination.latitude,
     destLng: trip.destination.longitude,
     destLabel: trip.destination.label,
+    riderPickupLat: conn.ride_request.pickup.latitude,
+    riderPickupLng: conn.ride_request.pickup.longitude,
+    riderPickupLabel: conn.ride_request.pickup.label,
   }
 }
 
 // ─── Small utility components ─────────────────────────────────────────────────
 
-function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'lg'; photoUrl?: string | null }) {
+export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'lg'; photoUrl?: string | null }) {
   const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', lg: 'size-14 text-xl' }[size]
   if (photoUrl) {
     return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
@@ -402,7 +411,7 @@ function ListingCard({ listing, onConnect, currentUserId }: { listing: Listing; 
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3">
-          <Avatar initials={listing.user.initials} />
+          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
           <div>
             <div className="flex items-center gap-1.5">
               <span className="text-sm font-semibold">{listing.user.name}</span>
@@ -737,14 +746,91 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 
 // ─── Driver-mode home ───────────────────────────────────────────────────────────
 
-function DriverHomeView({ myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView }: {
+function DriverHomeView({
+  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
+  searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
+  quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
+  filterSheetOpen, setFilterSheetOpen,
+}: {
   myOpenTrip: MyListing | undefined; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
   setView: (v: View) => void
+  searchQuery: string; setSearchQuery: (v: string) => void
+  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
+  filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
+  filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
+  filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
+  quickDateFilter: 'today' | 'any'; setQuickDateFilter: (v: 'today' | 'any') => void
+  seatsNeeded: number | null; setSeatsNeeded: (v: number | null) => void
+  filterSheetOpen: boolean; setFilterSheetOpen: (v: boolean) => void
 }) {
   const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
   const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
+  const isMobile = useIsMobile()
+
+  // Mobile-only: candidates are always ride requests (type 'rider'), so the
+  // vehicle-size filter and rider-facing "seats needed" pill never apply here
+  // — applying them would just zero out every result rather than doing
+  // anything useful, so they're deliberately left out of this predicate.
+  const mobileMatches = useMemo(() => {
+    if (!isMobile) return matches
+    const now = new Date()
+    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+    return matches.filter(m => {
+      const l = m.listing
+      const matchSearch = searchQuery.trim() === '' || l.to.toLowerCase().includes(searchQuery.toLowerCase()) || l.from.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchTag = filterTag === '' || l.tags.includes(filterTag)
+      const matchLuggage = filterLuggage === '' || l.luggageSize == null || l.luggageSize === 'none' || l.luggageSize === filterLuggage
+      const matchDate = quickDateFilter === 'any' || l.date === todayLocal
+      return matchSearch && matchTag && matchLuggage && matchDate
+    })
+  }, [matches, isMobile, searchQuery, filterTag, filterLuggage, quickDateFilter])
+
+  if (isMobile) {
+    const activeFilterCount = [filterTag !== '', filterLuggage !== ''].filter(Boolean).length
+    return (
+      <div className="space-y-4">
+        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
+        <MobileFilterBar
+          onOpenFilters={() => setFilterSheetOpen(true)}
+          activeCount={activeFilterCount}
+          quickDate={quickDateFilter} onQuickDate={setQuickDateFilter}
+          seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
+        />
+        {!myOpenTrip && (
+          <div className="rounded-3xl border border-dashed border-border p-5 text-center">
+            <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
+            <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+          </div>
+        )}
+        <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Finding nearby requests…</p>
+        ) : mobileMatches.length > 0 ? (
+          <div className="space-y-3">
+            {mobileMatches.map(m => (
+              <MobileListingCard key={m.listing.id} listing={m.listing} onConnect={l => { onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error')) }} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} />
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-16 text-muted-foreground">
+            <Search className="size-10 mx-auto mb-4 opacity-20" />
+            <p className="font-medium">No ride requests match</p>
+            <p className="text-sm mt-1">Try a different destination or fewer filters.</p>
+          </div>
+        )}
+        <FilterSheet
+          open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
+          filterType={filterType} setFilterType={setFilterType}
+          filterTag={filterTag} setFilterTag={setFilterTag}
+          filterCarType={filterCarType} setFilterCarType={setFilterCarType}
+          filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">
@@ -823,16 +909,61 @@ function DriverHomeView({ myOpenTrip, listings, currentUserId, currentUserIntere
 function FeedView({
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
-  listings, onConnect, loading, currentUserId,
+  quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
+  filterSheetOpen, setFilterSheetOpen,
+  listings, onConnect, loading, currentUserId, setView,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
+  quickDateFilter: 'today' | 'any'; setQuickDateFilter: (v: 'today' | 'any') => void
+  seatsNeeded: number | null; setSeatsNeeded: (v: number | null) => void
+  filterSheetOpen: boolean; setFilterSheetOpen: (v: boolean) => void
   listings: Listing[]; onConnect: (l: Listing) => void; loading: boolean; currentUserId: string
+  setView: (v: View) => void
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const isMobile = useIsMobile()
+
+  if (isMobile) {
+    const activeFilterCount = [filterType !== 'all', filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
+    return (
+      <div className="space-y-4">
+        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
+        <MobileFilterBar
+          onOpenFilters={() => setFilterSheetOpen(true)}
+          activeCount={activeFilterCount}
+          quickDate={quickDateFilter} onQuickDate={setQuickDateFilter}
+          seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
+        />
+        <SectionHeader label="Nearby Drivers" count={listings.length} noun={listings.length === 1 ? 'driver' : 'drivers'} />
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Loading…</p>
+        ) : listings.length > 0 ? (
+          <div className="space-y-3">
+            {listings.map(l => (
+              <MobileListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} />
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-16 text-muted-foreground">
+            <Search className="size-10 mx-auto mb-4 opacity-20" />
+            <p className="font-medium">No rides match</p>
+            <p className="text-sm mt-1">Try a different destination or fewer filters.</p>
+          </div>
+        )}
+        <FilterSheet
+          open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
+          filterType={filterType} setFilterType={setFilterType}
+          filterTag={filterTag} setFilterTag={setFilterTag}
+          filterCarType={filterCarType} setFilterCarType={setFilterCarType}
+          filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">
@@ -1082,13 +1213,21 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
 // ─── My Listings view ─────────────────────────────────────────────────────────
 
-function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void> }) {
-  const [tab, setTab] = useState<'driver' | 'rider'>('driver')
+function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast }: {
+  myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void>
+  userCoords: { lat: number; lng: number } | null; currentUserId: string
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const isMobile = useIsMobile()
+  const [tab, setTab] = useState<'driver' | 'rider' | 'pools'>('driver')
   const [cancelling, setCancelling] = useState<string | null>(null)
   const shown = myListings.filter(l => l.type === tab)
   const handleCancel = async (listing: MyListing) => {
     setCancelling(listing.id); try { await onCancel(listing) } finally { setCancelling(null) }
   }
+  // Pools is a standalone Sidebar entry on desktop already — only surface it
+  // as a third tab here on mobile, where the bottom nav was trimmed to 4 tabs.
+  const tabs = isMobile ? (['driver', 'rider', 'pools'] as const) : (['driver', 'rider'] as const)
   return (
     <div className="space-y-6">
       <div>
@@ -1096,13 +1235,15 @@ function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onC
         <p className="text-muted-foreground mt-1">Your posted driver trips and ride requests.</p>
       </div>
       <div className="flex rounded-xl bg-muted p-1 gap-1">
-        {(['driver', 'rider'] as const).map(t => (
+        {tabs.map(t => (
           <button key={t} onClick={() => setTab(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${tab === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-            {t === 'driver' ? 'Driver Trips' : 'Ride Requests'}
+            {t === 'driver' ? 'Driver Trips' : t === 'rider' ? 'Ride Requests' : 'Pools'}
           </button>
         ))}
       </div>
-      {shown.length === 0 ? (
+      {tab === 'pools' ? (
+        <PoolView userCoords={userCoords} currentUserId={currentUserId} showToast={showToast} />
+      ) : shown.length === 0 ? (
         <div className="text-center py-24 text-muted-foreground">
           <ClipboardList className="size-10 mx-auto mb-4 opacity-20" />
           <p className="font-medium">No {tab === 'driver' ? 'driver trips' : 'ride requests'} yet</p>
@@ -1147,7 +1288,7 @@ function MyListingsView({ myListings, onCancel }: { myListings: MyListing[]; onC
 // ─── Connection card ──────────────────────────────────────────────────────────
 
 function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead,
+  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onMarkRead,
   autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
@@ -1155,6 +1296,7 @@ function ConnectionCard({
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
+  onStartDriving: (conn: Connection) => void
   onMarkRead: (id: string) => void
   autoOpen?: 'chat' | 'gassplit' | null
   isActive: boolean
@@ -1250,6 +1392,7 @@ function ConnectionCard({
 
   const { status } = connection
   const hasRouteCoords = !!(connection.pickupLat && connection.destLat)
+  const hasRiderPickupCoords = !!(connection.riderPickupLat && connection.riderPickupLng)
 
   return (
     <motion.div ref={cardRef} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className={`bg-card rounded-3xl border overflow-hidden transition-colors ${autoOpen ? 'border-primary/50 ring-2 ring-primary/20' : 'border-border'}`}>
@@ -1309,6 +1452,11 @@ function ConnectionCard({
             {hasRouteCoords && (
               <button onClick={() => onViewRoute(connection)} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
                 <Map className="size-4" />Route
+              </button>
+            )}
+            {connection.myRole === 'driver' && hasRiderPickupCoords && (
+              <button onClick={() => onStartDriving(connection)} className="inline-flex items-center gap-1.5 rounded-2xl bg-green-600 text-white px-4 py-2 text-sm font-semibold hover:bg-green-700 transition-colors">
+                <Car className="size-4" />Start Driving
               </button>
             )}
             <button onClick={() => toggleSection('gassplit')} className={`inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'gassplit' ? 'bg-accent/20 text-amber-800' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
@@ -1422,12 +1570,13 @@ function ConnectionCard({
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onMarkRead, deepLink }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onMarkRead, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
+  onStartDriving: (conn: Connection) => void
   onMarkRead: (id: string) => void
   deepLink?: { connectionId: string; section: 'chat' | 'gassplit' } | null
 }) {
@@ -1457,7 +1606,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead}
+              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
               autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
               isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
@@ -1562,7 +1711,10 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void }) {
+function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
+  currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
+  mode: ListingType; onSetMode: (m: ListingType) => void
+}) {
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
   const [displayName, setDisplayName] = useState(profile.display_name)
@@ -1651,6 +1803,20 @@ function ProfileView({ currentUser, onProfileUpdate }: { currentUser: ApiUser; o
             <h2 className="mt-2 text-2xl font-semibold text-foreground">{profile.display_name}</h2>
             <p className="mt-1 text-sm text-muted-foreground">{currentUser.email}</p>
           </div>
+        </div>
+      </div>
+
+      <div className="rounded-3xl bg-card border border-border p-6 space-y-3">
+        <div>
+          <h3 className="text-base font-semibold text-foreground">Riding as</h3>
+          <p className="text-sm text-muted-foreground mt-0.5">Switch between browsing as a passenger looking for a ride, or a driver offering one.</p>
+        </div>
+        <div className="flex rounded-xl bg-muted p-1 gap-1" role="group" aria-label="Passenger or Driver mode">
+          {(['rider', 'driver'] as ListingType[]).map(m => (
+            <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`flex-1 py-2.5 rounded-lg text-sm font-semibold transition-colors ${mode === m ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {m === 'rider' ? 'Passenger' : 'Driver'}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -1806,7 +1972,8 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
         <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            <div className="flex rounded-xl bg-sidebar-accent p-0.5 gap-0.5 mr-1" role="group" aria-label="Passenger or Driver mode">
+            {/* Relocated to Profile on mobile — this screen is too cramped for it, and it's a settings-style choice, not a per-screen action. */}
+            <div className="hidden xl:flex rounded-xl bg-sidebar-accent p-0.5 gap-0.5 mr-1" role="group" aria-label="Passenger or Driver mode">
               {(['rider', 'driver'] as ListingType[]).map(m => (
                 <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${mode === m ? 'bg-white text-sidebar shadow-sm' : 'text-sidebar-foreground/65 hover:text-sidebar-foreground'}`}>
                   {m === 'rider' ? 'Passenger' : 'Driver'}
@@ -1837,13 +2004,13 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
 }
 
 function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v: View) => void; unreadMessages: number }) {
+  // Trimmed to 4 core tabs — Map is now a toggle inside Discover, Pools lives
+  // inside My Rides, and ride creation moved to the Discover FAB.
   const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
-    { id: 'feed', label: 'Feed', icon: <Search className="size-5" /> },
-    { id: 'map', label: 'Map', icon: <Map className="size-5" /> },
-    { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
-    { id: 'post', label: 'New', icon: <span className="text-xl font-light leading-none">+</span> },
+    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
+    { id: 'my-listings', label: 'My Rides', icon: <Car className="size-5" /> },
     { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
-    { id: 'profile', label: 'Me', icon: <Shield className="size-5" /> },
+    { id: 'profile', label: 'Profile', icon: <Shield className="size-5" /> },
   ]
   return (
     <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40">
@@ -1911,6 +2078,7 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
 
 export function Home() {
   const navigate = useNavigate()
+  const isMobile = useIsMobile()
 
   // ── Auth ──
   const [currentUser, setCurrentUser] = useState<ApiUser | null>(null)
@@ -1955,6 +2123,11 @@ export function Home() {
   const [matchedListingIds, setMatchedListingIds] = useState<string[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
 
+  // ── Mobile Discover: quick filters, filter sheet ──
+  const [quickDateFilter, setQuickDateFilter] = useState<'today' | 'any'>('any')
+  const [seatsNeeded, setSeatsNeeded] = useState<number | null>(null)
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false)
+
   // ── My Listings ──
   const [myListings, setMyListings] = useState<MyListing[]>([])
 
@@ -1965,6 +2138,9 @@ export function Home() {
 
   // ── Trip route (for Map view) ──
   const [tripRoute, setTripRoute] = useState<TripRoute | null>(null)
+
+  // ── Driving-to-pickup (for Map view) ──
+  const [drivingTo, setDrivingTo] = useState<DrivingTarget | null>(null)
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
@@ -2099,14 +2275,20 @@ export function Home() {
   useEffect(() => { if (currentUser) loadListings(userCoords) }, [currentUser, userCoords, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
-  const filteredListings = useMemo(() => allListings.filter(listing => {
-    const matchType = filterType === 'all' || listing.type === filterType
-    const matchTag = filterTag === '' || listing.tags.includes(filterTag)
-    const matchSearch = searchQuery.trim() === '' || listing.to.toLowerCase().includes(searchQuery.toLowerCase()) || listing.from.toLowerCase().includes(searchQuery.toLowerCase())
-    const matchCarType = filterCarType === '' || (listing.type === 'driver' && listing.carType === filterCarType)
-    const matchLuggage = filterLuggage === '' || listing.type !== 'driver' || (listing.luggageCapacity != null && LUGGAGE_ORDER.indexOf(listing.luggageCapacity) >= LUGGAGE_ORDER.indexOf(filterLuggage))
-    return matchType && matchTag && matchSearch && matchCarType && matchLuggage
-  }), [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage]) // eslint-disable-line react-hooks/exhaustive-deps
+  const filteredListings = useMemo(() => {
+    const now = new Date()
+    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+    return allListings.filter(listing => {
+      const matchType = filterType === 'all' || listing.type === filterType
+      const matchTag = filterTag === '' || listing.tags.includes(filterTag)
+      const matchSearch = searchQuery.trim() === '' || listing.to.toLowerCase().includes(searchQuery.toLowerCase()) || listing.from.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchCarType = filterCarType === '' || (listing.type === 'driver' && listing.carType === filterCarType)
+      const matchLuggage = filterLuggage === '' || listing.type !== 'driver' || (listing.luggageCapacity != null && LUGGAGE_ORDER.indexOf(listing.luggageCapacity) >= LUGGAGE_ORDER.indexOf(filterLuggage))
+      const matchDate = quickDateFilter === 'any' || listing.date === todayLocal
+      const matchSeats = seatsNeeded == null || listing.type !== 'driver' || ((listing.seats ?? 0) - (listing.seatsUsed ?? 0)) >= seatsNeeded
+      return matchType && matchTag && matchSearch && matchCarType && matchLuggage && matchDate && matchSeats
+    })
+  }, [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Handlers ──
   const onConnect = useCallback(async (listing: Listing) => {
@@ -2154,6 +2336,7 @@ export function Home() {
 
   const onViewRoute = useCallback((conn: Connection) => {
     if (!conn.pickupLat || !conn.pickupLng || !conn.destLat || !conn.destLng) return
+    setDrivingTo(null)
     setTripRoute({
       pickupLat: conn.pickupLat, pickupLng: conn.pickupLng, pickupLabel: conn.pickupLabel ?? 'Pickup',
       destLat: conn.destLat, destLng: conn.destLng, destLabel: conn.destLabel ?? 'Destination',
@@ -2161,6 +2344,21 @@ export function Home() {
     })
     setView('map')
   }, [])
+
+  const onStartDriving = useCallback((conn: Connection) => {
+    if (!conn.riderPickupLat || !conn.riderPickupLng) return
+    setTripRoute(null)
+    setDrivingTo({
+      connectionId: conn.id, pickupLat: conn.riderPickupLat, pickupLng: conn.riderPickupLng,
+      pickupLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+    })
+    setView('map')
+  }, [])
+
+  const onStopDriving = useCallback(() => {
+    setDrivingTo(null)
+    showToast('Trip navigation ended', 'success')
+  }, [showToast])
 
   const onMarkAllReadNotifs = useCallback(() => {
     setNotifications(prev => prev.map(n => ({ ...n, read: true })))
@@ -2194,7 +2392,7 @@ export function Home() {
 
   const onSignOut = useCallback(() => {
     authClient.signOut().catch(() => {})
-    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null)
+    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 
@@ -2245,7 +2443,11 @@ export function Home() {
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
-      <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} onSetMode={handleSetMode} />
+      {/* The immersive full-bleed Map view supplies its own floating header on
+          mobile, so the app's own top bar would just double up with it there. */}
+      <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} onSetMode={handleSetMode} />
+      </div>
 
       <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
         <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
@@ -2259,26 +2461,44 @@ export function Home() {
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView}
+                  searchQuery={searchQuery} setSearchQuery={setSearchQuery}
+                  filterType={filterType} setFilterType={setFilterType}
+                  filterTag={filterTag} setFilterTag={setFilterTag}
+                  filterCarType={filterCarType} setFilterCarType={setFilterCarType}
+                  filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
+                  quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter}
+                  seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded}
+                  filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen}
                 />
               ) : (
                 <div className="space-y-8">
-                  <BestMatches
-                    listings={allListings}
-                    referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
-                    currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
-                    onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds}
-                  />
-                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} />
+                  {/* Its own desktop-styled MatchCard would clash with the new mobile
+                      card design, and isn't part of the mobile redesign's scope. */}
+                  {!isMobile && (
+                    <BestMatches
+                      listings={allListings}
+                      referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
+                      currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
+                      onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds}
+                    />
+                  )}
+                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} />
                 </div>
               )
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} />}
+            {guardedView === 'feed' && isMobile && (
+              <>
+                <ViewToggleFab onClick={() => setView('map')} />
+                <OfferRideFab mode={mode} onClick={() => setView('post')} />
+              </>
+            )}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
-            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onMarkRead={onMarkRead} deepLink={connDeepLink} />}
+            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} />}
+            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} />}
           </main>
         </div>
       </div>

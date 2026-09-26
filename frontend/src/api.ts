@@ -32,6 +32,7 @@ export type ApiDriverTrip = {
   id: string;
   driver_id: string;
   driver_name: string | null;
+  driver_photo_url: string | null;
   pickup: LocationView;
   destination: LocationView;
   target_date: string;
@@ -49,6 +50,7 @@ export type ApiRideRequest = {
   id: string;
   rider_id: string;
   rider_name: string | null;
+  rider_photo_url: string | null;
   pickup: LocationView;
   destination: LocationView;
   target_date: string;
