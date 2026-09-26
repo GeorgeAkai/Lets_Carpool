@@ -2,7 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content: makes the browser shrink the actual
+         viewport when the on-screen keyboard opens (Chrome 108+, iOS Safari
+         16.4+), instead of just overlaying it. Without this, our fixed/absolute
+         bottom sheets (e.g. the map's search sheet) sit pinned to the old
+         viewport height and end up hidden under the keyboard. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#0284c8" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
     <title>Let's Carpool</title>
