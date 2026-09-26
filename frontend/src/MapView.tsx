@@ -1,12 +1,21 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 import * as maplibregl from "maplibre-gl"
 import "maplibre-gl/dist/maplibre-gl.css"
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url"
 import { useTheme } from "@neondatabase/auth-ui"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
 import {
   MapPin, Navigation, Clock, Ruler, DollarSign, X, Car, Search, Crosshair, ChevronUp, ChevronDown,
 } from "lucide-react"
+
+// Bundlers don't reliably auto-detect the `new Worker(new URL(...))` call
+// inside maplibre-gl's own source (it 404s under Vite's dev optimizer and
+// silently drops out of the Rollup production bundle too — tile parsing then
+// never happens and the map paints blank). Resolving the worker file
+// ourselves via Vite's `?url` import and pointing maplibre-gl at it explicitly
+// sidesteps that bundler detection entirely, in both dev and prod.
+maplibregl.setWorkerUrl(maplibreWorkerUrl)
 
 export interface TripRoute {
   pickupLat: number
@@ -258,6 +267,52 @@ export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStop
   const [searchText, setSearchText] = useState("")
   const [searchResults, setSearchResults] = useState<NominatimResult[]>([])
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Bottom sheet drag gesture ───────────────────────────────────────────────
+  // Tracks the sheet's live height in px while a pointer drag is in progress
+  // (null when settled, letting the CSS max-height transition take back over).
+  // A drag that never moves past a small threshold is treated as a tap, so the
+  // existing "tap the handle to expand/collapse" behavior still works.
+  const [sheetDragPx, setSheetDragPx] = useState<number | null>(null)
+  const dragStateRef = useRef<{ startY: number; startHeight: number; moved: boolean } | null>(null)
+
+  const sheetHeightBounds = useCallback(() => ({
+    collapsed: 220,
+    expanded: typeof window !== "undefined" ? window.innerHeight * 0.7 : 600,
+  }), [])
+
+  const onSheetHandlePointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    const { collapsed, expanded } = sheetHeightBounds()
+    dragStateRef.current = { startY: e.clientY, startHeight: sheetExpanded ? expanded : collapsed, moved: false }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }, [sheetExpanded, sheetHeightBounds])
+
+  const onSheetHandlePointerMove = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = dragStateRef.current
+    if (!drag) return
+    const deltaY = e.clientY - drag.startY
+    if (Math.abs(deltaY) > 4) drag.moved = true
+    const { collapsed, expanded } = sheetHeightBounds()
+    setSheetDragPx(Math.min(expanded, Math.max(collapsed, drag.startHeight - deltaY)))
+  }, [sheetHeightBounds])
+
+  const onSheetHandlePointerUp = useCallback(() => {
+    const drag = dragStateRef.current
+    dragStateRef.current = null
+    if (!drag) return
+    if (!drag.moved) {
+      setSheetExpanded(v => !v)
+    } else {
+      const { collapsed, expanded } = sheetHeightBounds()
+      setSheetDragPx(current => {
+        const settled = current ?? drag.startHeight
+        setSheetExpanded(settled > (collapsed + expanded) / 2)
+        return null
+      })
+      return
+    }
+    setSheetDragPx(null)
+  }, [sheetHeightBounds])
 
   const mode: "browse" | "trip" | "driving" = drivingTo ? "driving" : tripRoute ? "trip" : "browse"
 
@@ -816,11 +871,15 @@ export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStop
 
         {/* Bottom sheet drawer */}
         <div
-          className={`absolute left-0 right-0 bottom-0 z-10 rounded-t-3xl border-t border-white/10 bg-slate-900/90 text-white backdrop-blur-md shadow-[0_-8px_30px_rgba(0,0,0,.3)] transition-[max-height] duration-300 overflow-hidden ${sheetExpanded ? "max-h-[70vh]" : "max-h-[220px]"}`}
+          className={`absolute left-0 right-0 bottom-0 z-10 rounded-t-3xl border-t border-white/10 bg-slate-900/90 text-white backdrop-blur-md shadow-[0_-8px_30px_rgba(0,0,0,.3)] overflow-hidden ${sheetDragPx == null ? "transition-[max-height] duration-300" : ""} ${sheetExpanded ? "max-h-[70vh]" : "max-h-[220px]"}`}
+          style={sheetDragPx != null ? { maxHeight: sheetDragPx } : undefined}
         >
           <button
-            onClick={() => setSheetExpanded(v => !v)}
-            className="w-full flex flex-col items-center pt-2.5 pb-1"
+            onPointerDown={onSheetHandlePointerDown}
+            onPointerMove={onSheetHandlePointerMove}
+            onPointerUp={onSheetHandlePointerUp}
+            onPointerCancel={onSheetHandlePointerUp}
+            className="w-full flex flex-col items-center pt-2.5 pb-1 touch-none cursor-grab active:cursor-grabbing"
             aria-label={sheetExpanded ? "Collapse" : "Expand"}
           >
             <span className="block w-9 h-1 rounded-full bg-white/25" />

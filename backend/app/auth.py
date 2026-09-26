@@ -32,13 +32,23 @@ def verify_neon_auth_token(
     """
     try:
         signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token)
+        # PyJWT only *skips* an unset check symmetrically for `issuer` — pass
+        # `audience=None` against a token that actually carries an `aud` claim
+        # (Neon Auth's always do) and it raises InvalidAudienceError instead of
+        # treating "no expected audience configured" as "don't check". Passing
+        # `verify_aud: False` here is PyJWT's documented way to actually opt out,
+        # restoring the "only checked once configured" behavior every sign-in
+        # otherwise fails with regardless of how valid the token is.
+        options: dict[str, Any] = {"require": ["exp", "sub"]}
+        if audience is None:
+            options["verify_aud"] = False
         payload = jwt.decode(
             token,
             signing_key.key,
             algorithms=NEON_AUTH_JWT_ALGORITHMS,
             issuer=issuer,
             audience=audience,
-            options={"require": ["exp", "sub"]},
+            options=options,
         )
     except jwt.PyJWKClientError as exc:
         raise DomainError("Could not verify Neon Auth token signature", 401) from exc

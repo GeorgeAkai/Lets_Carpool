@@ -4,6 +4,13 @@ import { VitePWA } from "vite-plugin-pwa";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+  // Vite's dev dependency optimizer pre-bundles maplibre-gl into
+  // node_modules/.vite/deps/ but doesn't carry its worker file along, so the
+  // worker 404s and no vector tiles ever get parsed (the map paints blank —
+  // markers still show since those are plain DOM overlays, not tile-derived).
+  // Excluding it serves the package straight from node_modules, where the
+  // worker's relative path actually resolves.
+  optimizeDeps: { exclude: ["maplibre-gl"] },
   plugins: [
     react(),
     tailwindcss(),
