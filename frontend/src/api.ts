@@ -11,6 +11,15 @@ function authHeaders(): HeadersInit {
   return t ? { Authorization: `Bearer ${t}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
 }
 
+// Carries the HTTP status so callers can tell "forbidden" (403) apart from
+// other failures — the admin panel redirects to its 403 page on it.
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
@@ -19,7 +28,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(String(err?.detail ?? res.statusText));
+    throw new ApiError(String(err?.detail ?? res.statusText), res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -106,6 +115,7 @@ export type ApiUser = {
   email_domain: string;
   profile: ApiProfile;
   vehicle: ApiVehicle;
+  is_admin?: boolean;
 };
 
 export type HealthResponse = {
@@ -516,6 +526,94 @@ export function markNotificationsRead(): Promise<{ status: string }> {
 
 export function dismissNotification(notificationId: string): Promise<{ status: string }> {
   return request<{ status: string }>("DELETE", `/notifications/${notificationId}`);
+}
+
+// ─── Admin (superadmin only) ─────────────────────────────────────────────────
+
+export type AdminStats = {
+  total_users: number;
+  drivers: number;
+  passengers: number;
+  active_drivers: number;
+  active_riders: number;
+  completed_rides: number;
+  blocked_users: number;
+  reported_users: number;
+  open_reports: number;
+};
+
+export type AdminUserRow = {
+  id: string;
+  email: string;
+  created_at: string;
+  suspended: boolean;
+  display_name: string | null;
+  photo_url: string | null;
+  is_driver: boolean;
+  is_rider: boolean;
+  open_reports: number;
+};
+
+export type AdminReport = {
+  id: string;
+  reason: string;
+  status: "open" | "dismissed" | "actioned";
+  created_at: string;
+  resolved_at: string | null;
+  reporter_id: string;
+  reporter_email: string;
+  reporter_name: string | null;
+  reported_user_id: string;
+  reported_email: string;
+  reported_name: string | null;
+  reported_suspended: boolean;
+};
+
+export type AdminDestination = { label: string; trips: number; requests: number; total: number };
+
+export type AuditLogEntry = {
+  id: string;
+  created_at: string;
+  event_type: string;
+  actor_id: string | null;
+  actor_email: string | null;
+  ip_address: string | null;
+  details: string;
+};
+
+function qs(params: Record<string, string | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
+  const str = q.toString();
+  return str ? `?${str}` : "";
+}
+
+export function getAdminStats(): Promise<AdminStats> {
+  return request("GET", "/admin/stats");
+}
+
+export function getAdminUsers(query?: string): Promise<AdminUserRow[]> {
+  return request("GET", `/admin/users${qs({ q: query?.trim() })}`);
+}
+
+export function setAdminUserBlocked(userId: string, blocked: boolean): Promise<{ id: string; suspended: boolean }> {
+  return request("POST", `/admin/users/${userId}/${blocked ? "block" : "unblock"}`);
+}
+
+export function getAdminReports(status: "open" | "dismissed" | "actioned" | "all" = "open"): Promise<AdminReport[]> {
+  return request("GET", `/admin/reports${qs({ status })}`);
+}
+
+export function resolveAdminReport(reportId: string, action: "dismiss" | "suspend"): Promise<unknown> {
+  return request("POST", `/admin/reports/${reportId}/${action}`);
+}
+
+export function getAdminDestinations(limit = 10): Promise<AdminDestination[]> {
+  return request("GET", `/admin/destinations?limit=${limit}`);
+}
+
+export function getAuditLogs(eventType?: string, query?: string): Promise<AuditLogEntry[]> {
+  return request("GET", `/admin/audit-logs${qs({ event_type: eventType, q: query?.trim() })}`);
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────

@@ -529,7 +529,7 @@ describe("Connections view", () => {
     });
   });
 
-  it("keeps only one connection's chat open at a time, to avoid inbox clutter", async () => {
+  it("shows a master-detail inbox where selecting a conversation swaps the chat pane", async () => {
     const user = userEvent.setup();
 
     const makeConnection = (id: string, driverId: string, driverName: string) => ({
@@ -559,17 +559,97 @@ describe("Connections view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
-    await user.click(screen.getByRole("button", { name: /inbox/i }));
-    await waitFor(() => screen.getByText("Driver Alpha"));
-    expect(screen.getByText("Driver Beta")).toBeTruthy();
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
 
-    const chatButtons = screen.getAllByRole("button", { name: /^chat$/i });
-    await user.click(chatButtons[0]);
-    await waitFor(() => screen.getByText("Message from Alpha"));
+    // Desktop auto-opens the first conversation in the detail pane, and each
+    // list row previews its thread's last message.
+    await waitFor(() => expect(screen.getByRole("region", { name: /conversation/i })).toHaveTextContent("Message from Alpha"));
+    const pane = () => screen.getByRole("region", { name: /conversation/i });
+    expect(pane()).toHaveTextContent("Driver Alpha");
+    expect(pane()).not.toHaveTextContent("Message from Beta");
+    // Trip controls live in the pane header for accepted rides.
+    expect(screen.getByRole("button", { name: /gas split/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /complete/i })).toBeTruthy();
 
-    await user.click(chatButtons[1]);
-    await waitFor(() => screen.getByText("Message from Beta"));
-    expect(screen.queryByText("Message from Alpha")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /driver beta/i }));
+    await waitFor(() => expect(pane()).toHaveTextContent("Message from Beta"));
+    expect(pane()).not.toHaveTextContent("Message from Alpha");
+  });
+
+  it("files declined and cancelled conversations under Archived", async () => {
+    const user = userEvent.setup();
+    const base = {
+      ride_request_id: "rrq_1", driver_trip_id: "trp_1", initiator_user_id: "usr_abc",
+      created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z",
+      ride_request: { ...RIDE_REQUEST_1, rider_id: "usr_abc" }, driver_trip: DRIVER_TRIP_1,
+    };
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/connections": [
+        { ...base, id: "con_live", status: "accepted", driver_profile: { user_id: "usr_driver", display_name: "Live Driver", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null } },
+        { ...base, id: "con_dead", status: "declined", driver_profile: { user_id: "usr_driver", display_name: "Declined Driver", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null } },
+      ],
+    });
+
+    render(<MemoryRouter initialEntries={["/connections"]}><App /></MemoryRouter>);
+
+    await waitFor(() => expect(screen.getAllByText("Live Driver").length).toBeGreaterThan(0));
+    expect(screen.queryByText("Declined Driver")).toBeNull();
+
+    await user.click(screen.getByRole("tab", { name: /archived/i }));
+    await waitFor(() => expect(screen.getAllByText("Declined Driver").length).toBeGreaterThan(0));
+    expect(screen.queryByText("Live Driver")).toBeNull();
+  });
+});
+
+describe("My Rides view", () => {
+  beforeEach(() => {
+    signInWithExistingToken();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("defaults to active trips, keeps past ones under Past / Archive, and cleans up location labels", async () => {
+    const user = userEvent.setup();
+    const future = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    const trip = (id: string, status: string, target_date: string, dest: string) => ({
+      ...DRIVER_TRIP_1, id, driver_id: "usr_abc", status, target_date,
+      pickup: { id: `p_${id}`, label: "Chico, Chico, California", exact: true, latitude: 39.7, longitude: -121.8 },
+      destination: { id: `d_${id}`, label: dest, exact: true, latitude: 38.6, longitude: -121.5 },
+    });
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [
+        trip("trp_up", "open", future, "Sacramento, Sacramento County, California, United States"),
+        trip("trp_old", "cancelled", "2026-01-02", "Reno, Nevada"),
+      ],
+      "GET /me/ride-requests": [],
+    });
+
+    render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
+
+    await waitFor(() => screen.getByText("Sacramento, CA"));
+    expect(screen.getByText("Chico, CA")).toBeTruthy();
+    expect(screen.queryByText("Reno, NV")).toBeNull();
+    expect(screen.getByRole("button", { name: /manage ride/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /view matches/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel listing/i })).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: /past \/ archive/i }));
+    await waitFor(() => screen.getByText("Reno, NV"));
+    expect(screen.queryByText("Sacramento, CA")).toBeNull();
+
+    // Re-book pre-fills the post form with the old route.
+    await user.click(screen.getByRole("button", { name: /re-book/i }));
+    await waitFor(() => screen.getByText(/re-book this ride/i));
+    expect((screen.getByPlaceholderText(/destination/i) as HTMLInputElement).value).toBe("Reno, NV");
   });
 });
 
@@ -600,5 +680,58 @@ describe("Profile view", () => {
     // navigates the same place, so just take the first match.
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
     await waitFor(() => screen.getByText("Ada Rider"));
+  });
+
+  it("drops the duplicate mode toggle and saves profile + vehicle with one button", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const path = String(url).replace(BASE, "");
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
+      if (path.startsWith("/driver-trips/search") || path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
+      if (method === "PATCH" && path === "/me/profile") return { ok: true, json: async () => ({ ...ME_RESPONSE.profile, bio: "Hi there" }) };
+      if (method === "PUT" && path === "/me/driver-readiness") return { ok: true, json: async () => ({ make: "Honda" }) };
+      return { ok: false, json: async () => ({ detail: "not found" }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/driver readiness/i));
+
+    expect(screen.queryByText(/riding as/i)).toBeNull();
+    // Only the header copy of the Passenger/Driver switch remains.
+    expect(screen.getAllByRole("group", { name: /passenger or driver mode/i })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /save profile/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /save vehicle/i })).toBeNull();
+
+    const save = screen.getByRole("button", { name: /save changes/i });
+    expect(save).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/^bio$/i), "Hi there");
+    await user.type(screen.getByLabelText(/^make$/i), "Honda");
+    await user.click(save);
+
+    await waitFor(() => screen.getByText(/changes saved/i));
+    const calls = fetchMock.mock.calls.map(([url, init]) => `${((init as RequestInit | undefined)?.method ?? "GET").toUpperCase()} ${String(url).replace(BASE, "")}`);
+    expect(calls).toContain("PATCH /me/profile");
+    expect(calls).toContain("PUT /me/driver-readiness");
+  });
+
+  it("keeps Sign out in the account menu only", async () => {
+    const user = userEvent.setup();
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+    });
+
+    render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/driver readiness/i));
+
+    expect(screen.queryByRole("button", { name: /sign out/i })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.getByRole("menuitem", { name: /sign out/i })).toBeTruthy();
+    // Not the superadmin — no admin entry.
+    expect(screen.queryByRole("menuitem", { name: /admin/i })).toBeNull();
   });
 });

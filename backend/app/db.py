@@ -265,5 +265,26 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
+    # ── Admin / moderation ──────────────────────────────────────────────────
+    # `suspended` is a platform-level block set by the superadmin (distinct
+    # from the per-user `blocks` table, which only hides two users from each
+    # other). Suspended accounts can't sign in or use an existing token.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open'")
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id          TEXT PRIMARY KEY,
+            created_at  TIMESTAMPTZ NOT NULL,
+            event_type  TEXT NOT NULL,
+            actor_id    TEXT,
+            actor_email TEXT,
+            ip_address  TEXT,
+            details     TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs (created_at DESC)")
+
     cur.close()
     conn.close()
