@@ -357,7 +357,9 @@ describe("Post listing view", () => {
     await waitFor(() => screen.getByText(/post a listing/i));
     expect(screen.getByRole("button", { name: /i need a ride/i })).toHaveAttribute("aria-pressed", "true");
 
-    await user.click(screen.getByRole("button", { name: /^feed$/i }));
+    // "Discover" (renamed from "Feed") appears in both the desktop Sidebar
+    // and the mobile BottomNav — see the "Profile" comment above.
+    await user.click(screen.getAllByRole("button", { name: /^discover$/i })[0]);
     await user.click(screen.getByRole("button", { name: /^driver$/i }));
     await user.click(screen.getByRole("button", { name: /^post$/i }));
     await waitFor(() => screen.getByText(/post a listing/i));
@@ -592,7 +594,11 @@ describe("Profile view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
-    await user.click(screen.getByRole("button", { name: /profile/i }));
+    // "Profile" now appears in both the desktop Sidebar and the mobile
+    // BottomNav (present in the DOM together in jsdom, since Tailwind's
+    // `hidden`/`xl:` classes aren't computed without real CSS) — either one
+    // navigates the same place, so just take the first match.
+    await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
     await waitFor(() => screen.getByText("Ada Rider"));
   });
 });

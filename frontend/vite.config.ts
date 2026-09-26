@@ -10,6 +10,9 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       includeAssets: ["logo.svg", "icons/favicon-16x16.png", "icons/favicon-32x32.png"],
+      // maplibre-gl (replacing Leaflet for the vector-tile map) pushes the main
+      // bundle past workbox's 2 MiB default precache limit.
+      workbox: { maximumFileSizeToCacheInBytes: 5 * 1024 * 1024 },
       manifest: {
         name: "Let's Carpool",
         short_name: "Carpool",
