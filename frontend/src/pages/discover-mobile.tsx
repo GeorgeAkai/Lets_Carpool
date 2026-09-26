@@ -235,14 +235,20 @@ export function ViewToggleFab({ onClick }: { onClick: () => void }) {
   )
 }
 
+// Icon-only (not a labeled pill like ViewToggleFab): on narrow phones a
+// second full-width text pill at the same bottom-20 row would overlap the
+// centered map-toggle pill's bounding box. A compact circle stays clear of
+// it regardless of screen width, at the cost of relying on aria-label alone
+// for accessible naming.
 export function OfferRideFab({ mode, onClick }: { mode: 'rider' | 'driver'; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
       aria-label={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
-      className="fixed bottom-20 right-4 z-30 flex items-center gap-2 px-4 py-3 rounded-full bg-primary text-primary-foreground text-sm font-semibold shadow-xl active:scale-95 transition-transform"
+      title={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
+      className="fixed bottom-20 right-4 z-30 size-14 rounded-full bg-primary text-primary-foreground shadow-xl active:scale-95 transition-transform flex items-center justify-center"
     >
-      <Plus className="size-4" /> {mode === 'driver' ? 'Offer Ride' : 'Request Ride'}
+      <Plus className="size-6" />
     </button>
   )
 }
