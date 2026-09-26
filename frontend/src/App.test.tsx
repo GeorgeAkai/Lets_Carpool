@@ -9,9 +9,15 @@ import { fetchNeonJWT } from "./lib/auth";
 
 // Simulates a user who already has a live Neon session — required for NeonAuthSync
 // to not treat the app as signed-out and clear the pre-seeded backend token below.
+// Also pre-seeds the mode-choice gate's sessionStorage flag as already-answered
+// (Passenger), so tests that aren't specifically about the gate itself land
+// straight on Discover exactly like before it existed — test-setup.ts clears
+// sessionStorage before every test, so without this every test would hit the
+// gate first.
 function signInWithExistingToken() {
   localStorage.setItem("carpool_token", LOGIN_RESPONSE.access_token);
   setMockNeonSession({ user: { id: "usr_test", email: ME_RESPONSE.email, name: ME_RESPONSE.profile.display_name } });
+  sessionStorage.setItem("carpool_mode", "rider");
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -305,12 +311,13 @@ describe("Post listing view", () => {
       return { ok: false, json: async () => ({ detail: "not found" }) };
     });
     vi.stubGlobal("fetch", fetchMock);
+    // Driver mode, so the post form is locked to a driver trip.
+    sessionStorage.setItem("carpool_mode", "driver");
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/find your ride/i));
-
-    // Switch to Driver mode so the post form defaults to a driver trip.
-    await user.click(screen.getByRole("button", { name: /^driver$/i }));
+    // Driver mode is pre-seeded before render, so Discover shows DriverHomeView
+    // ("Your route") rather than the rider-mode "Find your ride" heading.
+    await waitFor(() => screen.getByRole("heading", { name: /^your route$/i }));
 
     // Navigate to Post view
     await user.click(screen.getByRole("button", { name: /^post$/i }));
@@ -352,18 +359,23 @@ describe("Post listing view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
-    // Defaults to Passenger mode — post form should default to a ride request.
+    // Defaults to Passenger mode (pre-seeded) — post form is locked to a ride
+    // request, with no interactive toggle (PostView no longer has one).
     await user.click(screen.getByRole("button", { name: /^post$/i }));
     await waitFor(() => screen.getByText(/post a listing/i));
-    expect(screen.getByRole("button", { name: /i need a ride/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText(/requesting a ride/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /i need a ride/i })).toBeNull();
 
-    // "Discover" (renamed from "Feed") appears in both the desktop Sidebar
-    // and the mobile BottomNav — see the "Profile" comment above.
+    // Switch to Driver mode via the deliberate Profile confirm flow — no
+    // toggle exists anymore, so this is the only way to switch.
+    await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
+    await user.click(screen.getByRole("button", { name: /switch to driver mode/i }));
+    await user.click(screen.getByRole("button", { name: /confirm switch/i }));
+
     await user.click(screen.getAllByRole("button", { name: /^discover$/i })[0]);
-    await user.click(screen.getByRole("button", { name: /^driver$/i }));
     await user.click(screen.getByRole("button", { name: /^post$/i }));
     await waitFor(() => screen.getByText(/post a listing/i));
-    expect(screen.getByRole("button", { name: /i'm offering a ride/i })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText(/offering a ride/i)).toBeTruthy();
   });
 
   it("routes a first-time switch to Driver mode into vehicle setup", async () => {
@@ -373,13 +385,13 @@ describe("Post listing view", () => {
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
     });
+    // Force the mode-choice gate to show, so choosing Driver here is a real
+    // first-time choice — this is now the vehicle-check's real entry point.
+    sessionStorage.removeItem("carpool_mode");
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/find your ride/i));
-
-    // Start from Passenger mode so switching to Driver is a real transition to observe.
-    await user.click(screen.getByRole("button", { name: /^passenger$/i }));
-    await user.click(screen.getByRole("button", { name: /^driver$/i }));
+    await waitFor(() => screen.getByText(/how are you riding today/i));
+    await user.click(screen.getByRole("button", { name: /i'm offering a ride/i }));
 
     await waitFor(() => screen.getByText(/driver readiness/i));
   });
@@ -391,12 +403,11 @@ describe("Post listing view", () => {
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
     });
+    sessionStorage.removeItem("carpool_mode");
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/find your ride/i));
-
-    await user.click(screen.getByRole("button", { name: /^passenger$/i }));
-    await user.click(screen.getByRole("button", { name: /^driver$/i }));
+    await waitFor(() => screen.getByText(/how are you riding today/i));
+    await user.click(screen.getByRole("button", { name: /i'm offering a ride/i }));
 
     expect(screen.queryByText(/driver readiness/i)).toBeNull();
     await waitFor(() => expect(screen.getByRole("heading", { name: /^your route$/i })).toBeTruthy());
@@ -409,11 +420,13 @@ describe("Post listing view", () => {
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
     });
+    sessionStorage.setItem("carpool_mode", "driver");
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/find your ride/i));
+    // Driver mode is pre-seeded before render, so Discover shows DriverHomeView
+    // ("Your route") rather than the rider-mode "Find your ride" heading.
+    await waitFor(() => screen.getByRole("heading", { name: /^your route$/i }));
 
-    await user.click(screen.getByRole("button", { name: /^driver$/i }));
     await user.click(screen.getByRole("button", { name: /^post$/i }));
     await waitFor(() => screen.getByText(/post a listing/i));
 
@@ -600,5 +613,48 @@ describe("Profile view", () => {
     // navigates the same place, so just take the first match.
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
     await waitFor(() => screen.getByText("Ada Rider"));
+  });
+
+  it("cancelling a mode switch leaves the mode unchanged", async () => {
+    const user = userEvent.setup();
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+    });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/find your ride/i));
+
+    await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
+    await waitFor(() => screen.getByText(/browsing as a passenger/i));
+
+    await user.click(screen.getByRole("button", { name: /switch to driver mode/i }));
+    await user.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+    // Still Passenger — cancelling never called onSetMode.
+    expect(screen.getByText(/browsing as a passenger/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /switch to driver mode/i })).toBeTruthy();
+  });
+
+  it("My Rides only shows the tab matching the current mode", async () => {
+    const user = userEvent.setup();
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [],
+    });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/find your ride/i));
+
+    await user.click(screen.getAllByRole("button", { name: /^my rides$/i })[0]);
+    await waitFor(() => screen.getByRole("heading", { name: /^my rides$/i }));
+
+    // Passenger mode (pre-seeded) — only the Ride Requests tab, never Driver Trips.
+    expect(screen.getByRole("button", { name: /ride requests/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /driver trips/i })).toBeNull();
   });
 });

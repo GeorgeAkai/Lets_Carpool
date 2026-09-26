@@ -23,10 +23,11 @@ import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
   ViewToggleFab, OfferRideFab,
 } from './discover-mobile'
+import { AdminView } from './admin'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools'
+type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -236,7 +237,7 @@ export function toInitials(name: string): string {
   return name.split(' ').map(w => w[0]?.toUpperCase() ?? '').join('').slice(0, 2)
 }
 
-function relativeTime(iso: string): string {
+export function relativeTime(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
   const h = Math.floor(diff / 3600000)
   if (h < 1) return 'just now'
@@ -1065,7 +1066,11 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null
   defaultType: ListingType; vehicle: api.ApiVehicle
 }) {
-  const [type, setType] = useState<ListingType>(defaultType)
+  // Locked to the app-wide mode (chosen at login / switched deliberately from
+  // Profile) rather than an independent in-form toggle — posting the "other"
+  // type while in Rider/Driver mode is exactly the kind of mixed-page
+  // behavior the mode gate exists to remove.
+  const type = defaultType
   const [from, setFrom] = useState<LocationValue | null>(null)
   const [to, setTo] = useState<LocationValue | null>(null)
   const [date, setDate] = useState('')
@@ -1122,12 +1127,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         <p className="text-muted-foreground mt-1">Share your trip or request a ride.</p>
       </div>
 
-      <div className="flex rounded-xl bg-muted p-1 gap-1 mb-8">
-        {(['driver', 'rider'] as ListingType[]).map(t => (
-          <button key={t} type="button" aria-pressed={type === t} onClick={() => setType(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${type === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-            {t === 'driver' ? "I'm offering a ride" : 'I need a ride'}
-          </button>
-        ))}
+      <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-muted text-sm font-medium text-foreground mb-8">
+        {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-5">
@@ -1231,21 +1232,24 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
 // ─── My Listings view ─────────────────────────────────────────────────────────
 
-function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast }: {
+function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast, mode }: {
   myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void>
   userCoords: { lat: number; lng: number } | null; currentUserId: string
   showToast: (msg: string, type: 'success' | 'error') => void
+  mode: ListingType
 }) {
   const isMobile = useIsMobile()
-  const [tab, setTab] = useState<'driver' | 'rider' | 'pools'>('driver')
+  // Only the listing type matching the current app-wide mode is shown — no
+  // mixed pages, matching Discover and Post. Pools is a standalone Sidebar
+  // entry on desktop already; only surface it as a second tab here on
+  // mobile, where the bottom nav was trimmed to 4 tabs.
+  const [tab, setTab] = useState<ListingType | 'pools'>(mode)
   const [cancelling, setCancelling] = useState<string | null>(null)
   const shown = myListings.filter(l => l.type === tab)
   const handleCancel = async (listing: MyListing) => {
     setCancelling(listing.id); try { await onCancel(listing) } finally { setCancelling(null) }
   }
-  // Pools is a standalone Sidebar entry on desktop already — only surface it
-  // as a third tab here on mobile, where the bottom nav was trimmed to 4 tabs.
-  const tabs = isMobile ? (['driver', 'rider', 'pools'] as const) : (['driver', 'rider'] as const)
+  const tabs = isMobile ? ([mode, 'pools'] as const) : ([mode] as const)
   return (
     <div className="space-y-6">
       <div>
@@ -1755,9 +1759,10 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
+  onOpenAdmin: () => void
 }) {
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
@@ -1768,6 +1773,8 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
   const [nationality, setNationality] = useState(profile.nationality ?? '')
   const [profileSaving, setProfileSaving] = useState(false)
   const [profileMsg, setProfileMsg] = useState<{ text: string; ok: boolean } | null>(null)
+  const [confirmingModeSwitch, setConfirmingModeSwitch] = useState(false)
+  const otherMode: ListingType = mode === 'rider' ? 'driver' : 'rider'
 
   const addInterest = () => {
     const tag = interestDraft.trim()
@@ -1853,15 +1860,29 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
       <div className="rounded-3xl bg-card border border-border p-6 space-y-3">
         <div>
           <h3 className="text-base font-semibold text-foreground">Riding as</h3>
-          <p className="text-sm text-muted-foreground mt-0.5">Switch between browsing as a passenger looking for a ride, or a driver offering one.</p>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
+          </p>
         </div>
-        <div className="flex rounded-xl bg-muted p-1 gap-1" role="group" aria-label="Passenger or Driver mode">
-          {(['rider', 'driver'] as ListingType[]).map(m => (
-            <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`flex-1 py-2.5 rounded-lg text-sm font-semibold transition-colors ${mode === m ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
-              {m === 'rider' ? 'Passenger' : 'Driver'}
-            </button>
-          ))}
-        </div>
+        {!confirmingModeSwitch ? (
+          <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="w-full py-2.5 rounded-xl border border-border text-sm font-semibold text-foreground hover:bg-muted transition-colors">
+            Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
+          </button>
+        ) : (
+          <div className="rounded-2xl bg-muted p-4 space-y-3">
+            <p className="text-sm text-foreground">
+              Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
+            </p>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                Confirm switch
+              </button>
+              <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
@@ -1943,6 +1964,22 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode }: {
           {currentUser.email_domain ? `Verified domain: ${currentUser.email_domain}` : 'Use a verified email domain to establish trust.'}
         </p>
       </div>
+
+      {api.isAdminUser(currentUser) && (
+        <button
+          type="button" onClick={onOpenAdmin}
+          className="w-full flex items-center justify-between gap-3 rounded-3xl bg-card border border-border p-5 text-left hover:border-primary/30 transition-colors"
+        >
+          <span className="flex items-center gap-3">
+            <span className="rounded-2xl bg-primary/10 p-2.5 text-primary"><Shield className="size-4" /></span>
+            <span>
+              <span className="block text-sm font-semibold text-foreground">Admin Panel</span>
+              <span className="block text-xs text-muted-foreground mt-0.5">Analytics, moderation, and audit logs</span>
+            </span>
+          </span>
+          <ChevronRight className="size-4 text-muted-foreground" />
+        </button>
+      )}
     </div>
   )
 }
@@ -2005,10 +2042,9 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode, onSetMode }: {
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
   setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
   onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
-  mode: ListingType; onSetMode: (m: ListingType) => void
 }) {
   return (
     <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
@@ -2016,14 +2052,6 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
         <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            {/* Relocated to Profile on mobile — this screen is too cramped for it, and it's a settings-style choice, not a per-screen action. */}
-            <div className="hidden xl:flex rounded-xl bg-sidebar-accent p-0.5 gap-0.5 mr-1" role="group" aria-label="Passenger or Driver mode">
-              {(['rider', 'driver'] as ListingType[]).map(m => (
-                <button key={m} type="button" aria-pressed={mode === m} onClick={() => onSetMode(m)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${mode === m ? 'bg-white text-sidebar shadow-sm' : 'text-sidebar-foreground/65 hover:text-sidebar-foreground'}`}>
-                  {m === 'rider' ? 'Passenger' : 'Driver'}
-                </button>
-              ))}
-            </div>
             <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
             </button>
@@ -2118,6 +2146,40 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
   )
 }
 
+// ─── Mode choice gate ───────────────────────────────────────────────────────
+// Shown once per session, before any Discover content — replaces the old
+// anytime toggle with an explicit up-front choice so Rider/Driver stop
+// feeling like two variants of one mixed page.
+
+function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
+  const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
+    { mode: 'rider', icon: <Users className="size-7" />, title: 'I need a ride', desc: 'Find drivers heading your way.' },
+    { mode: 'driver', icon: <Car className="size-7" />, title: "I'm offering a ride", desc: 'Publish your route and find riders.' },
+  ]
+  return (
+    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-8 px-6 py-12 text-center">
+      <div>
+        <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground">How are you riding today?</h1>
+        <p className="mt-2 text-muted-foreground max-w-sm mx-auto">Choose how you'll use Carpool this session — you can switch anytime from Profile.</p>
+      </div>
+      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+        {options.map(({ mode: m, icon, title, desc }) => (
+          <button
+            key={m}
+            type="button"
+            onClick={() => onChoose(m)}
+            className="flex-1 rounded-3xl border border-border bg-card p-6 text-left hover:border-primary/40 hover:shadow-lg transition-all"
+          >
+            <span className="inline-flex rounded-2xl bg-primary/10 p-3 text-primary">{icon}</span>
+            <h2 className="mt-4 text-lg font-semibold text-foreground">{title}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{desc}</p>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ─── Home (carpool app) ───────────────────────────────────────────────────────
 
 export function Home() {
@@ -2156,6 +2218,13 @@ export function Home() {
   // ── Passenger/Driver mode ── persists per session; switches primary actions/views
   const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
   useEffect(() => { sessionStorage.setItem('carpool_mode', mode) }, [mode])
+
+  // Gate Discover behind an explicit one-time choice instead of defaulting
+  // silently to Passenger — sessionStorage having no value yet means this is
+  // a fresh session that hasn't chosen. Once chosen, this stays closed for
+  // the rest of the session; switching later is a deliberate action in
+  // Profile, not this gate reappearing.
+  const [modeGateOpen, setModeGateOpen] = useState(() => sessionStorage.getItem('carpool_mode') === null)
 
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
@@ -2489,8 +2558,11 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools']
-  const guardedView: View = !currentUser && AUTH_VIEWS.includes(view) ? 'feed' : view
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin']
+  const guardedView: View =
+    !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
+    : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
+    : view
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
 
@@ -2523,6 +2595,13 @@ export function Home() {
     return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
+  // One-time choice before Discover — see the modeGateOpen comment above.
+  // Goes through handleSetMode so the existing "Driver with no vehicle on
+  // file routes to Profile" behavior applies to this first choice too.
+  if (modeGateOpen) {
+    return <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
@@ -2538,7 +2617,7 @@ export function Home() {
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
       <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
-        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} onSetMode={handleSetMode} />
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} />
       </div>
 
       <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
@@ -2587,10 +2666,11 @@ export function Home() {
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
-            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
+            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} />}
             {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} />}
+            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} />}
+            {guardedView === 'admin' && <AdminView showToast={showToast} />}
           </main>
         </div>
       </div>

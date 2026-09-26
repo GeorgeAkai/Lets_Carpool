@@ -80,6 +80,9 @@ class User:
     provider: str
     provider_subject: str
     created_at: datetime
+    status: str = "active"
+    suspended_at: datetime | None = None
+    suspended_reason: str | None = None
 
 
 @dataclass
@@ -208,6 +211,18 @@ class Report:
     reported_user_id: str
     reason: str
     created_at: datetime
+    status: str = "open"
+
+
+@dataclass
+class AuditLogEntry:
+    id: str
+    event_type: str
+    actor_user_id: str | None
+    actor_email: str | None
+    ip_address: str | None
+    detail: dict[str, Any]
+    created_at: datetime
 
 
 @dataclass
@@ -260,7 +275,24 @@ def _row_to_user(r: dict) -> User:
     return User(
         id=r["id"], email=r["email"], email_domain=r["email_domain"],
         provider=r["provider"], provider_subject=r["provider_subject"],
-        created_at=r["created_at"],
+        created_at=r["created_at"], status=r.get("status", "active"),
+        suspended_at=r.get("suspended_at"), suspended_reason=r.get("suspended_reason"),
+    )
+
+def _row_to_report(r: dict) -> Report:
+    return Report(
+        id=r["id"], reporter_id=r["reporter_id"], reported_user_id=r["reported_user_id"],
+        reason=r["reason"], created_at=r["created_at"], status=r.get("status", "open"),
+    )
+
+def _row_to_audit_log(r: dict) -> AuditLogEntry:
+    detail = r["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    return AuditLogEntry(
+        id=r["id"], event_type=r["event_type"], actor_user_id=r["actor_user_id"],
+        actor_email=r["actor_email"], ip_address=r["ip_address"],
+        detail=detail or {}, created_at=r["created_at"],
     )
 
 def _row_to_profile(r: dict) -> Profile:
@@ -393,7 +425,8 @@ class Store:
 
     # ─── Auth ─────────────────────────────────────────────────────────────────
 
-    def authenticate_email(self, email: str, display_name: str) -> User:
+    def authenticate_email(self, email: str, display_name: str) -> tuple[User, bool]:
+        """Returns (user, is_new_signup) — the latter drives the USER_REGISTERED audit event."""
         normalized_email = email.strip().lower()
         normalized_name = display_name.strip()
         if not normalized_name:
@@ -406,7 +439,7 @@ class Store:
             cur.execute("SELECT * FROM users WHERE email = %s", (normalized_email,))
             row = cur.fetchone()
             if row:
-                return _row_to_user(row)
+                return _row_to_user(row), False
 
             user_id = new_id("usr")
             cur.execute(
@@ -421,7 +454,7 @@ class Store:
                 (user_id, normalized_name),
             )
             cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            return _row_to_user(cur.fetchone())
+            return _row_to_user(cur.fetchone()), True
 
     def user_for_id(self, user_id: str) -> User:
         with get_conn() as conn:
@@ -730,6 +763,7 @@ class Store:
                    {joins}
                    WHERE dt.status IN ('open', 'matched')
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
@@ -755,6 +789,7 @@ class Store:
                    {joins}
                    WHERE rr.status IN ('open', 'matched')
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
@@ -1384,6 +1419,229 @@ class Store:
                 (user_a, user_b, user_b, user_a),
             )
             return cur.fetchone() is not None
+
+    # ─── Admin ────────────────────────────────────────────────────────────────
+
+    def _user_filter_clause(self, search: str | None, status: str | None) -> tuple[str, list[Any]]:
+        conditions = []
+        params: list[Any] = []
+        if search:
+            conditions.append("(u.email ILIKE %s OR p.display_name ILIKE %s)")
+            pattern = f"%{search}%"
+            params.extend([pattern, pattern])
+        if status:
+            conditions.append("u.status = %s")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        return where, params
+
+    def list_users(self, search: str | None = None, status: str | None = None,
+                    limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        where, params = self._user_filter_clause(search, status)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                f"""SELECT u.id, u.email, u.email_domain, u.created_at, u.status,
+                           u.suspended_at, u.suspended_reason,
+                           p.display_name, p.photo_url,
+                           EXISTS(SELECT 1 FROM driver_trips dt WHERE dt.driver_id = u.id) AS is_driver,
+                           EXISTS(SELECT 1 FROM ride_requests rr WHERE rr.rider_id = u.id) AS is_rider,
+                           (SELECT COUNT(*) FROM reports r WHERE r.reported_user_id = u.id AND r.status = 'open') AS open_report_count
+                    FROM users u
+                    LEFT JOIN profiles p ON p.user_id = u.id
+                    {where}
+                    ORDER BY u.created_at DESC
+                    LIMIT %s OFFSET %s""",
+                (*params, limit, offset),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_users(self, search: str | None = None, status: str | None = None) -> int:
+        where, params = self._user_filter_clause(search, status)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                f"SELECT COUNT(*) AS c FROM users u LEFT JOIN profiles p ON p.user_id = u.id {where}",
+                params,
+            )
+            return cur.fetchone()["c"]
+
+    def suspend_user(self, admin_id: str, target_user_id: str, reason: str | None = None) -> User:
+        if admin_id == target_user_id:
+            raise DomainError("Admins cannot suspend their own account")
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE users SET status = 'suspended', suspended_at = %s, suspended_reason = %s WHERE id = %s",
+                (now_utc(), reason, target_user_id),
+            )
+            if cur.rowcount == 0:
+                raise DomainError("User not found", 404)
+            cur.execute("SELECT * FROM users WHERE id = %s", (target_user_id,))
+            return _row_to_user(cur.fetchone())
+
+    def unsuspend_user(self, target_user_id: str) -> User:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE users SET status = 'active', suspended_at = NULL, suspended_reason = NULL WHERE id = %s",
+                (target_user_id,),
+            )
+            if cur.rowcount == 0:
+                raise DomainError("User not found", 404)
+            cur.execute("SELECT * FROM users WHERE id = %s", (target_user_id,))
+            return _row_to_user(cur.fetchone())
+
+    def get_admin_stats(self) -> dict[str, Any]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+
+            def count(sql: str, params: tuple[Any, ...] = ()) -> int:
+                cur.execute(sql, params)
+                return cur.fetchone()["c"]
+
+            return {
+                "total_users": count("SELECT COUNT(*) AS c FROM users"),
+                "new_users_7d": count("SELECT COUNT(*) AS c FROM users WHERE created_at >= %s", (now_utc() - timedelta(days=7),)),
+                "suspended_users": count("SELECT COUNT(*) AS c FROM users WHERE status = 'suspended'"),
+                "total_drivers": count("SELECT COUNT(DISTINCT driver_id) AS c FROM driver_trips"),
+                "total_riders": count("SELECT COUNT(DISTINCT rider_id) AS c FROM ride_requests"),
+                "active_drivers": count("SELECT COUNT(DISTINCT driver_id) AS c FROM driver_trips WHERE status IN ('open', 'matched')"),
+                "active_riders": count("SELECT COUNT(DISTINCT rider_id) AS c FROM ride_requests WHERE status IN ('open', 'matched')"),
+                "completed_rides": count("SELECT COUNT(*) AS c FROM connections WHERE status = 'completed'"),
+                "open_reports": count("SELECT COUNT(*) AS c FROM reports WHERE status = 'open'"),
+            }
+
+    def list_reports(self, status: str | None = None, limit: int = 100) -> list[Report]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            if status:
+                cur.execute("SELECT * FROM reports WHERE status = %s ORDER BY created_at DESC LIMIT %s", (status, limit))
+            else:
+                cur.execute("SELECT * FROM reports ORDER BY created_at DESC LIMIT %s", (limit,))
+            return [_row_to_report(r) for r in cur.fetchall()]
+
+    def _set_report_status(self, report_id: str, status: str) -> Report:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE reports SET status = %s WHERE id = %s", (status, report_id))
+            if cur.rowcount == 0:
+                raise DomainError("Report not found", 404)
+            cur.execute("SELECT * FROM reports WHERE id = %s", (report_id,))
+            return _row_to_report(cur.fetchone())
+
+    def dismiss_report(self, report_id: str) -> Report:
+        return self._set_report_status(report_id, "dismissed")
+
+    def mark_report_actioned(self, report_id: str) -> Report:
+        return self._set_report_status(report_id, "actioned")
+
+    def list_active_driver_trips(self, limit: int = 200) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT dt.id, dt.driver_id, dt.target_date, dt.seats_available, dt.seats_reserved,
+                          dt.status, dt.created_at, p.display_name AS driver_name,
+                          pu.label AS pickup_label, du.label AS destination_label
+                   FROM driver_trips dt
+                   LEFT JOIN profiles p ON p.user_id = dt.driver_id
+                   LEFT JOIN locations pu ON pu.id = dt.pickup_location_id
+                   LEFT JOIN locations du ON du.id = dt.destination_location_id
+                   WHERE dt.status IN ('open', 'matched')
+                   ORDER BY dt.created_at DESC LIMIT %s""",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def list_active_ride_requests(self, limit: int = 200) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT rr.id, rr.rider_id, rr.target_date, rr.passenger_count,
+                          rr.status, rr.created_at, p.display_name AS rider_name,
+                          pu.label AS pickup_label, du.label AS destination_label
+                   FROM ride_requests rr
+                   LEFT JOIN profiles p ON p.user_id = rr.rider_id
+                   LEFT JOIN locations pu ON pu.id = rr.pickup_location_id
+                   LEFT JOIN locations du ON du.id = rr.destination_location_id
+                   WHERE rr.status IN ('open', 'matched')
+                   ORDER BY rr.created_at DESC LIMIT %s""",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def admin_remove_ride_request(self, request_id: str) -> RideRequest:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE ride_requests SET status = 'cancelled' WHERE id = %s", (request_id,))
+            if cur.rowcount == 0:
+                raise DomainError("Ride request not found", 404)
+            cur.execute("SELECT * FROM ride_requests WHERE id = %s", (request_id,))
+            return _row_to_ride_request(cur.fetchone())
+
+    def admin_remove_driver_trip(self, trip_id: str) -> DriverTrip:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE driver_trips SET status = 'cancelled' WHERE id = %s", (trip_id,))
+            if cur.rowcount == 0:
+                raise DomainError("Driver trip not found", 404)
+            cur.execute("SELECT * FROM driver_trips WHERE id = %s", (trip_id,))
+            return _row_to_driver_trip(cur.fetchone())
+
+    def popular_destinations(self, limit: int = 10) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT l.label, COUNT(*) AS trip_count
+                   FROM (
+                       SELECT destination_location_id FROM ride_requests
+                       UNION ALL
+                       SELECT destination_location_id FROM driver_trips
+                   ) dest
+                   JOIN locations l ON l.id = dest.destination_location_id
+                   GROUP BY l.label
+                   ORDER BY trip_count DESC
+                   LIMIT %s""",
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def log_audit(self, event_type: str, actor_user_id: str | None, actor_email: str | None,
+                   ip_address: str | None, detail: dict[str, Any] | None = None) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO audit_logs (id, event_type, actor_user_id, actor_email, ip_address, detail, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (new_id("log"), event_type, actor_user_id, actor_email, ip_address,
+                 json.dumps(detail or {}), now_utc()),
+            )
+
+    def list_audit_logs(self, event_type: str | None = None, actor_email: str | None = None,
+                         date_from: datetime | None = None, date_to: datetime | None = None,
+                         limit: int = 200) -> list[AuditLogEntry]:
+        conditions = []
+        params: list[Any] = []
+        if event_type:
+            conditions.append("event_type = %s")
+            params.append(event_type)
+        if actor_email:
+            conditions.append("actor_email ILIKE %s")
+            params.append(f"%{actor_email}%")
+        if date_from:
+            conditions.append("created_at >= %s")
+            params.append(date_from)
+        if date_to:
+            conditions.append("created_at <= %s")
+            params.append(date_to)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                f"SELECT * FROM audit_logs {where} ORDER BY created_at DESC LIMIT %s",
+                (*params, limit),
+            )
+            return [_row_to_audit_log(r) for r in cur.fetchall()]
 
     # ─── Views ────────────────────────────────────────────────────────────────
 
