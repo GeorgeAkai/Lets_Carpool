@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, is_dataclass
-import logging
 from datetime import date, datetime, time
-from typing import Any, Annotated, Literal
+from typing import Any, Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +14,6 @@ from pydantic_settings import BaseSettings
 from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
 from backend.app.domain import DomainError, Store, User
 
-logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     database_url: str = "postgresql://carpool:carpool@localhost:5432/carpool"
@@ -46,9 +44,13 @@ class Settings(BaseSettings):
     # or the manual expire endpoints below.
     cron_secret: str | None = None
 
-    # The single account allowed into /admin. Compared case-insensitively
-    # against the email on the verified Neon Auth token that created the user.
-    superadmin_email: str = "ageorge@akihlee.com"
+    # Space-separated allowlist of emails granted access to /admin/* endpoints
+    # (see AdminUser below), matched case-insensitively.
+    admin_emails: str = "ageorge@akihlee.com"
+
+    @property
+    def admin_email_set(self) -> set[str]:
+        return {e.strip().lower() for e in self.admin_emails.split() if e.strip()}
 
     @property
     def neon_auth_jwks_url(self) -> str | None:
@@ -175,6 +177,14 @@ class DriverLocationUpdate(BaseModel):
     speed_kmh: float | None = None
 
 
+class SuspendUserRequest(BaseModel):
+    reason: str | None = None
+
+
+class WarnUserRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
 # ─── WebSocket connection manager ─────────────────────────────────────────────
 
 class ConnectionManager:
@@ -218,19 +228,6 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     app.state.settings = s
     app.state.ws_manager = ConnectionManager()
 
-    def audit(request: Request | None, event_type: str, user: User | None = None, details: str = "") -> None:
-        # Audit logging must never be the reason a user-facing request fails.
-        try:
-            app.state.store.log_event(
-                event_type,
-                actor_id=user.id if user else None,
-                actor_email=user.email if user else None,
-                ip_address=client_ip(request) if request else None,
-                details=details,
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to write audit log entry %s", event_type)
-
     @app.exception_handler(DomainError)
     async def handle_domain_error(_: Any, exc: DomainError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
@@ -254,34 +251,41 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/auth/login")
     def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         settings = app.state.settings
+        ip = client_ip(request)
         if not settings.neon_auth_jwks_url:
             raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
-        claims = verify_neon_auth_token(
-            payload.neon_token,
-            jwks_url=settings.neon_auth_jwks_url,
-            issuer=settings.neon_auth_issuer,
-            audience=settings.neon_auth_audience,
-        )
+        try:
+            claims = verify_neon_auth_token(
+                payload.neon_token,
+                jwks_url=settings.neon_auth_jwks_url,
+                issuer=settings.neon_auth_issuer,
+                audience=settings.neon_auth_audience,
+            )
+        except DomainError as exc:
+            app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": str(exc)})
+            raise
         email = claims.get("email")
         if not isinstance(email, str) or not email:
+            app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": "missing email claim"})
             raise DomainError("Neon Auth token did not include an email claim", 401)
         name = claims.get("name") or email.split("@")[0]
-        user = app.state.store.authenticate_email(email, str(name))
-        if user.suspended:
-            audit(request, "auth.login_blocked", user, "Suspended account attempted to sign in")
-            raise DomainError("This account has been suspended", 403)
-        audit(request, "auth.login", user)
+        user, is_new = app.state.store.authenticate_email(email, str(name))
+        if user.status == "suspended":
+            app.state.store.log_audit("LOGIN_FAILED", user.id, user.email, ip, {"reason": "account suspended"})
+            raise DomainError("Your account has been suspended", 403)
+        if is_new:
+            app.state.store.log_audit("USER_REGISTERED", user.id, user.email, ip)
         access_token = create_access_token(
             user_id=user.id, email=user.email,
             secret=settings.jwt_secret, expires_minutes=settings.jwt_expires_minutes,
         )
-        return {"access_token": access_token, "token_type": "bearer", "user": serialize_me(app, user)}
+        return {"access_token": access_token, "token_type": "bearer", "user": serialize_user(app.state.store, user)}
 
     # ── User / Profile ────────────────────────────────────────────────────────
 
     @app.get("/me")
     def get_me(user: CurrentUser) -> dict[str, Any]:
-        return serialize_me(app, user)
+        return serialize_user(app.state.store, user)
 
     @app.patch("/me/profile")
     def update_profile(payload: ProfileUpdate, user: CurrentUser) -> dict[str, Any]:
@@ -351,7 +355,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/ride-requests")
     def create_ride_request(payload: RideRequestCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
         request = app.state.store.create_ride_request(user.id, payload.model_dump())
-        audit(http_request, "listing.ride_request_created", user, request.id)
+        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "ride_request", "id": request.id})
         return serialize_ride_request(app.state.store, request, exact=True)
 
     @app.post("/ride-requests/expire")
@@ -360,9 +364,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return {"status": "ok"}
 
     @app.post("/ride-requests/{request_id}/cancel")
-    def cancel_ride_request(request_id: str, user: CurrentUser, http_request: Request) -> dict[str, Any]:
+    def cancel_ride_request(request_id: str, user: CurrentUser) -> dict[str, Any]:
         request = app.state.store.cancel_ride_request(user.id, request_id)
-        audit(http_request, "listing.cancelled", user, request_id)
         return serialize_ride_request(app.state.store, request, exact=True)
 
     @app.get("/ride-requests/search")
@@ -378,9 +381,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Driver trips ──────────────────────────────────────────────────────────
 
     @app.post("/driver-trips")
-    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, request: Request) -> dict[str, Any]:
+    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
         trip = app.state.store.create_driver_trip(user.id, payload.model_dump())
-        audit(request, "listing.driver_trip_created", user, trip.id)
+        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": trip.id})
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.post("/driver-trips/expire")
@@ -389,9 +392,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return {"status": "ok"}
 
     @app.post("/driver-trips/{trip_id}/cancel")
-    def cancel_driver_trip(trip_id: str, user: CurrentUser, request: Request) -> dict[str, Any]:
+    def cancel_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
         trip = app.state.store.cancel_driver_trip(user.id, trip_id)
-        audit(request, "listing.cancelled", user, trip_id)
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.get("/driver-trips/search")
@@ -407,9 +409,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Connections ───────────────────────────────────────────────────────────
 
     @app.post("/connections")
-    def create_connection(payload: ConnectionCreate, user: CurrentUser, request: Request) -> dict[str, Any]:
+    def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
         connection = app.state.store.create_connection(user.id, payload.model_dump())
-        audit(request, "connection.created", user, connection.id)
         return serialize_connection(app.state.store, connection)
 
     @app.post("/connections/expire")
@@ -432,9 +433,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return [serialize_connection(app.state.store, c) for c in connections]
 
     @app.post("/connections/{connection_id}/transition")
-    async def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser, request: Request) -> dict[str, Any]:
+    async def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser) -> dict[str, Any]:
         connection = app.state.store.transition_connection(user.id, connection_id, payload.action)
-        audit(request, f"connection.{payload.action}", user, f"{connection_id} → {connection.status}")
         rr = app.state.store.get_ride_request(connection.ride_request_id)
         trip = app.state.store.get_driver_trip(connection.driver_trip_id)
         await app.state.ws_manager.broadcast([rr.rider_id, trip.driver_id], {
@@ -551,69 +551,97 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── User actions ──────────────────────────────────────────────────────────
 
     @app.post("/users/{target_user_id}/block")
-    def block_user(target_user_id: str, user: CurrentUser, request: Request) -> dict[str, str]:
+    def block_user(target_user_id: str, user: CurrentUser) -> dict[str, str]:
         app.state.store.block_user(user.id, target_user_id)
-        audit(request, "user.blocked", user, f"Blocked {target_user_id}")
         return {"status": "blocked"}
 
     @app.post("/users/{target_user_id}/report")
-    def report_user(target_user_id: str, payload: ReportCreate, user: CurrentUser, request: Request) -> dict[str, Any]:
+    def report_user(target_user_id: str, payload: ReportCreate, user: CurrentUser) -> dict[str, Any]:
         report = app.state.store.report_user(user.id, target_user_id, payload.reason)
-        audit(request, "user.reported", user, f"Reported {target_user_id}: {payload.reason}")
         return serialize(report)
 
-    # ── Admin (superadmin only) ───────────────────────────────────────────────
+    # ── Admin ─────────────────────────────────────────────────────────────────
 
     @app.get("/admin/stats")
-    def admin_stats(_admin: AdminUser) -> dict[str, int]:
-        return app.state.store.admin_stats()
+    def admin_stats(_admin: AdminUser) -> dict[str, Any]:
+        return app.state.store.get_admin_stats()
 
     @app.get("/admin/users")
-    def admin_users(_admin: AdminUser, q: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-        return serialize(app.state.store.admin_list_users(q, min(max(limit, 1), 500)))
+    def admin_list_users(
+        _admin: AdminUser, search: str | None = None, status: str | None = None,
+        limit: int = 50, offset: int = 0,
+    ) -> dict[str, Any]:
+        return {
+            "users": [serialize(u) for u in app.state.store.list_users(search, status, limit, offset)],
+            "total": app.state.store.count_users(search, status),
+        }
 
-    @app.post("/admin/users/{target_user_id}/block")
-    def admin_block_user(target_user_id: str, admin: AdminUser, request: Request) -> dict[str, Any]:
-        if target_user_id == admin.id:
-            raise DomainError("You cannot block your own admin account")
-        target = app.state.store.set_user_suspended(target_user_id, True)
-        audit(request, "admin.user_blocked", admin, f"Blocked {target.email}")
-        return {"id": target.id, "suspended": target.suspended}
+    @app.post("/admin/users/{target_user_id}/suspend")
+    def admin_suspend_user(target_user_id: str, payload: SuspendUserRequest, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        user = app.state.store.suspend_user(admin.id, target_user_id, payload.reason)
+        app.state.store.log_audit("USER_BLOCKED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id, "reason": payload.reason})
+        return serialize(user)
 
-    @app.post("/admin/users/{target_user_id}/unblock")
-    def admin_unblock_user(target_user_id: str, admin: AdminUser, request: Request) -> dict[str, Any]:
-        target = app.state.store.set_user_suspended(target_user_id, False)
-        audit(request, "admin.user_unblocked", admin, f"Unblocked {target.email}")
-        return {"id": target.id, "suspended": target.suspended}
+    @app.post("/admin/users/{target_user_id}/unsuspend")
+    def admin_unsuspend_user(target_user_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        user = app.state.store.unsuspend_user(target_user_id)
+        app.state.store.log_audit("USER_UNBLOCKED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id})
+        return serialize(user)
+
+    @app.post("/admin/users/{target_user_id}/warn")
+    def admin_warn_user(target_user_id: str, payload: WarnUserRequest, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        notification = app.state.store.notify(target_user_id, "admin_warning", "Warning from Let's Carpool", payload.message)
+        app.state.store.log_audit("WARNING_SENT", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id, "message": payload.message})
+        return serialize(notification)
 
     @app.get("/admin/reports")
-    def admin_reports(_admin: AdminUser, status: Literal["open", "dismissed", "actioned", "all"] = "open") -> list[dict[str, Any]]:
-        return serialize(app.state.store.admin_list_reports(None if status == "all" else status))
+    def admin_list_reports(_admin: AdminUser, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        return [serialize_report(app.state.store, r) for r in app.state.store.list_reports(status, limit)]
 
     @app.post("/admin/reports/{report_id}/dismiss")
-    def admin_dismiss_report(report_id: str, admin: AdminUser, request: Request) -> dict[str, Any]:
-        report = app.state.store.resolve_report(report_id, "dismissed")
-        audit(request, "admin.report_dismissed", admin, f"Dismissed report {report_id}")
-        return serialize(report)
+    def admin_dismiss_report(report_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        report = app.state.store.dismiss_report(report_id)
+        app.state.store.log_audit("REPORT_DISMISSED", admin.id, admin.email, client_ip(http_request), {"report_id": report_id})
+        return serialize_report(app.state.store, report)
 
-    @app.post("/admin/reports/{report_id}/suspend")
-    def admin_suspend_reported(report_id: str, admin: AdminUser, request: Request) -> dict[str, Any]:
-        report = app.state.store.resolve_report(report_id, "actioned")
-        if report.reported_user_id == admin.id:
-            raise DomainError("You cannot suspend your own admin account")
-        target = app.state.store.set_user_suspended(report.reported_user_id, True)
-        audit(request, "admin.user_suspended", admin, f"Suspended {target.email} (report {report_id})")
-        return serialize(report)
+    @app.post("/admin/reports/{report_id}/block")
+    def admin_block_from_report(report_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        report = app.state.store.mark_report_actioned(report_id)
+        user = app.state.store.suspend_user(admin.id, report.reported_user_id, f"Reported: {report.reason}")
+        ip = client_ip(http_request)
+        app.state.store.log_audit("REPORT_ACTIONED", admin.id, admin.email, ip, {"report_id": report_id})
+        app.state.store.log_audit("USER_BLOCKED", admin.id, admin.email, ip, {"target_user_id": user.id, "reason": f"Reported: {report.reason}"})
+        return serialize(user)
 
-    @app.get("/admin/destinations")
-    def admin_destinations(_admin: AdminUser, limit: int = 10) -> list[dict[str, Any]]:
-        return app.state.store.admin_top_destinations(min(max(limit, 1), 50))
+    @app.get("/admin/destinations/popular")
+    def admin_popular_destinations(_admin: AdminUser, limit: int = 10) -> list[dict[str, Any]]:
+        return app.state.store.popular_destinations(limit)
+
+    @app.get("/admin/routes/active")
+    def admin_active_routes(_admin: AdminUser, limit: int = 200) -> dict[str, Any]:
+        return {
+            "driver_trips": [serialize(t) for t in app.state.store.list_active_driver_trips(limit)],
+            "ride_requests": [serialize(r) for r in app.state.store.list_active_ride_requests(limit)],
+        }
+
+    @app.post("/admin/routes/ride-requests/{request_id}/remove")
+    def admin_remove_ride_request(request_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        rr = app.state.store.admin_remove_ride_request(request_id)
+        app.state.store.log_audit("LISTING_REMOVED", admin.id, admin.email, client_ip(http_request), {"kind": "ride_request", "id": request_id})
+        return serialize(rr)
+
+    @app.post("/admin/routes/driver-trips/{trip_id}/remove")
+    def admin_remove_driver_trip(trip_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        trip = app.state.store.admin_remove_driver_trip(trip_id)
+        app.state.store.log_audit("LISTING_REMOVED", admin.id, admin.email, client_ip(http_request), {"kind": "driver_trip", "id": trip_id})
+        return serialize(trip)
 
     @app.get("/admin/audit-logs")
     def admin_audit_logs(
-        _admin: AdminUser, event_type: str | None = None, q: str | None = None, limit: int = 200,
+        _admin: AdminUser, event_type: str | None = None, actor_email: str | None = None,
+        date_from: datetime | None = None, date_to: datetime | None = None, limit: int = 200,
     ) -> list[dict[str, Any]]:
-        return serialize(app.state.store.admin_audit_logs(event_type, q, min(max(limit, 1), 500)))
+        return [serialize(l) for l in app.state.store.list_audit_logs(event_type, actor_email, date_from, date_to, limit)]
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
@@ -676,8 +704,10 @@ def current_user(request: Request, authorization: Annotated[str | None, Header()
         user = request.app.state.store.user_for_id(user_id)
     except DomainError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    if user.suspended:
-        raise HTTPException(status_code=403, detail="This account has been suspended")
+    # Suspended accounts are locked out of every authenticated route, not just
+    # blocked from publishing — a still-valid JWT shouldn't outlive a ban.
+    if user.status == "suspended":
+        raise HTTPException(status_code=403, detail="Your account has been suspended")
     return user
 
 
@@ -690,24 +720,16 @@ def optional_user(request: Request, authorization: Annotated[str | None, Header(
 CurrentUser = Annotated[User, Depends(current_user)]
 
 
-def is_superadmin(settings: Settings, user: User) -> bool:
-    return bool(settings.superadmin_email) and user.email.lower() == settings.superadmin_email.strip().lower()
-
-
-def require_admin(request: Request, user: CurrentUser) -> User:
-    if not is_superadmin(request.app.state.settings, user):
-        raise HTTPException(status_code=403, detail="Forbidden")
+def admin_user(user: CurrentUser, request: Request) -> User:
+    if user.email.strip().lower() not in request.app.state.settings.admin_email_set:
+        raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
 
-AdminUser = Annotated[User, Depends(require_admin)]
+AdminUser = Annotated[User, Depends(admin_user)]
 
 
 def client_ip(request: Request) -> str | None:
-    # Behind Vercel's proxy the real client is the first X-Forwarded-For hop.
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip() or None
     return request.client.host if request.client else None
 
 
@@ -733,12 +755,22 @@ def serialize_user(store: Store, user: User) -> dict[str, Any]:
     return {**serialize(user), "profile": serialize(profile), "vehicle": serialize(vehicle)}
 
 
-def serialize_me(app: FastAPI, user: User) -> dict[str, Any]:
-    return {**serialize_user(app.state.store, user), "is_admin": is_superadmin(app.state.settings, user)}
-
-
 def serialize_location(store: Store, location_id: str, exact: bool) -> dict[str, Any]:
     return store.location_view(location_id, exact=exact)
+
+
+def serialize_report(store: Store, report: Any) -> dict[str, Any]:
+    data = serialize(report)
+    reporter = store.get_profile(report.reporter_id)
+    reported = store.get_profile(report.reported_user_id)
+    reporter_user = store.user_for_id(report.reporter_id)
+    reported_user = store.user_for_id(report.reported_user_id)
+    data["reporter_name"] = reporter.display_name if reporter else None
+    data["reporter_email"] = reporter_user.email
+    data["reported_name"] = reported.display_name if reported else None
+    data["reported_email"] = reported_user.email
+    data["reported_status"] = reported_user.status
+    return data
 
 
 def serialize_ride_request(store: Store, request: Any, exact: bool) -> dict[str, Any]:

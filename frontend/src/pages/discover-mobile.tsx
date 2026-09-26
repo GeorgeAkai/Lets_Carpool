@@ -217,8 +217,9 @@ export function SectionHeader({ label, count, noun }: { label: string; count: nu
   )
 }
 
-export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn }: {
+export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected = false }: {
   listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; onEditOwn: () => void
+  alreadyConnected?: boolean
 }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -270,14 +271,20 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
       </div>
 
       {!isOwn && (
-        <button
-          onClick={() => onConnect(listing)}
-          className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
-        >
-          {/* Driver listings are seats you can ask for; passenger listings are
-              people you can pick up. */}
-          {isDriver ? 'Request Ride' : 'Offer Ride'}
-        </button>
+        alreadyConnected ? (
+          <div className="mt-1 w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
+            <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
+          </div>
+        ) : (
+          <button
+            onClick={() => onConnect(listing)}
+            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
+          >
+            {/* Driver listings are seats you can ask for; passenger listings are
+                people you can pick up. */}
+            {isDriver ? 'Request Ride' : 'Offer Ride'}
+          </button>
+        )
       )}
     </div>
   )

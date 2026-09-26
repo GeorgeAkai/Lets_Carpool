@@ -1,83 +1,143 @@
 from __future__ import annotations
 
-from backend.app.domain import format_place
-from backend.tests.test_mvp_api import auth, client, make_request_and_trip
+from backend.tests.test_mvp_api import auth, client, location
 
-SUPERADMIN = "ageorge@akihlee.com"
-
-
-def test_format_place_collapses_repeated_geocoder_parts() -> None:
-    assert format_place("Chico, Chico, California") == "Chico, CA"
-    assert format_place("Chico State, Chico, California, 95929, United States") == "Chico State, Chico, CA"
-    assert format_place(
-        "Sacramento International Airport, Sacramento, Sacramento County, California, United States"
-    ) == "Sacramento International Airport, Sacramento, CA"
+ADMIN_EMAIL = "ageorge@akihlee.com"
 
 
-def test_admin_routes_are_restricted_to_the_superadmin() -> None:
-    api = client()
-    user, headers = auth(api, "someone@example.com", "Some One")
-
-    assert user["is_admin"] is False
-    for path in ["/admin/stats", "/admin/users", "/admin/reports", "/admin/destinations", "/admin/audit-logs"]:
-        assert api.get(path, headers=headers).status_code == 403
-    assert api.get("/admin/stats").status_code == 401
+def test_non_admin_cannot_reach_admin_routes() -> None:
+    c = client()
+    _, headers = auth(c, "rando@example.com", "Rando")
+    assert c.get("/admin/stats", headers=headers).status_code == 403
+    assert c.get("/admin/users", headers=headers).status_code == 403
 
 
-def test_superadmin_sees_kpis_destinations_and_audit_logs() -> None:
-    api = client()
-    make_request_and_trip(api)
-    admin, admin_headers = auth(api, SUPERADMIN.upper(), "Admin")
+def test_admin_stats_and_user_list() -> None:
+    c = client()
+    _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    _, rider_headers = auth(c, "rider@example.com", "Rider")
 
-    assert admin["is_admin"] is True
-    stats = api.get("/admin/stats", headers=admin_headers).json()
-    assert stats["total_users"] == 3
-    assert stats["drivers"] == 1
-    assert stats["passengers"] == 1
-    assert stats["active_drivers"] == 1
-    assert stats["active_riders"] == 1
+    stats = c.get("/admin/stats", headers=admin_headers).json()
+    assert stats["total_users"] == 2
 
-    destinations = api.get("/admin/destinations", headers=admin_headers).json()
-    assert destinations[0] == {"label": "SFO Terminal 2, San Francisco, CA", "trips": 1, "requests": 1, "total": 2}
-
-    logs = api.get("/admin/audit-logs", headers=admin_headers, params={"event_type": "listing."}).json()
-    assert {log["event_type"] for log in logs} == {"listing.ride_request_created", "listing.driver_trip_created"}
-    assert all(log["ip_address"] for log in logs)
+    users = c.get("/admin/users", headers=admin_headers).json()
+    assert users["total"] == 2
+    emails = {u["email"] for u in users["users"]}
+    assert {"rider@example.com", ADMIN_EMAIL} == emails
 
 
-def test_superadmin_can_block_and_unblock_users() -> None:
-    api = client()
-    target, target_headers = auth(api, "target@example.com", "Tar Get")
-    admin, admin_headers = auth(api, SUPERADMIN, "Admin")
+def test_suspend_locks_out_user_and_hides_listings() -> None:
+    c = client()
+    _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    rider, rider_headers = auth(c, "rider2@example.com", "Rider Two")
 
-    users = api.get("/admin/users", headers=admin_headers, params={"q": "tar"}).json()
-    assert [u["email"] for u in users] == ["target@example.com"]
+    pickup = location(c, rider_headers, "Pickup", 37.0, -122.0)
+    dest = location(c, rider_headers, "Dest", 37.5, -122.5)
+    resp = c.post(
+        "/ride-requests", headers=rider_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": dest["id"],
+            "target_date": "2099-01-01", "flexibility": "exact", "passenger_count": 1,
+        },
+    )
+    assert resp.status_code == 200
 
-    assert api.post(f"/admin/users/{target['id']}/block", headers=admin_headers).json()["suspended"] is True
-    assert api.get("/me", headers=target_headers).status_code == 403
-    assert api.get("/admin/stats", headers=admin_headers).json()["blocked_users"] == 1
+    other_user_headers = auth(c, "searcher@example.com", "Searcher")[1]
+    visible = c.get(
+        "/ride-requests/search",
+        headers=other_user_headers,
+        params={"destination_latitude": 37.5, "destination_longitude": -122.5, "destination_radius_meters": 5000},
+    ).json()
+    assert any(r["rider_id"] == rider["id"] for r in visible)
 
-    assert api.post(f"/admin/users/{target['id']}/unblock", headers=admin_headers).json()["suspended"] is False
-    assert api.get("/me", headers=target_headers).status_code == 200
+    suspend_resp = c.post(f"/admin/users/{rider['id']}/suspend", headers=admin_headers, json={"reason": "test"})
+    assert suspend_resp.status_code == 200
+    assert suspend_resp.json()["status"] == "suspended"
 
-    assert api.post(f"/admin/users/{admin['id']}/block", headers=admin_headers).status_code == 400
+    # Locked out entirely, even with a still-valid JWT.
+    assert c.get("/me", headers=rider_headers).status_code == 403
+
+    visible_after = c.get(
+        "/ride-requests/search",
+        headers=other_user_headers,
+        params={"destination_latitude": 37.5, "destination_longitude": -122.5, "destination_radius_meters": 5000},
+    ).json()
+    assert not any(r["rider_id"] == rider["id"] for r in visible_after)
+
+    unsuspend_resp = c.post(f"/admin/users/{rider['id']}/unsuspend", headers=admin_headers)
+    assert unsuspend_resp.status_code == 200
+    assert unsuspend_resp.json()["status"] == "active"
+    assert c.get("/me", headers=rider_headers).status_code == 200
 
 
-def test_superadmin_reviews_the_reported_users_queue() -> None:
-    api = client()
-    reporter, reporter_headers = auth(api, "reporter@example.com", "Rep Orter")
-    reported, reported_headers = auth(api, "reported@example.com", "Rep Orted")
-    _, admin_headers = auth(api, SUPERADMIN, "Admin")
-    first = api.post(f"/users/{reported['id']}/report", headers=reporter_headers, json={"reason": "No-show"}).json()
-    second = api.post(f"/users/{reported['id']}/report", headers=reporter_headers, json={"reason": "Rude"}).json()
+def test_admin_cannot_suspend_self() -> None:
+    c = client()
+    admin, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    resp = c.post(f"/admin/users/{admin['id']}/suspend", headers=admin_headers, json={})
+    assert resp.status_code == 400
 
-    queue = api.get("/admin/reports", headers=admin_headers).json()
-    assert {r["id"] for r in queue} == {first["id"], second["id"]}
-    assert queue[0]["reported_email"] == "reported@example.com"
 
-    assert api.post(f"/admin/reports/{first['id']}/dismiss", headers=admin_headers).json()["status"] == "dismissed"
-    assert api.post(f"/admin/reports/{second['id']}/suspend", headers=admin_headers).json()["status"] == "actioned"
+def test_reports_queue_dismiss_and_block() -> None:
+    c = client()
+    _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    reporter, reporter_headers = auth(c, "reporter@example.com", "Reporter")
+    target, _ = auth(c, "target@example.com", "Target")
 
-    assert api.get("/admin/reports", headers=admin_headers).json() == []
-    assert api.get("/me", headers=reported_headers).status_code == 403
-    assert len(api.get("/admin/reports", headers=admin_headers, params={"status": "all"}).json()) == 2
+    report_resp = c.post(f"/users/{target['id']}/report", headers=reporter_headers, json={"reason": "spam"})
+    assert report_resp.status_code == 200
+    report = report_resp.json()
+
+    reports = c.get("/admin/reports", headers=admin_headers).json()
+    assert any(r["id"] == report["id"] and r["reported_email"] == "target@example.com" for r in reports)
+
+    dismiss_resp = c.post(f"/admin/reports/{report['id']}/dismiss", headers=admin_headers)
+    assert dismiss_resp.status_code == 200
+    assert dismiss_resp.json()["status"] == "dismissed"
+
+    report2_resp = c.post(f"/users/{target['id']}/report", headers=reporter_headers, json={"reason": "harassment"})
+    report2 = report2_resp.json()
+    block_resp = c.post(f"/admin/reports/{report2['id']}/block", headers=admin_headers)
+    assert block_resp.status_code == 200
+    assert block_resp.json()["status"] == "suspended"
+
+
+def test_popular_destinations_and_active_routes() -> None:
+    c = client()
+    _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    _, rider_headers = auth(c, "rider3@example.com", "Rider Three")
+
+    pickup = location(c, rider_headers, "Pickup", 37.0, -122.0)
+    dest = location(c, rider_headers, "SMF Airport", 38.6, -121.5)
+    c.post(
+        "/ride-requests", headers=rider_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": dest["id"],
+            "target_date": "2099-01-01", "flexibility": "exact", "passenger_count": 1,
+        },
+    )
+
+    popular = c.get("/admin/destinations/popular", headers=admin_headers).json()
+    assert any(d["label"] == "SMF Airport" and d["trip_count"] >= 1 for d in popular)
+
+    active = c.get("/admin/routes/active", headers=admin_headers).json()
+    assert any(r["destination_label"] == "SMF Airport" for r in active["ride_requests"])
+
+    request_id = c.get("/me/ride-requests", headers=rider_headers).json()[0]["id"]
+    remove_resp = c.post(f"/admin/routes/ride-requests/{request_id}/remove", headers=admin_headers)
+    assert remove_resp.status_code == 200
+    assert remove_resp.json()["status"] == "cancelled"
+
+
+def test_audit_log_records_key_events() -> None:
+    c = client()
+    _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
+    auth(c, "newuser@example.com", "New User")
+    c.post("/auth/login", json={"neon_token": "not-a-real-token"})
+
+    logs = c.get("/admin/audit-logs", headers=admin_headers).json()
+    event_types = {l["event_type"] for l in logs}
+    assert "USER_REGISTERED" in event_types
+    assert "LOGIN_FAILED" in event_types
+
+    filtered = c.get("/admin/audit-logs", headers=admin_headers, params={"event_type": "USER_REGISTERED"}).json()
+    assert all(l["event_type"] == "USER_REGISTERED" for l in filtered)

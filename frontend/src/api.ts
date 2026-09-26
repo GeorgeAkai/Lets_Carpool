@@ -11,15 +11,6 @@ function authHeaders(): HeadersInit {
   return t ? { Authorization: `Bearer ${t}`, "Content-Type": "application/json" } : { "Content-Type": "application/json" };
 }
 
-// Carries the HTTP status so callers can tell "forbidden" (403) apart from
-// other failures — the admin panel redirects to its 403 page on it.
-export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method,
@@ -28,7 +19,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(String(err?.detail ?? res.statusText), res.status);
+    throw new Error(String(err?.detail ?? res.statusText));
   }
   return res.json() as Promise<T>;
 }
@@ -113,10 +104,18 @@ export type ApiUser = {
   id: string;
   email: string;
   email_domain: string;
+  status: "active" | "suspended";
   profile: ApiProfile;
   vehicle: ApiVehicle;
-  is_admin?: boolean;
 };
+
+// The one account allowed onto /admin — enforced server-side on every
+// /admin/* call regardless of what the UI shows or hides.
+const ADMIN_EMAIL = "ageorge@akihlee.com";
+
+export function isAdminUser(user: ApiUser | null): boolean {
+  return !!user && user.email.trim().toLowerCase() === ADMIN_EMAIL;
+}
 
 export type HealthResponse = {
   status: "ok";
@@ -528,92 +527,150 @@ export function dismissNotification(notificationId: string): Promise<{ status: s
   return request<{ status: string }>("DELETE", `/notifications/${notificationId}`);
 }
 
-// ─── Admin (superadmin only) ─────────────────────────────────────────────────
+// ─── Admin ────────────────────────────────────────────────────────────────────
 
-export type AdminStats = {
+export type ApiAdminStats = {
   total_users: number;
-  drivers: number;
-  passengers: number;
+  new_users_7d: number;
+  suspended_users: number;
+  total_drivers: number;
+  total_riders: number;
   active_drivers: number;
   active_riders: number;
   completed_rides: number;
-  blocked_users: number;
-  reported_users: number;
   open_reports: number;
 };
 
-export type AdminUserRow = {
+export type ApiAdminUser = {
   id: string;
   email: string;
+  email_domain: string;
   created_at: string;
-  suspended: boolean;
+  status: "active" | "suspended";
+  suspended_at: string | null;
+  suspended_reason: string | null;
   display_name: string | null;
   photo_url: string | null;
   is_driver: boolean;
   is_rider: boolean;
-  open_reports: number;
+  open_report_count: number;
 };
 
-export type AdminReport = {
+export type ApiAdminReport = {
   id: string;
-  reason: string;
-  status: "open" | "dismissed" | "actioned";
-  created_at: string;
-  resolved_at: string | null;
   reporter_id: string;
-  reporter_email: string;
-  reporter_name: string | null;
   reported_user_id: string;
-  reported_email: string;
+  reason: string;
+  created_at: string;
+  status: "open" | "dismissed" | "actioned";
+  reporter_name: string | null;
+  reporter_email: string;
   reported_name: string | null;
-  reported_suspended: boolean;
+  reported_email: string;
+  reported_status: "active" | "suspended";
 };
 
-export type AdminDestination = { label: string; trips: number; requests: number; total: number };
+export type ApiPopularDestination = {
+  label: string;
+  trip_count: number;
+};
 
-export type AuditLogEntry = {
+export type ApiActiveDriverTrip = {
   id: string;
+  driver_id: string;
+  target_date: string;
+  seats_available: number;
+  seats_reserved: number;
+  status: string;
   created_at: string;
+  driver_name: string | null;
+  pickup_label: string | null;
+  destination_label: string | null;
+};
+
+export type ApiActiveRideRequest = {
+  id: string;
+  rider_id: string;
+  target_date: string;
+  passenger_count: number;
+  status: string;
+  created_at: string;
+  rider_name: string | null;
+  pickup_label: string | null;
+  destination_label: string | null;
+};
+
+export type ApiAuditLogEntry = {
+  id: string;
   event_type: string;
-  actor_id: string | null;
+  actor_user_id: string | null;
   actor_email: string | null;
   ip_address: string | null;
-  details: string;
+  detail: Record<string, unknown>;
+  created_at: string;
 };
 
-function qs(params: Record<string, string | undefined>): string {
-  const q = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) if (v) q.set(k, v);
-  const str = q.toString();
-  return str ? `?${str}` : "";
+export function getAdminStats(): Promise<ApiAdminStats> {
+  return request<ApiAdminStats>("GET", "/admin/stats");
 }
 
-export function getAdminStats(): Promise<AdminStats> {
-  return request("GET", "/admin/stats");
+export function getAdminUsers(opts: { search?: string; status?: string; limit?: number; offset?: number } = {}): Promise<{ users: ApiAdminUser[]; total: number }> {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(opts)) {
+    if (v !== undefined && v !== "") params.set(k, String(v));
+  }
+  const qs = params.toString();
+  return request("GET", `/admin/users${qs ? `?${qs}` : ""}`);
 }
 
-export function getAdminUsers(query?: string): Promise<AdminUserRow[]> {
-  return request("GET", `/admin/users${qs({ q: query?.trim() })}`);
+export function suspendUser(userId: string, reason?: string): Promise<ApiAdminUser> {
+  return request<ApiAdminUser>("POST", `/admin/users/${userId}/suspend`, { reason: reason ?? null });
 }
 
-export function setAdminUserBlocked(userId: string, blocked: boolean): Promise<{ id: string; suspended: boolean }> {
-  return request("POST", `/admin/users/${userId}/${blocked ? "block" : "unblock"}`);
+export function unsuspendUser(userId: string): Promise<ApiAdminUser> {
+  return request<ApiAdminUser>("POST", `/admin/users/${userId}/unsuspend`);
 }
 
-export function getAdminReports(status: "open" | "dismissed" | "actioned" | "all" = "open"): Promise<AdminReport[]> {
-  return request("GET", `/admin/reports${qs({ status })}`);
+export function warnUser(userId: string, message: string): Promise<unknown> {
+  return request("POST", `/admin/users/${userId}/warn`, { message });
 }
 
-export function resolveAdminReport(reportId: string, action: "dismiss" | "suspend"): Promise<unknown> {
-  return request("POST", `/admin/reports/${reportId}/${action}`);
+export function getAdminReports(status?: string): Promise<ApiAdminReport[]> {
+  const qs = status ? `?status=${status}` : "";
+  return request<ApiAdminReport[]>("GET", `/admin/reports${qs}`);
 }
 
-export function getAdminDestinations(limit = 10): Promise<AdminDestination[]> {
-  return request("GET", `/admin/destinations?limit=${limit}`);
+export function dismissReport(reportId: string): Promise<ApiAdminReport> {
+  return request<ApiAdminReport>("POST", `/admin/reports/${reportId}/dismiss`);
 }
 
-export function getAuditLogs(eventType?: string, query?: string): Promise<AuditLogEntry[]> {
-  return request("GET", `/admin/audit-logs${qs({ event_type: eventType, q: query?.trim() })}`);
+export function blockFromReport(reportId: string): Promise<ApiAdminUser> {
+  return request<ApiAdminUser>("POST", `/admin/reports/${reportId}/block`);
+}
+
+export function getPopularDestinations(limit = 10): Promise<ApiPopularDestination[]> {
+  return request<ApiPopularDestination[]>("GET", `/admin/destinations/popular?limit=${limit}`);
+}
+
+export function getActiveRoutes(): Promise<{ driver_trips: ApiActiveDriverTrip[]; ride_requests: ApiActiveRideRequest[] }> {
+  return request("GET", "/admin/routes/active");
+}
+
+export function adminRemoveRideRequest(requestId: string): Promise<unknown> {
+  return request("POST", `/admin/routes/ride-requests/${requestId}/remove`);
+}
+
+export function adminRemoveDriverTrip(tripId: string): Promise<unknown> {
+  return request("POST", `/admin/routes/driver-trips/${tripId}/remove`);
+}
+
+export function getAuditLogs(opts: { event_type?: string; actor_email?: string; date_from?: string; date_to?: string; limit?: number } = {}): Promise<ApiAuditLogEntry[]> {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(opts)) {
+    if (v !== undefined && v !== "") params.set(k, String(v));
+  }
+  const qs = params.toString();
+  return request<ApiAuditLogEntry[]>("GET", `/admin/audit-logs${qs ? `?${qs}` : ""}`);
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────

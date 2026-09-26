@@ -1,444 +1,493 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState, useEffect, useCallback } from 'react'
 import {
-  ArrowLeft, Ban, Car, CheckCircle2, Flag, MapPin, RefreshCw, Search, ShieldCheck, Users, UserCheck,
+  Users, Car, ShieldCheck, ShieldAlert, ScrollText, Flag, Ban, CheckCircle2,
+  Trash2, MessageSquareWarning, RefreshCw, Route, Trophy,
 } from 'lucide-react'
 import * as api from '../api'
-import type { AdminDestination, AdminReport, AdminStats, AdminUserRow, AuditLogEntry, ApiUser } from '../api'
-import { formatPlace } from '../lib/places'
+import type {
+  ApiAdminStats, ApiAdminUser, ApiAdminReport, ApiPopularDestination,
+  ApiActiveDriverTrip, ApiActiveRideRequest, ApiAuditLogEntry,
+} from '../api'
+import { SERIF, Avatar, toInitials, relativeTime } from './home'
 
-// The backend is the real gate (every /admin/* endpoint 403s for anyone else);
-// this constant only decides what the client renders before that check lands.
-export const SUPERADMIN_EMAIL = 'ageorge@akihlee.com'
+type AdminTab = 'overview' | 'users' | 'routes' | 'logs'
+type Toast = (msg: string, type: 'success' | 'error') => void
 
-export function isSuperadmin(user: Pick<ApiUser, 'email' | 'is_admin'> | null | undefined): boolean {
-  if (!user) return false
-  return user.is_admin === true || user.email.toLowerCase() === SUPERADMIN_EMAIL
-}
-
-type Tab = 'users' | 'reports' | 'insights' | 'audit'
-
-const EVENT_FILTERS: { value: string; label: string }[] = [
-  { value: '', label: 'All events' },
-  { value: 'auth.', label: 'Sign-ins' },
-  { value: 'listing.', label: 'Listings' },
-  { value: 'connection.', label: 'Connections' },
-  { value: 'user.', label: 'Blocks & reports' },
-  { value: 'admin.', label: 'Admin actions' },
+const TABS: Array<{ id: AdminTab; label: string; icon: typeof Users }> = [
+  { id: 'overview', label: 'Overview', icon: ShieldCheck },
+  { id: 'users', label: 'Users & Moderation', icon: Users },
+  { id: 'routes', label: 'Rides & Routes', icon: Route },
+  { id: 'logs', label: 'System Logs', icon: ScrollText },
 ]
 
-function fmtDate(iso: string, withTime = false): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return iso
-  return withTime
-    ? d.toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
-    : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+const EVENT_TYPES = ['USER_REGISTERED', 'RIDE_PUBLISHED', 'USER_BLOCKED', 'USER_UNBLOCKED', 'WARNING_SENT', 'REPORT_DISMISSED', 'REPORT_ACTIONED', 'LISTING_REMOVED', 'LOGIN_FAILED']
+
+function StatusBadge({ status }: { status: 'active' | 'suspended' }) {
+  return status === 'suspended' ? (
+    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-500/10 text-red-500">Suspended</span>
+  ) : (
+    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-green-500/10 text-green-600">Active</span>
+  )
 }
 
-function useDebounced<T>(value: T, ms = 300): T {
-  const [debounced, setDebounced] = useState(value)
-  useEffect(() => {
-    const id = setTimeout(() => setDebounced(value), ms)
-    return () => clearTimeout(id)
-  }, [value, ms])
-  return debounced
+function RoleBadge({ isDriver, isRider }: { isDriver: boolean; isRider: boolean }) {
+  const label = isDriver && isRider ? 'Driver + Rider' : isDriver ? 'Driver' : isRider ? 'Rider' : 'New'
+  return <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-medium bg-muted text-muted-foreground">{label}</span>
 }
 
-// ─── Page ───────────────────────────────────────────────────────────────────────
-
-export function AdminPage() {
-  const navigate = useNavigate()
-  const [me, setMe] = useState<ApiUser | null>(null)
-  const [stats, setStats] = useState<AdminStats | null>(null)
-  const [tab, setTab] = useState<Tab>('users')
-  const [error, setError] = useState<string | null>(null)
-
-  // Any 401 means the session is gone; any 403 means "not the superadmin".
-  const handleError = useCallback((e: unknown) => {
-    if (e instanceof api.ApiError && e.status === 401) { navigate('/auth/sign-in', { replace: true }); return }
-    if (e instanceof api.ApiError && e.status === 403) { navigate('/403', { replace: true }); return }
-    setError(e instanceof Error ? e.message : 'Something went wrong')
-  }, [navigate])
-
-  useEffect(() => {
-    if (!localStorage.getItem('carpool_token')) { navigate('/auth/sign-in', { replace: true }); return }
-    api.getMe()
-      .then(user => {
-        if (!isSuperadmin(user)) { navigate('/403', { replace: true }); return }
-        setMe(user)
-      })
-      .catch(handleError)
-  }, [navigate, handleError])
-
-  const loadStats = useCallback(() => { api.getAdminStats().then(setStats).catch(handleError) }, [handleError])
-  useEffect(() => { if (me) loadStats() }, [me, loadStats])
-
-  if (!me) {
-    return (
-      <div className="min-h-screen bg-background text-muted-foreground flex items-center justify-center text-sm">
-        {error ?? 'Checking access…'}
-      </div>
-    )
-  }
-
-  const tabs: { id: Tab; label: string; badge?: number }[] = [
-    { id: 'users', label: 'Users' },
-    { id: 'reports', label: 'Reports', badge: stats?.open_reports },
-    { id: 'insights', label: 'Route insights' },
-    { id: 'audit', label: 'Audit logs' },
-  ]
-
+function StatTile({ label, value, sub }: { label: string; value: number | string; sub?: string }) {
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
-        <div className="max-w-[1440px] mx-auto px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0">
-            <button onClick={() => navigate('/discover')} aria-label="Back to app" className="p-2 -ml-2 rounded-xl hover:bg-sidebar-accent transition-colors">
-              <ArrowLeft className="size-4" />
-            </button>
-            <ShieldCheck className="size-5 text-sidebar-primary shrink-0" />
-            <span className="font-semibold truncate">Admin Console</span>
-          </div>
-          <span className="hidden sm:block text-xs text-sidebar-foreground/60 truncate">{me.email}</span>
-        </div>
-      </header>
-
-      <main className="max-w-[1440px] mx-auto px-4 lg:px-8 py-6 space-y-6">
-        {error && (
-          <div className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive flex items-center justify-between gap-3">
-            <span>{error}</span>
-            <button onClick={() => setError(null)} className="text-xs font-semibold">Dismiss</button>
-          </div>
-        )}
-
-        <KpiGrid stats={stats} onRefresh={loadStats} />
-
-        <div className="flex gap-1 overflow-x-auto rounded-2xl bg-muted p-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist">
-          {tabs.map(t => (
-            <button
-              key={t.id} role="tab" aria-selected={tab === t.id} onClick={() => setTab(t.id)}
-              className={`shrink-0 flex-1 min-w-fit px-4 py-2 rounded-xl text-sm font-medium transition-colors flex items-center justify-center gap-2 ${tab === t.id ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              {t.label}
-              {!!t.badge && <span className="min-w-5 h-5 px-1.5 rounded-full bg-destructive text-white text-[11px] font-bold flex items-center justify-center">{t.badge}</span>}
-            </button>
-          ))}
-        </div>
-
-        {tab === 'users' && <UsersPanel currentAdminId={me.id} onError={handleError} onChanged={loadStats} />}
-        {tab === 'reports' && <ReportsPanel onError={handleError} onChanged={loadStats} />}
-        {tab === 'insights' && <InsightsPanel onError={handleError} />}
-        {tab === 'audit' && <AuditPanel onError={handleError} />}
-      </main>
+    <div className="rounded-3xl bg-card border border-border p-5">
+      <p className="text-sm text-muted-foreground">{label}</p>
+      <p style={SERIF} className="mt-1 text-3xl text-foreground">{value}</p>
+      {sub && <p className="mt-1 text-xs text-muted-foreground">{sub}</p>}
     </div>
   )
 }
 
-// ─── KPIs ───────────────────────────────────────────────────────────────────────
+export function AdminView({ showToast }: { showToast: Toast }) {
+  const [tab, setTab] = useState<AdminTab>('overview')
 
-function KpiGrid({ stats, onRefresh }: { stats: AdminStats | null; onRefresh: () => void }) {
-  const v = (n: number | undefined) => (stats ? n ?? 0 : '—')
-  const cards: { label: string; value: ReactNode; sub: string; Icon: typeof Users; tone: string }[] = [
-    { label: 'Total users', value: v(stats?.total_users), sub: stats ? `${stats.drivers} drivers · ${stats.passengers} passengers` : 'Loading…', Icon: Users, tone: 'bg-primary/10 text-primary' },
-    { label: 'Active drivers', value: v(stats?.active_drivers), sub: 'With an open trip', Icon: Car, tone: 'bg-sky-500/10 text-sky-600 dark:text-sky-400' },
-    { label: 'Active riders', value: v(stats?.active_riders), sub: 'With an open request', Icon: UserCheck, tone: 'bg-violet-500/10 text-violet-600 dark:text-violet-400' },
-    { label: 'Completed rides', value: v(stats?.completed_rides), sub: 'All time', Icon: CheckCircle2, tone: 'bg-green-500/10 text-green-600 dark:text-green-400' },
-    { label: 'Blocked / reported', value: stats ? `${stats.blocked_users} / ${stats.reported_users}` : '—', sub: stats ? `${stats.open_reports} open report${stats.open_reports === 1 ? '' : 's'}` : 'Loading…', Icon: Ban, tone: 'bg-destructive/10 text-destructive' },
-  ]
   return (
-    <section className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Platform overview</h1>
-        <button onClick={onRefresh} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
-          <RefreshCw className="size-3.5" /> Refresh
-        </button>
+    <div className="space-y-6">
+      <div>
+        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Admin Panel</h1>
+        <p className="text-muted-foreground mt-1">Platform analytics, moderation, and audit trail.</p>
       </div>
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-        {cards.map(({ label, value, sub, Icon, tone }, i) => (
-          <div key={label} className={`rounded-2xl border border-border bg-card p-4 ${i === 0 ? 'col-span-2 lg:col-span-1' : ''}`}>
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-xs font-medium text-muted-foreground">{label}</p>
-              <span className={`size-7 rounded-lg flex items-center justify-center ${tone}`}><Icon className="size-3.5" /></span>
-            </div>
-            <p className="mt-2 text-2xl font-semibold tabular-nums">{value}</p>
-            <p className="mt-0.5 text-xs text-muted-foreground truncate">{sub}</p>
-          </div>
+
+      <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-1 px-1">
+        {TABS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id} onClick={() => setTab(id)}
+            className={`shrink-0 inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl text-sm font-semibold transition-colors ${tab === id ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}
+          >
+            <Icon className="size-4" />{label}
+          </button>
         ))}
       </div>
-    </section>
-  )
-}
 
-// ─── Shared table chrome ────────────────────────────────────────────────────────
-
-function Panel({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="rounded-3xl border border-border bg-card overflow-hidden">
-      <div className="px-5 py-4 border-b border-border flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-base font-semibold">{title}</h2>
-        {actions}
-      </div>
-      {children}
-    </section>
-  )
-}
-
-function SearchInput({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder: string }) {
-  return (
-    <div className="relative w-full sm:w-72">
-      <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
-      <input
-        value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} aria-label={placeholder}
-        className="w-full pl-9 pr-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20"
-      />
+      {tab === 'overview' && <OverviewTab showToast={showToast} />}
+      {tab === 'users' && <UsersTab showToast={showToast} />}
+      {tab === 'routes' && <RoutesTab showToast={showToast} />}
+      {tab === 'logs' && <LogsTab showToast={showToast} />}
     </div>
   )
 }
 
-function EmptyRow({ colSpan, children }: { colSpan: number; children: ReactNode }) {
-  return <tr><td colSpan={colSpan} className="px-5 py-10 text-center text-sm text-muted-foreground">{children}</td></tr>
-}
+// ─── Overview ───────────────────────────────────────────────────────────────
 
-const TH = 'px-5 py-3 text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide whitespace-nowrap'
-const TD = 'px-5 py-3 align-middle'
+function OverviewTab({ showToast }: { showToast: Toast }) {
+  const [stats, setStats] = useState<ApiAdminStats | null>(null)
+  const [loading, setLoading] = useState(true)
 
-// ─── Users ──────────────────────────────────────────────────────────────────────
+  const load = useCallback(() => {
+    setLoading(true)
+    api.getAdminStats().then(setStats).catch(e => showToast(e instanceof Error ? e.message : 'Failed to load stats', 'error')).finally(() => setLoading(false))
+  }, [showToast])
 
-function UsersPanel({ currentAdminId, onError, onChanged }: { currentAdminId: string; onError: (e: unknown) => void; onChanged: () => void }) {
-  const [query, setQuery] = useState('')
-  const debounced = useDebounced(query)
-  const [users, setUsers] = useState<AdminUserRow[] | null>(null)
-  const [busyId, setBusyId] = useState<string | null>(null)
+  useEffect(() => { load() }, [load])
 
-  useEffect(() => {
-    let cancelled = false
-    api.getAdminUsers(debounced).then(rows => { if (!cancelled) setUsers(rows) }).catch(onError)
-    return () => { cancelled = true }
-  }, [debounced, onError])
-
-  const toggle = async (u: AdminUserRow) => {
-    setBusyId(u.id)
-    try {
-      const res = await api.setAdminUserBlocked(u.id, !u.suspended)
-      setUsers(prev => prev?.map(x => x.id === u.id ? { ...x, suspended: res.suspended } : x) ?? null)
-      onChanged()
-    } catch (e) { onError(e) } finally { setBusyId(null) }
-  }
+  if (loading && !stats) return <div className="py-24 text-center text-muted-foreground text-sm">Loading analytics…</div>
+  if (!stats) return null
 
   return (
-    <Panel title="User moderation" actions={<SearchInput value={query} onChange={setQuery} placeholder="Search name or email" />}>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50">
-            <tr><th className={TH}>User</th><th className={TH}>Role</th><th className={TH}>Joined</th><th className={TH}>Open reports</th><th className={TH}>Status</th><th className={`${TH} text-right`}>Access</th></tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {users === null ? <EmptyRow colSpan={6}>Loading users…</EmptyRow>
-              : users.length === 0 ? <EmptyRow colSpan={6}>No users match “{debounced}”.</EmptyRow>
-              : users.map(u => (
-                <tr key={u.id} className="hover:bg-muted/30">
-                  <td className={TD}>
-                    <div className="flex items-center gap-3 min-w-[200px]">
-                      {u.photo_url
-                        ? <img src={u.photo_url} alt="" className="size-8 rounded-full object-cover" />
-                        : <div className="size-8 rounded-full bg-secondary text-secondary-foreground text-xs font-semibold flex items-center justify-center">{(u.display_name ?? u.email).slice(0, 2).toUpperCase()}</div>}
-                      <div className="min-w-0">
-                        <p className="font-medium truncate">{u.display_name ?? '—'}</p>
-                        <p className="text-xs text-muted-foreground truncate">{u.email}</p>
-                      </div>
-                    </div>
-                  </td>
-                  <td className={TD}>
-                    <div className="flex gap-1">
-                      {u.is_driver && <span className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">Driver</span>}
-                      {u.is_rider && <span className="text-[11px] px-2 py-0.5 rounded-full bg-accent/15 text-amber-700 dark:text-amber-400 font-medium">Passenger</span>}
-                      {!u.is_driver && !u.is_rider && <span className="text-xs text-muted-foreground">—</span>}
-                    </div>
-                  </td>
-                  <td className={`${TD} whitespace-nowrap text-muted-foreground`}>{fmtDate(u.created_at)}</td>
-                  <td className={`${TD} tabular-nums`}>{u.open_reports > 0 ? <span className="font-semibold text-destructive">{u.open_reports}</span> : <span className="text-muted-foreground">0</span>}</td>
-                  <td className={TD}>
-                    {u.suspended
-                      ? <span className="text-xs px-2 py-0.5 rounded-full bg-destructive/10 text-destructive font-medium">Blocked</span>
-                      : <span className="text-xs px-2 py-0.5 rounded-full bg-green-500/10 text-green-700 dark:text-green-400 font-medium">Active</span>}
-                  </td>
-                  <td className={`${TD} text-right`}>
-                    <button
-                      role="switch" aria-checked={!u.suspended} aria-label={`${u.suspended ? 'Unblock' : 'Block'} ${u.email}`}
-                      disabled={busyId === u.id || u.id === currentAdminId}
-                      onClick={() => toggle(u)}
-                      title={u.id === currentAdminId ? "You can't block yourself" : undefined}
-                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors disabled:opacity-40 ${u.suspended ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'border border-border text-destructive hover:bg-destructive/10'}`}
-                    >
-                      {u.suspended ? 'Unblock' : 'Block'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-          </tbody>
-        </table>
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatTile label="Total Users" value={stats.total_users} sub={`${stats.total_drivers} drivers · ${stats.total_riders} riders`} />
+        <StatTile label="Active Drivers" value={stats.active_drivers} sub="Published, open routes" />
+        <StatTile label="Active Riders" value={stats.active_riders} sub="Open ride requests" />
+        <StatTile label="Completed Rides" value={stats.completed_rides} sub="All-time" />
+        <StatTile label="New Signups" value={stats.new_users_7d} sub="Last 7 days" />
+        <StatTile label="Suspended Users" value={stats.suspended_users} sub="Locked out of the platform" />
+        <StatTile label="Open Reports" value={stats.open_reports} sub="Awaiting moderation" />
       </div>
-    </Panel>
+      <button onClick={load} className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+        <RefreshCw className="size-3.5" />Refresh
+      </button>
+    </div>
   )
 }
 
-// ─── Reports ────────────────────────────────────────────────────────────────────
+// ─── Users & Moderation ───────────────────────────────────────────────────────
 
-function ReportsPanel({ onError, onChanged }: { onError: (e: unknown) => void; onChanged: () => void }) {
-  const [status, setStatus] = useState<'open' | 'dismissed' | 'actioned' | 'all'>('open')
-  const [reports, setReports] = useState<AdminReport[] | null>(null)
-  const [busyId, setBusyId] = useState<string | null>(null)
+function UsersTab({ showToast }: { showToast: Toast }) {
+  const [section, setSection] = useState<'directory' | 'reports'>('directory')
+  return (
+    <div className="space-y-4">
+      <div className="flex rounded-xl bg-muted p-1 gap-1 w-fit" role="group">
+        {(['directory', 'reports'] as const).map(s => (
+          <button key={s} onClick={() => setSection(s)} className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${section === s ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+            {s === 'directory' ? 'User Directory' : 'Reports Queue'}
+          </button>
+        ))}
+      </div>
+      {section === 'directory' ? <UserDirectory showToast={showToast} /> : <ReportsQueue showToast={showToast} />}
+    </div>
+  )
+}
 
-  const load = useCallback(() => { api.getAdminReports(status).then(setReports).catch(onError) }, [status, onError])
-  useEffect(() => { setReports(null); load() }, [load])
+const PAGE_SIZE = 20
 
-  const act = async (r: AdminReport, action: 'dismiss' | 'suspend') => {
-    setBusyId(r.id)
-    try { await api.resolveAdminReport(r.id, action); load(); onChanged() }
-    catch (e) { onError(e) } finally { setBusyId(null) }
+function UserDirectory({ showToast }: { showToast: Toast }) {
+  const [search, setSearch] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'' | 'active' | 'suspended'>('')
+  const [users, setUsers] = useState<ApiAdminUser[]>([])
+  const [total, setTotal] = useState(0)
+  const [offset, setOffset] = useState(0)
+  const [loading, setLoading] = useState(true)
+
+  const load = useCallback(() => {
+    setLoading(true)
+    api.getAdminUsers({ search: search || undefined, status: statusFilter || undefined, limit: PAGE_SIZE, offset })
+      .then(res => { setUsers(res.users); setTotal(res.total) })
+      .catch(e => showToast(e instanceof Error ? e.message : 'Failed to load users', 'error'))
+      .finally(() => setLoading(false))
+  }, [search, statusFilter, offset, showToast])
+
+  useEffect(() => { load() }, [load])
+
+  const toggleSuspend = async (u: ApiAdminUser) => {
+    try {
+      if (u.status === 'suspended') {
+        await api.unsuspendUser(u.id)
+        showToast(`${u.display_name || u.email} unblocked`, 'success')
+      } else {
+        const reason = window.prompt(`Reason for blocking ${u.display_name || u.email}? (optional)`) ?? undefined
+        await api.suspendUser(u.id, reason)
+        showToast(`${u.display_name || u.email} blocked`, 'success')
+      }
+      load()
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Action failed', 'error') }
   }
 
-  const statusPill = (s: AdminReport['status']) => ({
-    open: 'bg-amber-500/15 text-amber-700 dark:text-amber-400',
-    dismissed: 'bg-muted text-muted-foreground',
-    actioned: 'bg-destructive/10 text-destructive',
-  }[s])
+  const warn = async (u: ApiAdminUser) => {
+    const message = window.prompt(`Warning message to send to ${u.display_name || u.email}:`)
+    if (!message) return
+    try { await api.warnUser(u.id, message); showToast('Warning sent', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send warning', 'error') }
+  }
 
   return (
-    <Panel
-      title="Reported users queue"
-      actions={
-        <div className="flex gap-1 rounded-xl bg-muted p-0.5">
-          {(['open', 'dismissed', 'actioned', 'all'] as const).map(s => (
-            <button key={s} onClick={() => setStatus(s)} className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-colors ${status === s ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>{s}</button>
+    <div className="rounded-3xl bg-card border border-border overflow-hidden">
+      <div className="p-4 flex flex-wrap gap-2 border-b border-border">
+        <input
+          value={search} onChange={e => setSearch(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') { setOffset(0); load() } }}
+          placeholder="Search name or email…"
+          className="flex-1 min-w-[180px] px-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20"
+        />
+        <div className="flex rounded-xl bg-muted p-1 gap-1">
+          {([['', 'All'], ['active', 'Active'], ['suspended', 'Suspended']] as const).map(([val, label]) => (
+            <button key={val} onClick={() => { setStatusFilter(val); setOffset(0) }} className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${statusFilter === val ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {label}
+            </button>
           ))}
         </div>
-      }
-    >
-      {reports === null ? <p className="px-5 py-10 text-center text-sm text-muted-foreground">Loading reports…</p>
-        : reports.length === 0 ? (
-          <div className="px-5 py-12 text-center text-muted-foreground">
-            <Flag className="size-8 mx-auto mb-3 opacity-30" />
-            <p className="text-sm font-medium">{status === 'open' ? 'No open reports — the queue is clear.' : 'Nothing here.'}</p>
-          </div>
-        ) : (
-          <ul className="divide-y divide-border">
-            {reports.map(r => (
-              <li key={r.id} className="px-5 py-4 flex flex-col lg:flex-row lg:items-center gap-3">
-                <div className="flex-1 min-w-0 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-semibold">{r.reported_name ?? r.reported_email}</span>
-                    <span className="text-xs text-muted-foreground">{r.reported_email}</span>
-                    <span className={`text-[11px] px-2 py-0.5 rounded-full font-medium capitalize ${statusPill(r.status)}`}>{r.status}</span>
-                    {r.reported_suspended && <span className="text-[11px] px-2 py-0.5 rounded-full bg-destructive/10 text-destructive font-medium">Account blocked</span>}
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground uppercase tracking-wide">
+              <th className="px-4 py-3 font-medium">User</th>
+              <th className="px-4 py-3 font-medium">Role</th>
+              <th className="px-4 py-3 font-medium">Registered</th>
+              <th className="px-4 py-3 font-medium">Status</th>
+              <th className="px-4 py-3 font-medium">Reports</th>
+              <th className="px-4 py-3 font-medium text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {users.map(u => (
+              <tr key={u.id}>
+                <td className="px-4 py-3">
+                  <div className="flex items-center gap-3">
+                    <Avatar initials={toInitials(u.display_name || u.email)} size="sm" photoUrl={u.photo_url} />
+                    <div className="min-w-0">
+                      <p className="font-medium text-foreground truncate">{u.display_name || '—'}</p>
+                      <p className="text-xs text-muted-foreground truncate">{u.email}</p>
+                    </div>
                   </div>
-                  <p className="text-sm">“{r.reason}”</p>
-                  <p className="text-xs text-muted-foreground">Reported by {r.reporter_name ?? r.reporter_email} · {fmtDate(r.created_at, true)}</p>
-                </div>
-                {r.status === 'open' && (
-                  <div className="flex gap-2 shrink-0">
-                    <button onClick={() => act(r, 'dismiss')} disabled={busyId === r.id} className="px-3.5 py-2 rounded-xl border border-border text-sm font-medium hover:bg-muted disabled:opacity-50 transition-colors">Dismiss</button>
-                    <button onClick={() => act(r, 'suspend')} disabled={busyId === r.id} className="px-3.5 py-2 rounded-xl bg-destructive text-white text-sm font-semibold hover:bg-destructive/90 disabled:opacity-50 transition-colors">Suspend account</button>
+                </td>
+                <td className="px-4 py-3"><RoleBadge isDriver={u.is_driver} isRider={u.is_rider} /></td>
+                <td className="px-4 py-3 text-muted-foreground whitespace-nowrap">{new Date(u.created_at).toLocaleDateString()}</td>
+                <td className="px-4 py-3"><StatusBadge status={u.status} /></td>
+                <td className="px-4 py-3">
+                  {u.open_report_count > 0 ? (
+                    <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-600"><Flag className="size-3" />{u.open_report_count}</span>
+                  ) : <span className="text-xs text-muted-foreground">—</span>}
+                </td>
+                <td className="px-4 py-3">
+                  <div className="flex items-center justify-end gap-2">
+                    <button onClick={() => warn(u)} title="Send warning" className="p-1.5 rounded-lg text-muted-foreground hover:text-amber-600 hover:bg-amber-500/10 transition-colors"><MessageSquareWarning className="size-4" /></button>
+                    <button
+                      onClick={() => toggleSuspend(u)}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors ${u.status === 'suspended' ? 'bg-green-500/10 text-green-600 hover:bg-green-500/20' : 'bg-red-500/10 text-red-500 hover:bg-red-500/20'}`}
+                    >
+                      {u.status === 'suspended' ? <><CheckCircle2 className="size-3.5" />Unblock</> : <><Ban className="size-3.5" />Block</>}
+                    </button>
                   </div>
-                )}
-              </li>
+                </td>
+              </tr>
             ))}
-          </ul>
-        )}
-    </Panel>
+            {!loading && users.length === 0 && (
+              <tr><td colSpan={6} className="px-4 py-10 text-center text-muted-foreground">No users match this filter.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="p-4 flex items-center justify-between border-t border-border text-sm text-muted-foreground">
+        <span>{total === 0 ? '0 users' : `${offset + 1}–${Math.min(offset + PAGE_SIZE, total)} of ${total}`}</span>
+        <div className="flex gap-2">
+          <button disabled={offset === 0} onClick={() => setOffset(o => Math.max(0, o - PAGE_SIZE))} className="px-3 py-1.5 rounded-xl border border-border disabled:opacity-40 hover:bg-muted transition-colors">Previous</button>
+          <button disabled={offset + PAGE_SIZE >= total} onClick={() => setOffset(o => o + PAGE_SIZE)} className="px-3 py-1.5 rounded-xl border border-border disabled:opacity-40 hover:bg-muted transition-colors">Next</button>
+        </div>
+      </div>
+    </div>
   )
 }
 
-// ─── Route insights ─────────────────────────────────────────────────────────────
+function ReportsQueue({ showToast }: { showToast: Toast }) {
+  const [reports, setReports] = useState<ApiAdminReport[]>([])
+  const [statusFilter, setStatusFilter] = useState<'' | 'open' | 'dismissed' | 'actioned'>('open')
+  const [loading, setLoading] = useState(true)
 
-function InsightsPanel({ onError }: { onError: (e: unknown) => void }) {
-  const [rows, setRows] = useState<AdminDestination[] | null>(null)
-  useEffect(() => { api.getAdminDestinations(10).then(setRows).catch(onError) }, [onError])
-  const max = useMemo(() => Math.max(1, ...(rows ?? []).map(r => r.total)), [rows])
+  const load = useCallback(() => {
+    setLoading(true)
+    api.getAdminReports(statusFilter || undefined)
+      .then(setReports)
+      .catch(e => showToast(e instanceof Error ? e.message : 'Failed to load reports', 'error'))
+      .finally(() => setLoading(false))
+  }, [statusFilter, showToast])
+
+  useEffect(() => { load() }, [load])
+
+  const dismiss = async (id: string) => {
+    try { await api.dismissReport(id); showToast('Report dismissed', 'success'); load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+  const block = async (r: ApiAdminReport) => {
+    if (!window.confirm(`Block ${r.reported_name || r.reported_email}? This suspends their account.`)) return
+    try { await api.blockFromReport(r.id); showToast('User blocked', 'success'); load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+  const warn = async (r: ApiAdminReport) => {
+    const message = window.prompt(`Warning message to send to ${r.reported_name || r.reported_email}:`)
+    if (!message) return
+    try { await api.warnUser(r.reported_user_id, message); showToast('Warning sent', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
 
   return (
-    <Panel title="Top popular destinations">
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50">
-            <tr><th className={`${TH} w-12`}>#</th><th className={TH}>Destination</th><th className={`${TH} text-right`}>Driver trips</th><th className={`${TH} text-right`}>Ride requests</th><th className={`${TH} w-1/3`}>Total</th></tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {rows === null ? <EmptyRow colSpan={5}>Loading…</EmptyRow>
-              : rows.length === 0 ? <EmptyRow colSpan={5}>No rides have been posted yet.</EmptyRow>
-              : rows.map((r, i) => (
-                <tr key={r.label}>
-                  <td className={`${TD} text-muted-foreground tabular-nums`}>{i + 1}</td>
-                  <td className={TD}><span className="flex items-center gap-2 font-medium min-w-[160px]"><MapPin className="size-3.5 text-primary shrink-0" />{formatPlace(r.label)}</span></td>
-                  <td className={`${TD} text-right tabular-nums`}>{r.trips}</td>
-                  <td className={`${TD} text-right tabular-nums`}>{r.requests}</td>
-                  <td className={TD}>
-                    <div className="flex items-center gap-2 min-w-[120px]">
-                      <div className="flex-1 h-2 rounded-full bg-muted overflow-hidden"><div className="h-full rounded-full bg-primary" style={{ width: `${(r.total / max) * 100}%` }} /></div>
-                      <span className="text-xs font-semibold tabular-nums w-6 text-right">{r.total}</span>
-                    </div>
+    <div className="rounded-3xl bg-card border border-border overflow-hidden">
+      <div className="p-4 flex items-center gap-2 border-b border-border">
+        <div className="flex rounded-xl bg-muted p-1 gap-1">
+          {(['open', 'dismissed', 'actioned', ''] as const).map(s => (
+            <button key={s || 'all'} onClick={() => setStatusFilter(s)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold capitalize transition-colors ${statusFilter === s ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {s || 'All'}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="divide-y divide-border">
+        {reports.map(r => (
+          <div key={r.id} className="p-4 flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm">
+                <span className="font-semibold text-foreground">{r.reported_name || r.reported_email}</span>
+                <span className="text-muted-foreground"> reported by </span>
+                <span className="font-medium text-foreground">{r.reporter_name || r.reporter_email}</span>
+              </p>
+              <p className="text-sm text-muted-foreground mt-0.5">{r.reason}</p>
+              <p className="text-xs text-muted-foreground mt-1">{relativeTime(r.created_at)} · <StatusBadge status={r.reported_status} /></p>
+            </div>
+            {r.status === 'open' ? (
+              <div className="flex items-center gap-2 shrink-0">
+                <button onClick={() => warn(r)} className="p-1.5 rounded-lg text-muted-foreground hover:text-amber-600 hover:bg-amber-500/10 transition-colors" title="Send warning"><MessageSquareWarning className="size-4" /></button>
+                <button onClick={() => dismiss(r.id)} className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-muted text-muted-foreground hover:text-foreground transition-colors">Dismiss</button>
+                <button onClick={() => block(r)} className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors">Block user</button>
+              </div>
+            ) : (
+              <span className="text-xs font-medium text-muted-foreground capitalize shrink-0">{r.status}</span>
+            )}
+          </div>
+        ))}
+        {!loading && reports.length === 0 && (
+          <p className="p-10 text-center text-muted-foreground text-sm">No reports in this queue.</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Rides & Routes ───────────────────────────────────────────────────────────
+
+function RoutesTab({ showToast }: { showToast: Toast }) {
+  const [destinations, setDestinations] = useState<ApiPopularDestination[]>([])
+  const [driverTrips, setDriverTrips] = useState<ApiActiveDriverTrip[]>([])
+  const [rideRequests, setRideRequests] = useState<ApiActiveRideRequest[]>([])
+  const [loading, setLoading] = useState(true)
+
+  const load = useCallback(() => {
+    setLoading(true)
+    Promise.all([api.getPopularDestinations(10), api.getActiveRoutes()])
+      .then(([dest, routes]) => { setDestinations(dest); setDriverTrips(routes.driver_trips); setRideRequests(routes.ride_requests) })
+      .catch(e => showToast(e instanceof Error ? e.message : 'Failed to load routes', 'error'))
+      .finally(() => setLoading(false))
+  }, [showToast])
+
+  useEffect(() => { load() }, [load])
+
+  const removeRideRequest = async (id: string) => {
+    if (!window.confirm('Remove this ride request?')) return
+    try { await api.adminRemoveRideRequest(id); showToast('Listing removed', 'success'); load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+  const removeDriverTrip = async (id: string) => {
+    if (!window.confirm('Remove this driver trip?')) return
+    try { await api.adminRemoveDriverTrip(id); showToast('Listing removed', 'success'); load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+
+  const maxCount = Math.max(1, ...destinations.map(d => d.trip_count))
+
+  if (loading && destinations.length === 0 && driverTrips.length === 0 && rideRequests.length === 0) {
+    return <div className="py-24 text-center text-muted-foreground text-sm">Loading routes…</div>
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-3xl bg-card border border-border p-6">
+        <h3 className="text-base font-semibold text-foreground flex items-center gap-2"><Trophy className="size-4 text-primary" />Popular Destinations</h3>
+        <div className="mt-4 space-y-2.5">
+          {destinations.map(d => (
+            <div key={d.label} className="flex items-center gap-3">
+              <span className="text-sm text-foreground w-40 truncate shrink-0">{d.label}</span>
+              <div className="flex-1 h-2 rounded-full bg-muted overflow-hidden">
+                <div className="h-full rounded-full bg-primary" style={{ width: `${(d.trip_count / maxCount) * 100}%` }} />
+              </div>
+              <span className="text-xs text-muted-foreground w-8 text-right shrink-0">{d.trip_count}</span>
+            </div>
+          ))}
+          {destinations.length === 0 && <p className="text-sm text-muted-foreground">No destination activity yet.</p>}
+        </div>
+      </div>
+
+      <div className="rounded-3xl bg-card border border-border overflow-hidden">
+        <h3 className="p-6 pb-0 text-base font-semibold text-foreground flex items-center gap-2"><Car className="size-4 text-primary" />Active Driver Trips</h3>
+        <div className="overflow-x-auto mt-4">
+          <table className="w-full text-sm">
+            <tbody className="divide-y divide-border">
+              {driverTrips.map(t => (
+                <tr key={t.id}>
+                  <td className="px-6 py-3">
+                    <p className="font-medium text-foreground">{t.driver_name || 'Driver'}</p>
+                    <p className="text-xs text-muted-foreground">{t.pickup_label} → {t.destination_label}</p>
+                  </td>
+                  <td className="px-4 py-3 text-muted-foreground whitespace-nowrap text-xs">{t.target_date} · {t.seats_reserved}/{t.seats_available} seats</td>
+                  <td className="px-4 py-3 text-right">
+                    <button onClick={() => removeDriverTrip(t.id)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors"><Trash2 className="size-3.5" />Remove</button>
                   </td>
                 </tr>
               ))}
-          </tbody>
-        </table>
+              {driverTrips.length === 0 && <tr><td className="px-6 py-8 text-center text-muted-foreground text-sm">No active driver trips.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
-    </Panel>
+
+      <div className="rounded-3xl bg-card border border-border overflow-hidden">
+        <h3 className="p-6 pb-0 text-base font-semibold text-foreground flex items-center gap-2"><Users className="size-4 text-primary" />Active Ride Requests</h3>
+        <div className="overflow-x-auto mt-4">
+          <table className="w-full text-sm">
+            <tbody className="divide-y divide-border">
+              {rideRequests.map(r => (
+                <tr key={r.id}>
+                  <td className="px-6 py-3">
+                    <p className="font-medium text-foreground">{r.rider_name || 'Rider'}</p>
+                    <p className="text-xs text-muted-foreground">{r.pickup_label} → {r.destination_label}</p>
+                  </td>
+                  <td className="px-4 py-3 text-muted-foreground whitespace-nowrap text-xs">{r.target_date} · {r.passenger_count} pax</td>
+                  <td className="px-4 py-3 text-right">
+                    <button onClick={() => removeRideRequest(r.id)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors"><Trash2 className="size-3.5" />Remove</button>
+                  </td>
+                </tr>
+              ))}
+              {rideRequests.length === 0 && <tr><td className="px-6 py-8 text-center text-muted-foreground text-sm">No active ride requests.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   )
 }
 
-// ─── Audit logs ─────────────────────────────────────────────────────────────────
+// ─── System Logs ────────────────────────────────────────────────────────────
 
-function AuditPanel({ onError }: { onError: (e: unknown) => void }) {
+function LogsTab({ showToast }: { showToast: Toast }) {
+  const [logs, setLogs] = useState<ApiAuditLogEntry[]>([])
   const [eventType, setEventType] = useState('')
-  const [query, setQuery] = useState('')
-  const debounced = useDebounced(query)
-  const [logs, setLogs] = useState<AuditLogEntry[] | null>(null)
+  const [actorEmail, setActorEmail] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    let cancelled = false
-    api.getAuditLogs(eventType || undefined, debounced).then(rows => { if (!cancelled) setLogs(rows) }).catch(onError)
-    return () => { cancelled = true }
-  }, [eventType, debounced, onError])
+  const load = useCallback(() => {
+    setLoading(true)
+    api.getAuditLogs({
+      event_type: eventType || undefined,
+      actor_email: actorEmail || undefined,
+      date_from: dateFrom ? new Date(dateFrom).toISOString() : undefined,
+      date_to: dateTo ? new Date(dateTo).toISOString() : undefined,
+    }).then(setLogs).catch(e => showToast(e instanceof Error ? e.message : 'Failed to load logs', 'error')).finally(() => setLoading(false))
+  }, [eventType, actorEmail, dateFrom, dateTo, showToast])
 
-  const tone = (t: string) =>
-    t.startsWith('admin.') ? 'bg-destructive/10 text-destructive'
-      : t.startsWith('auth.') ? 'bg-primary/10 text-primary'
-      : t.startsWith('user.') ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
-      : 'bg-muted text-muted-foreground'
+  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps -- only auto-load once; Filter button re-runs with current inputs
 
   return (
-    <Panel
-      title="Audit logs"
-      actions={
-        <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
-          <select value={eventType} onChange={e => setEventType(e.target.value)} aria-label="Event type" className="px-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20">
-            {EVENT_FILTERS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+    <div className="rounded-3xl bg-card border border-border overflow-hidden">
+      <div className="p-4 flex flex-wrap gap-2 border-b border-border items-center">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className="size-4 text-muted-foreground shrink-0" />
+          <select value={eventType} onChange={e => setEventType(e.target.value)} className="px-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20">
+            <option value="">All event types</option>
+            {EVENT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
-          <SearchInput value={query} onChange={setQuery} placeholder="Search actor, IP or details" />
         </div>
-      }
-    >
+        <input value={actorEmail} onChange={e => setActorEmail(e.target.value)} placeholder="Filter by actor email…" className="px-3 py-2 rounded-xl bg-input-background text-sm flex-1 min-w-[160px] focus:outline-none focus:ring-2 focus:ring-ring/20" />
+        <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="px-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20" />
+        <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="px-3 py-2 rounded-xl bg-input-background text-sm focus:outline-none focus:ring-2 focus:ring-ring/20" />
+        <button onClick={load} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Filter</button>
+      </div>
+
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="bg-muted/50">
-            <tr><th className={TH}>Timestamp</th><th className={TH}>Event type</th><th className={TH}>Actor</th><th className={TH}>IP address</th><th className={TH}>Details</th></tr>
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground uppercase tracking-wide">
+              <th className="px-4 py-3 font-medium">Timestamp</th>
+              <th className="px-4 py-3 font-medium">Event</th>
+              <th className="px-4 py-3 font-medium">Actor</th>
+              <th className="px-4 py-3 font-medium">IP Address</th>
+              <th className="px-4 py-3 font-medium">Details</th>
+            </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {logs === null ? <EmptyRow colSpan={5}>Loading…</EmptyRow>
-              : logs.length === 0 ? <EmptyRow colSpan={5}>No events match these filters.</EmptyRow>
-              : logs.map(l => (
-                <tr key={l.id} className="hover:bg-muted/30">
-                  <td className={`${TD} whitespace-nowrap text-muted-foreground tabular-nums`}>{fmtDate(l.created_at, true)}</td>
-                  <td className={TD}><span className={`text-[11px] px-2 py-0.5 rounded-full font-mono whitespace-nowrap ${tone(l.event_type)}`}>{l.event_type}</span></td>
-                  <td className={`${TD} whitespace-nowrap`}>{l.actor_email ?? <span className="text-muted-foreground">system</span>}</td>
-                  <td className={`${TD} whitespace-nowrap font-mono text-xs text-muted-foreground`}>{l.ip_address ?? '—'}</td>
-                  <td className={`${TD} text-muted-foreground min-w-[220px]`}>{l.details || '—'}</td>
-                </tr>
-              ))}
+            {logs.map(l => (
+              <tr key={l.id}>
+                <td className="px-4 py-3 text-muted-foreground whitespace-nowrap text-xs">{new Date(l.created_at).toLocaleString()}</td>
+                <td className="px-4 py-3"><span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-muted text-foreground">{l.event_type}</span></td>
+                <td className="px-4 py-3 text-foreground">{l.actor_email || 'system'}</td>
+                <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{l.ip_address || '—'}</td>
+                <td className="px-4 py-3 text-muted-foreground text-xs max-w-xs truncate">{Object.keys(l.detail).length > 0 ? JSON.stringify(l.detail) : '—'}</td>
+              </tr>
+            ))}
+            {!loading && logs.length === 0 && (
+              <tr><td colSpan={5} className="px-4 py-10 text-center text-muted-foreground">No matching log entries.</td></tr>
+            )}
           </tbody>
         </table>
       </div>
-    </Panel>
+    </div>
   )
 }

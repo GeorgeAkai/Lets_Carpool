@@ -53,6 +53,12 @@ def run_migrations(database_url: str) -> None:
             created_at        TIMESTAMPTZ NOT NULL
         )
     """)
+    # Admin moderation: 'active' | 'suspended'. Suspended users are locked out
+    # entirely (see current_user() in main.py) and their listings drop out of
+    # search, rather than just being blocked by one peer (see `blocks` below).
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
@@ -215,6 +221,8 @@ def run_migrations(database_url: str) -> None:
             created_at       TIMESTAMPTZ NOT NULL
         )
     """)
+    # 'open' | 'dismissed' | 'actioned' — set by an admin working the reports queue.
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open'")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS blocks (
@@ -223,6 +231,22 @@ def run_migrations(database_url: str) -> None:
             PRIMARY KEY (blocker_id, blocked_id)
         )
     """)
+
+    # Admin audit trail: security- and moderation-relevant events (signups,
+    # listing publication, suspensions, failed logins, ...). Append-only.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id              TEXT PRIMARY KEY,
+            event_type      TEXT NOT NULL,
+            actor_user_id   TEXT REFERENCES users(id),
+            actor_email     TEXT,
+            ip_address      TEXT,
+            detail          JSONB NOT NULL DEFAULT '{}',
+            created_at      TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs (created_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type ON audit_logs (event_type)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pools (
@@ -264,27 +288,6 @@ def run_migrations(database_url: str) -> None:
             created_at TIMESTAMPTZ NOT NULL
         )
     """)
-
-    # ── Admin / moderation ──────────────────────────────────────────────────
-    # `suspended` is a platform-level block set by the superadmin (distinct
-    # from the per-user `blocks` table, which only hides two users from each
-    # other). Suspended accounts can't sign in or use an existing token.
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN NOT NULL DEFAULT FALSE")
-    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open'")
-    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id          TEXT PRIMARY KEY,
-            created_at  TIMESTAMPTZ NOT NULL,
-            event_type  TEXT NOT NULL,
-            actor_id    TEXT,
-            actor_email TEXT,
-            ip_address  TEXT,
-            details     TEXT NOT NULL DEFAULT ''
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx ON audit_logs (created_at DESC)")
 
     cur.close()
     conn.close()
