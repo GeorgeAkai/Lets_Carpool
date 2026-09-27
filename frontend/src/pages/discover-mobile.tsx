@@ -209,6 +209,10 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
         )}
       </div>
 
+      {listing.notes && (
+        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 line-clamp-3">{listing.notes}</p>
+      )}
+
       {!isOwn && (
         alreadyConnected ? (
           <div className="mt-1 w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">

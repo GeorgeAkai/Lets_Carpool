@@ -140,6 +140,7 @@ class RideRequest:
     created_at: datetime
     luggage_size: str = "none"
     preferred_car_type: str | None = None
+    notes: str | None = None
 
 
 @dataclass
@@ -157,6 +158,7 @@ class DriverTrip:
     created_at: datetime
     luggage_capacity: str = "medium"
     car_type: str | None = None
+    notes: str | None = None
 
 
 @dataclass
@@ -334,6 +336,7 @@ def _row_to_ride_request(r: dict) -> RideRequest:
         status=r["status"], created_at=r["created_at"],
         luggage_size=r["luggage_size"] or "none",
         preferred_car_type=r["preferred_car_type"],
+        notes=r["notes"],
     )
 
 def _row_to_driver_trip(r: dict) -> DriverTrip:
@@ -347,6 +350,7 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         status=r["status"], created_at=r["created_at"],
         luggage_capacity=r["luggage_capacity"] or "medium",
         car_type=r["car_type"],
+        notes=r["notes"],
     )
 
 def _row_to_connection(r: dict) -> Connection:
@@ -595,6 +599,7 @@ class Store:
         preferred_car_type = data.get("preferred_car_type")
         if preferred_car_type and preferred_car_type not in ALLOWED_CAR_TYPES:
             raise DomainError(f"Invalid car type: {preferred_car_type}")
+        notes = (data.get("notes") or "").strip() or None
 
         rr = RideRequest(
             id=new_id("rrq"), rider_id=rider_id,
@@ -604,6 +609,7 @@ class Store:
             passenger_count=passenger_count, tags=tags,
             status="open", created_at=now_utc(),
             luggage_size=luggage_size, preferred_car_type=preferred_car_type,
+            notes=notes,
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -611,12 +617,12 @@ class Store:
                 """INSERT INTO ride_requests (id, rider_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        passenger_count, tags, status, created_at, luggage_size,
-                       preferred_car_type)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       preferred_car_type, notes)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (rr.id, rr.rider_id, rr.pickup_location_id,
                  rr.destination_location_id, rr.target_date, rr.flexibility,
                  rr.passenger_count, rr.tags, rr.status, rr.created_at,
-                 rr.luggage_size, rr.preferred_car_type),
+                 rr.luggage_size, rr.preferred_car_type, rr.notes),
             )
         return rr
 
@@ -666,6 +672,7 @@ class Store:
         car_type = data.get("car_type")
         if car_type and car_type not in ALLOWED_CAR_TYPES:
             raise DomainError(f"Invalid car type: {car_type}")
+        notes = (data.get("notes") or "").strip() or None
 
         trip = DriverTrip(
             id=new_id("trp"), driver_id=driver_id,
@@ -675,6 +682,7 @@ class Store:
             seats_available=seats_available, seats_reserved=0,
             tags=tags, status="open", created_at=now_utc(),
             luggage_capacity=luggage_capacity, car_type=car_type,
+            notes=notes,
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -682,12 +690,13 @@ class Store:
                 """INSERT INTO driver_trips (id, driver_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        seats_available, seats_reserved, tags, status, created_at,
-                       luggage_capacity, car_type)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       luggage_capacity, car_type, notes)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
-                 trip.status, trip.created_at, trip.luggage_capacity, trip.car_type),
+                 trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
+                 trip.notes),
             )
         return trip
 

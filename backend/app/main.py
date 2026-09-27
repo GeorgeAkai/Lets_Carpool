@@ -109,6 +109,7 @@ class RideRequestCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     luggage_size: str = "none"
     preferred_car_type: str | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class DriverTripCreate(BaseModel):
@@ -120,6 +121,7 @@ class DriverTripCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     luggage_capacity: str = "medium"
     car_type: str | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class ConnectionCreate(BaseModel):

@@ -14,7 +14,7 @@ import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
 import { useTheme } from '@neondatabase/auth-ui'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
-import { MapView } from '../MapView'
+import { MapView, distanceMeters } from '../MapView'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
 import { authClient, fetchNeonJWT } from '../lib/auth'
@@ -42,12 +42,13 @@ export interface Listing {
   seats?: number; seatsUsed?: number; passengers?: number; estimatedGas?: number
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
+  notes?: string | null
 }
 
 export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
   flexibility: Flexibility; seats?: number; passengers?: number; tags: RideTag[]
-  status: string; createdAt: string
+  status: string; createdAt: string; notes?: string | null
 }
 
 interface Connection {
@@ -108,13 +109,14 @@ function shortLabel(r: NominatimResult): string {
 }
 
 function LocationInput({
-  label, value, onChange, placeholder, required,
+  label, value, onChange, placeholder, required, nearCoords,
 }: {
   label: string
   value: LocationValue | null
   onChange: (v: LocationValue | null) => void
   placeholder: string
   required?: boolean
+  nearCoords?: { lat: number; lng: number } | null
 }) {
   const [query, setQuery] = useState(value?.label ?? '')
   const [suggestions, setSuggestions] = useState<NominatimResult[]>([])
@@ -134,18 +136,34 @@ function LocationInput({
     debounceRef.current = setTimeout(async () => {
       setLoading(true)
       try {
+        // Bias (not restrict) toward the user's area: a ~1° box (~100km) around
+        // their location tells Nominatim to rank local matches higher, without
+        // `bounded=1` — which would hide a deliberate search for a far-away
+        // place entirely. The client-side distance sort below is what actually
+        // guarantees the nearest match comes first, since viewbox alone is only
+        // a soft hint and a same-named city on the other side of the world can
+        // still outrank it on Nominatim's own "importance" score.
+        const viewbox = nearCoords
+          ? `&viewbox=${nearCoords.lng - 1},${nearCoords.lat + 1},${nearCoords.lng + 1},${nearCoords.lat - 1}`
+          : ''
         const res = await fetch(
-          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1`,
+          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1${viewbox}`,
           { headers: { 'Accept-Language': 'en' } },
         )
         const data: NominatimResult[] = await res.json()
+        if (nearCoords) {
+          data.sort((a, b) =>
+            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(a.lat), parseFloat(a.lon)]) -
+            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(b.lat), parseFloat(b.lon)]),
+          )
+        }
         setSuggestions(data)
         setOpen(data.length > 0)
       } catch { /* network error — silently ignore */ } finally {
         setLoading(false)
       }
     }, 350)
-  }, [])
+  }, [nearCoords])
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -277,7 +295,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     carType: (trip.car_type as CarType) ?? undefined,
     luggageCapacity: (trip.luggage_capacity as LuggageSize) ?? undefined,
     status: trip.status === 'open' ? 'open' : 'matched',
-    postedAt: relativeTime(trip.created_at),
+    postedAt: relativeTime(trip.created_at), notes: trip.notes,
   }
 }
 
@@ -292,7 +310,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
     luggageSize: (req.luggage_size as LuggageSize) ?? undefined,
     status: req.status === 'open' ? 'open' : 'matched',
-    postedAt: relativeTime(req.created_at),
+    postedAt: relativeTime(req.created_at), notes: req.notes,
   }
 }
 
@@ -303,7 +321,7 @@ function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available,
     tags: trip.tags.filter((t): t is RideTag => t === 'airport' || t === 'student'),
-    status: trip.status, createdAt: trip.created_at,
+    status: trip.status, createdAt: trip.created_at, notes: trip.notes,
   }
 }
 
@@ -314,7 +332,7 @@ function requestToMyListing(req: api.ApiRideRequest): MyListing {
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => t === 'airport' || t === 'student'),
-    status: req.status, createdAt: req.created_at,
+    status: req.status, createdAt: req.created_at, notes: req.notes,
   }
 }
 
@@ -493,6 +511,10 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
 
       {listing.tags.length > 0 && (
         <div className="flex gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>
+      )}
+
+      {listing.notes && (
+        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 line-clamp-3">{listing.notes}</p>
       )}
 
       {isOwn ? (
@@ -715,6 +737,7 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
           {isDriverListing && listing.carType && <p className="flex items-center gap-1.5"><Car className="size-3" />{CAR_TYPE_EMOJI[listing.carType]} {CAR_TYPE_LABELS[listing.carType]}</p>}
           {isDriverListing && listing.luggageCapacity && listing.luggageCapacity !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</p>}
           {!isDriverListing && listing.luggageSize && listing.luggageSize !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</p>}
+          {listing.notes && <p className="text-foreground/80">{listing.notes}</p>}
           <p>Posted {listing.postedAt}</p>
         </div>
       )}
@@ -918,6 +941,7 @@ function DriverHomeView({
                   <p className="text-xs text-muted-foreground mt-0.5 truncate">
                     <span>{m.listing.from}</span> → <span>{m.listing.to}</span> · {m.listing.passengers} passenger{(m.listing.passengers ?? 0) > 1 ? 's' : ''} · {m.listing.date}
                   </p>
+                  {m.listing.notes && <p className="text-xs text-muted-foreground/80 mt-0.5 truncate italic">"{m.listing.notes}"</p>}
                 </div>
                 <UserMenuButton targetUserId={m.listing.ownerId} showToast={showToast} />
                 {connectedListingIds.has(m.listing.apiId) ? (
@@ -1098,6 +1122,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   const [carType, setCarType] = useState<CarType | ''>((myVehicle?.car_type as CarType) ?? '')
   const [luggageSize, setLuggageSize] = useState<LuggageSize>('none')
   const [luggageCapacity, setLuggageCapacity] = useState<LuggageSize>('medium')
+  const [notes, setNotes] = useState('')
   const [declared, setDeclared] = useState(false)
   const [submitted, setSubmitted] = useState(false)
   const [error, setError] = useState('')
@@ -1121,6 +1146,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
           pickup_location_id: pickupLoc.id, destination_location_id: destLoc.id,
           target_date: date, flexibility, seats_available: parseInt(seats, 10),
           tags: Array.from(tags), car_type: carType || undefined, luggage_capacity: luggageCapacity,
+          notes: notes.trim() || undefined,
         })
         onPost(tripToMyListing(trip))
       } else {
@@ -1128,6 +1154,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
           pickup_location_id: pickupLoc.id, destination_location_id: destLoc.id,
           target_date: date, flexibility, passenger_count: parseInt(passengers, 10),
           tags: Array.from(tags), luggage_size: luggageSize,
+          notes: notes.trim() || undefined,
         })
         onPost(requestToMyListing(req))
       }
@@ -1150,8 +1177,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
       <form onSubmit={handleSubmit} className="space-y-5">
         <div className="grid grid-cols-2 gap-3">
-          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required />
-          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required />
+          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required nearCoords={userCoords} />
+          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required nearCoords={userCoords} />
         </div>
 
         <div className="grid grid-cols-2 gap-3">
@@ -1232,6 +1259,17 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
           </div>
         </div>
 
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium">Add a note <span className="text-muted-foreground font-normal">(optional)</span></label>
+          <textarea
+            value={notes} onChange={e => setNotes(e.target.value)} rows={3} maxLength={500}
+            placeholder={type === 'driver'
+              ? "e.g. I'm heading to SFO around 8am. Anyone going the same direction?"
+              : "e.g. Looking for a driver heading downtown Friday morning, one small bag."}
+            className={`${inputCls} resize-none`}
+          />
+        </div>
+
         <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">
           <input type="checkbox" checked={declared} onChange={() => setDeclared(v => !v)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
           I confirm the information is accurate.
@@ -1306,6 +1344,7 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
                     {listing.passengers != null && <><Dot className="size-3" /><span>{listing.passengers} passenger{listing.passengers > 1 ? 's' : ''}</span></>}
                   </div>
                   {listing.tags.length > 0 && <div className="flex gap-1.5 pl-5 pt-1">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>}
+                  {listing.notes && <p className="text-sm text-muted-foreground pl-5 pt-1">{listing.notes}</p>}
                 </div>
                 <div className="flex flex-col items-end gap-2 shrink-0">
                   <ListingStatusBadge status={listing.status} />
@@ -2087,7 +2126,7 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
               {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[10px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
             <button onClick={() => setView('profile')} className="size-8 rounded-full bg-sidebar-accent text-sidebar-foreground text-xs font-semibold flex items-center justify-center hover:ring-2 hover:ring-sidebar-primary/40 transition-all" aria-label="Account" style={MONO}>{initials}</button>
-            <button onClick={onSignOut} className="hidden xl:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent transition-colors" aria-label="Sign out"><LogOut className="size-4" /><span>Sign out</span></button>
+            <button onClick={onSignOut} className="flex items-center gap-1.5 p-2 xl:px-3 xl:py-1.5 rounded-xl text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent transition-colors" aria-label="Sign out"><LogOut className="size-5 xl:size-4" /><span className="hidden xl:inline">Sign out</span></button>
           </div>
         ) : (
           <div className="flex items-center gap-2">

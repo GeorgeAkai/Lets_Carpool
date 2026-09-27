@@ -144,6 +144,7 @@ def run_migrations(database_url: str) -> None:
             preferred_car_type      TEXT
         )
     """)
+    cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS notes TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS driver_trips (
@@ -162,6 +163,7 @@ def run_migrations(database_url: str) -> None:
             car_type                TEXT
         )
     """)
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS notes TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS connections (
