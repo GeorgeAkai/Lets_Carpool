@@ -759,10 +759,11 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                f"""SELECT dt.* FROM driver_trips dt
+                f"""SELECT DISTINCT dt.* FROM driver_trips dt
                    {joins}
                    WHERE dt.status IN ('open', 'matched')
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
+                   AND dt.driver_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
@@ -771,7 +772,7 @@ class Store:
                           OR (blocker_id = dt.driver_id AND blocked_id = %s)
                    )
                    ORDER BY dt.created_at DESC""",
-                (*geo_params, user_id, user_id),
+                (user_id, *geo_params, user_id, user_id),
             )
             trips = [_row_to_driver_trip(r) for r in cur.fetchall()]
 
@@ -785,10 +786,11 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                f"""SELECT rr.* FROM ride_requests rr
+                f"""SELECT DISTINCT rr.* FROM ride_requests rr
                    {joins}
                    WHERE rr.status IN ('open', 'matched')
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
+                   AND rr.rider_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
@@ -797,7 +799,7 @@ class Store:
                           OR (blocker_id = rr.rider_id AND blocked_id = %s)
                    )
                    ORDER BY rr.created_at DESC""",
-                (*geo_params, user_id, user_id),
+                (user_id, *geo_params, user_id, user_id),
             )
             requests = [_row_to_ride_request(r) for r in cur.fetchall()]
 

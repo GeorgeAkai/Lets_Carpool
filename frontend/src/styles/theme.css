@@ -1,6 +1,12 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  /* Single source of truth for the fixed mobile BottomNav's rendered height
+     (tap-target row + safe-area inset). FABs and scroll-content padding read
+     this instead of guessing their own "nav height + buffer" constant, so a
+     change to the nav's own height/inset can't silently drift out of sync
+     with what's clearing it. */
+  --bottom-nav-h: calc(4rem + env(safe-area-inset-bottom));
   --font-size: 16px;
   --background: #f8fafc;
   --foreground: #0f172a;

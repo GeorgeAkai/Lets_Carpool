@@ -84,6 +84,20 @@ interface NominatimResult {
   address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
 }
 
+async function reverseGeocode(lat: number, lng: number): Promise<string> {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
+      { headers: { 'Accept-Language': 'en' } },
+    )
+    const data: NominatimResult = await res.json()
+    const label = shortLabel(data)
+    return label || 'My location'
+  } catch {
+    return 'My location'
+  }
+}
+
 function shortLabel(r: NominatimResult): string {
   const parts = [r.name || r.display_name.split(',')[0]]
   const a = r.address ?? {}
@@ -968,9 +982,9 @@ function FeedView({
           </div>
         ) : (
           <div className="text-center py-16 text-muted-foreground">
-            <Search className="size-10 mx-auto mb-4 opacity-20" />
-            <p className="font-medium">No rides match</p>
-            <p className="text-sm mt-1">Try a different destination or fewer filters.</p>
+            <p className="text-4xl mb-4 opacity-50">🚗</p>
+            <p className="font-medium">No nearby drivers right now</p>
+            <p className="text-sm mt-1">Try searching for a specific destination above or post a request.</p>
           </div>
         )}
         <FilterSheet
@@ -1051,9 +1065,9 @@ function FeedView({
         </div>
       ) : !loading ? (
         <div className="text-center py-24 text-muted-foreground">
-          <Search className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No listings match</p>
-          <p className="text-sm mt-1">Try broadening your filters.</p>
+          <p className="text-4xl mb-4 opacity-50">🚗</p>
+          <p className="font-medium">No nearby drivers right now</p>
+          <p className="text-sm mt-1">Try searching for a specific destination above or post a request.</p>
         </div>
       ) : null}
     </div>
@@ -1071,6 +1085,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   // type while in Rider/Driver mode is exactly the kind of mixed-page
   // behavior the mode gate exists to remove.
   const type = defaultType
+  const submittingRef = useRef(false)
   const [from, setFrom] = useState<LocationValue | null>(null)
   const [to, setTo] = useState<LocationValue | null>(null)
   const [date, setDate] = useState('')
@@ -1092,7 +1107,9 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
   const handleSubmit = async (e: { preventDefault(): void }) => {
     e.preventDefault()
+    if (submittingRef.current) return
     if (!from || !to) { setError('Please select both pickup and destination from the suggestions'); return }
+    submittingRef.current = true
     setSubmitted(true); setError('')
     try {
       const [pickupLoc, destLoc] = await Promise.all([
@@ -1114,7 +1131,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         })
         onPost(requestToMyListing(req))
       }
-    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to post'); setSubmitted(false) }
+    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to post'); setSubmitted(false); submittingRef.current = false }
   }
 
   const inputCls = 'w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors'
@@ -1921,43 +1938,45 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
         </div>
       </div>
 
-      <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-semibold text-foreground">Driver Readiness</h3>
-          <p className="text-sm text-muted-foreground mt-1">Vehicle details and self-declared eligibility.</p>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          {[['Make', make, setMake], ['Model', model, setModel], ['Color', color, setColor]].map(([label, val, setter]) => (
-            <div key={label as string} className="space-y-1.5">
-              <label className="text-sm font-medium">{label as string}</label>
-              <input value={val as string} onChange={e => (setter as (v: string) => void)(e.target.value)} placeholder={label as string} className={inputCls} />
+      {mode === 'driver' && (
+        <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
+          <div>
+            <h3 className="text-base font-semibold text-foreground">Driver Readiness</h3>
+            <p className="text-sm text-muted-foreground mt-1">Vehicle details and self-declared eligibility.</p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {[['Make', make, setMake], ['Model', model, setModel], ['Color', color, setColor]].map(([label, val, setter]) => (
+              <div key={label as string} className="space-y-1.5">
+                <label className="text-sm font-medium">{label as string}</label>
+                <input value={val as string} onChange={e => (setter as (v: string) => void)(e.target.value)} placeholder={label as string} className={inputCls} />
+              </div>
+            ))}
+            <div className="space-y-1.5"><label className="text-sm font-medium">Seats</label><input type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} className={inputCls} /></div>
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">Vehicle type</label>
+            <div className="flex flex-wrap gap-2">
+              {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
+                <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-sm font-medium transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                  {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
+                </button>
+              ))}
             </div>
-          ))}
-          <div className="space-y-1.5"><label className="text-sm font-medium">Seats</label><input type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} className={inputCls} /></div>
-        </div>
-        <div className="space-y-1.5">
-          <label className="text-sm font-medium">Vehicle type</label>
-          <div className="flex flex-wrap gap-2">
-            {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
-              <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-sm font-medium transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-                {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
-              </button>
+          </div>
+          <div className="space-y-2">
+            {([['has_license', "I have a valid driver's license", hasLicense, setHasLicense], ['has_insurance', 'I have valid car insurance', hasInsurance, setHasInsurance], ['has_record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, boolean, (v: boolean) => void][]).map(([key, label, val, setter]) => (
+              <label key={key} className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+                <input type="checkbox" checked={val} onChange={() => setter(!val)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
+                {label}
+              </label>
             ))}
           </div>
+          <div className="flex items-center gap-3">
+            <button onClick={saveVehicle} disabled={vehicleSaving} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{vehicleSaving ? 'Saving…' : 'Save vehicle'}</button>
+            {vehicleMsg && <p className={`text-sm ${vehicleMsg.ok ? 'text-green-700' : 'text-red-500'}`}>{vehicleMsg.text}</p>}
+          </div>
         </div>
-        <div className="space-y-2">
-          {([['has_license', "I have a valid driver's license", hasLicense, setHasLicense], ['has_insurance', 'I have valid car insurance', hasInsurance, setHasInsurance], ['has_record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, boolean, (v: boolean) => void][]).map(([key, label, val, setter]) => (
-            <label key={key} className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-              <input type="checkbox" checked={val} onChange={() => setter(!val)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
-              {label}
-            </label>
-          ))}
-        </div>
-        <div className="flex items-center gap-3">
-          <button onClick={saveVehicle} disabled={vehicleSaving} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{vehicleSaving ? 'Saving…' : 'Save vehicle'}</button>
-          {vehicleMsg && <p className={`text-sm ${vehicleMsg.ok ? 'text-green-700' : 'text-red-500'}`}>{vehicleMsg.text}</p>}
-        </div>
-      </div>
+      )}
 
       <div className="rounded-3xl bg-muted p-6">
         <p className="text-sm font-semibold text-foreground">Identity</p>
@@ -2093,7 +2112,7 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
     { id: 'profile', label: 'Profile', icon: <Shield className="size-5" /> },
   ]
   return (
-    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40">
+    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
       <div className="flex items-center justify-around px-2 h-16">
         {items.map(({ id, label, icon }) => {
           const active = view === id
@@ -2436,7 +2455,10 @@ export function Home() {
     try {
       const q = coords ? { pickup_latitude: coords.lat, pickup_longitude: coords.lng, pickup_radius_meters: 80000 } : {}
       const [trips, requests] = await Promise.all([api.searchDriverTrips(q), api.searchRideRequests(q)])
-      setAllListings([...trips.map(tripToListing), ...requests.map(requestToListing)])
+      const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
+      const seenIds = new Set<string>()
+      const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
+      setAllListings(deduped)
     } catch { } finally { setFeedLoading(false) }
   }, [])
 
@@ -2479,13 +2501,14 @@ export function Home() {
   const onConnect = useCallback(async (listing: Listing) => {
     try {
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
+      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation('My location', lat, lng), api.createLocation(listing.to, lat, lng)])
+        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
         conn = await api.createConnection(rr.id, listing.apiId)
       } else {
-        const [p, d] = await Promise.all([api.createLocation('My location', lat, lng), api.createLocation(listing.to, lat, lng)])
+        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
         conn = await api.createConnection(listing.apiId, trip.id)
       }
@@ -2662,7 +2685,7 @@ export function Home() {
         <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} />
       </div>
 
-      <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-24 xl:pb-6">
+      <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
         <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
           <div className="hidden xl:block">
             <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} />

@@ -327,6 +327,21 @@ def test_riders_and_drivers_publish_searchable_one_off_listings() -> None:
     assert requests[0]["rider_name"] == "Riley Rider"
 
 
+def test_search_excludes_the_searching_users_own_listings() -> None:
+    # Discover is meant to surface *other* people's rides. Without an
+    # explicit self-exclusion clause, a driver's own trip (or a rider's own
+    # request) would show up in their own feed alongside everyone else's —
+    # "My Listings" is the dedicated place to manage your own posts.
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+
+    trips = api.get("/driver-trips/search", headers=driver_headers).json()
+    requests = api.get("/ride-requests/search", headers=rider_headers).json()
+
+    assert driver_trip["id"] not in {t["id"] for t in trips}
+    assert ride_request["id"] not in {r["id"] for r in requests}
+
+
 def test_search_excludes_listings_with_a_past_target_date() -> None:
     # Search must never show a stale listing on its own, regardless of
     # whether the hourly expire sweep has run yet — a driver/rider shouldn't

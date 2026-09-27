@@ -87,7 +87,7 @@ export function FilterSheet({
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" role="dialog" aria-modal="true" aria-label="Filters">
       <div className="absolute inset-0 bg-foreground/40 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl p-5 pb-8 space-y-5 max-h-[80vh] overflow-y-auto">
+      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl p-5 pb-[calc(env(safe-area-inset-bottom)+2rem)] space-y-5 max-h-[80vh] overflow-y-auto">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-foreground">Filters</h2>
           <button onClick={onClose} aria-label="Close filters" className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-colors">
@@ -235,7 +235,7 @@ export function ViewToggleFab({ onClick }: { onClick: () => void }) {
     <button
       onClick={onClick}
       aria-label="Switch to map view"
-      className="fixed bottom-20 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-5 py-3 rounded-full bg-foreground text-background text-sm font-semibold shadow-xl active:scale-95 transition-transform"
+      className="fixed bottom-[calc(var(--bottom-nav-h)+1rem)] left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-5 py-3 rounded-full bg-foreground text-background text-sm font-semibold shadow-xl active:scale-95 transition-transform"
     >
       <MapIcon className="size-4" /> Map View
     </button>
@@ -253,7 +253,7 @@ export function OfferRideFab({ mode, onClick }: { mode: 'rider' | 'driver'; onCl
       onClick={onClick}
       aria-label={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
       title={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
-      className="fixed bottom-20 right-4 z-30 size-14 rounded-full bg-primary text-primary-foreground shadow-xl active:scale-95 transition-transform flex items-center justify-center"
+      className="fixed bottom-[calc(var(--bottom-nav-h)+1rem)] right-4 z-30 size-14 rounded-full bg-primary text-primary-foreground shadow-xl active:scale-95 transition-transform flex items-center justify-center"
     >
       <Plus className="size-6" />
     </button>
