@@ -514,7 +514,7 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
       )}
 
       {listing.notes && (
-        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 line-clamp-3">{listing.notes}</p>
+        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 whitespace-pre-wrap">{listing.notes}</p>
       )}
 
       {isOwn ? (
@@ -2501,7 +2501,16 @@ export function Home() {
     } catch { } finally { setFeedLoading(false) }
   }, [])
 
-  useEffect(() => { if (currentUser) loadListings(userCoords) }, [currentUser, userCoords, loadListings])
+  // Another user's new post has no way to push into an already-open Discover
+  // tab — refetch whenever Discover becomes the active view (not just once on
+  // mount/coords), and keep polling while it stays active so a listing posted
+  // while you're already browsing shows up without a manual reload.
+  useEffect(() => {
+    if (!currentUser || view !== 'feed') return
+    loadListings(userCoords)
+    const id = setInterval(() => loadListings(userCoords), 20000)
+    return () => clearInterval(id)
+  }, [currentUser, view, userCoords, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
   const filteredListings = useMemo(() => {
@@ -2767,7 +2776,7 @@ export function Home() {
                 <OfferRideFab mode={mode} onClick={() => setView('post')} />
               </>
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} />}
