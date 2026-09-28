@@ -2489,11 +2489,15 @@ export function Home() {
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
 
   // ── Feed ──
-  const loadListings = useCallback(async (coords?: { lat: number; lng: number } | null) => {
+  // Deliberately no pickup-radius pre-filter: Discover should show every
+  // active listing (minus your own, blocked users, and suspended accounts —
+  // already enforced server-side) so the destination search bar and filter
+  // sheet are what narrow the list, not a silent, invisible GPS distance
+  // cutoff a listing could fall just outside of with no indication why.
+  const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const q = coords ? { pickup_latitude: coords.lat, pickup_longitude: coords.lng, pickup_radius_meters: 80000 } : {}
-      const [trips, requests] = await Promise.all([api.searchDriverTrips(q), api.searchRideRequests(q)])
+      const [trips, requests] = await Promise.all([api.searchDriverTrips({}), api.searchRideRequests({})])
       const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
@@ -2503,14 +2507,14 @@ export function Home() {
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
-  // mount/coords), and keep polling while it stays active so a listing posted
-  // while you're already browsing shows up without a manual reload.
+  // mount), and keep polling while it stays active so a listing posted while
+  // you're already browsing shows up without a manual reload.
   useEffect(() => {
     if (!currentUser || view !== 'feed') return
-    loadListings(userCoords)
-    const id = setInterval(() => loadListings(userCoords), 20000)
+    loadListings()
+    const id = setInterval(loadListings, 20000)
     return () => clearInterval(id)
-  }, [currentUser, view, userCoords, loadListings])
+  }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
   const filteredListings = useMemo(() => {
