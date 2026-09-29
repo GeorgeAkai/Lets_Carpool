@@ -69,6 +69,8 @@ interface Connection {
   pickupLat?: number; pickupLng?: number; pickupLabel?: string
   destLat?: number; destLng?: number; destLabel?: string
   riderPickupLat?: number; riderPickupLng?: number; riderPickupLabel?: string
+  // Driver's reported leg of an accepted ride (for the rider's "on the way").
+  tripPhase?: 'pickup' | 'dropoff' | null
 }
 
 interface LocationValue {
@@ -371,6 +373,7 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
     riderPickupLat: conn.ride_request.pickup.latitude,
     riderPickupLng: conn.ride_request.pickup.longitude,
     riderPickupLabel: conn.ride_request.pickup.label,
+    tripPhase: conn.trip_phase ?? null,
   }
 }
 
@@ -1425,7 +1428,7 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
 // ─── Connection card ──────────────────────────────────────────────────────────
 
 function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat,
+  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onTrackDriver, onOpenChat,
   autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
@@ -1434,6 +1437,7 @@ function ConnectionCard({
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
+  onTrackDriver: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
   autoOpen?: 'gassplit' | null
   isActive: boolean
@@ -1560,6 +1564,12 @@ function ConnectionCard({
             {connection.myRole === 'driver' && hasRiderPickupCoords && (
               <button onClick={() => onStartDriving(connection)} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-emerald-700 transition-colors">
                 <Car className="size-4" />Go pick up {connection.withUser.name.split(' ')[0]}
+              </button>
+            )}
+            {connection.myRole === 'rider' && hasRiderPickupCoords && (
+              <button onClick={() => onTrackDriver(connection)} className={`flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors ${connection.tripPhase ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-card border border-border text-foreground hover:bg-muted'}`}>
+                <MapPin className="size-4" />
+                {connection.tripPhase === 'pickup' ? 'Driver on the way — track' : connection.tripPhase === 'dropoff' ? 'On your way — track' : 'Track driver'}
               </button>
             )}
             <div className="basis-full flex flex-wrap gap-2">
@@ -1746,13 +1756,14 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, deepLink }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onTrackDriver, onOpenChat, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
+  onTrackDriver: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
   deepLink?: { connectionId: string; section: 'gassplit' } | null
 }) {
@@ -1782,7 +1793,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat}
+              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onTrackDriver={onTrackDriver} onOpenChat={onOpenChat}
               autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
               isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
@@ -2615,6 +2626,16 @@ export function Home() {
 
   useEffect(() => { if (currentUser) loadConnections(currentUser.id) }, [currentUser, loadConnections])
 
+  // Websocket pushes don't survive serverless hosting, so refresh the Inbox
+  // whenever it's opened and every 30s while it's open and visible — that's
+  // how a rider sees "accepted" or "driver on the way" without reloading.
+  useEffect(() => {
+    if (!currentUser || view !== 'connections') return
+    loadConnections(currentUser.id)
+    const id = setInterval(() => { if (document.visibilityState === 'visible') loadConnections(currentUser.id) }, 30000)
+    return () => clearInterval(id)
+  }, [currentUser, view, loadConnections])
+
   // ── My Listings ──
   const loadMyListings = useCallback(async () => {
     try {
@@ -2790,27 +2811,48 @@ export function Home() {
       dropoff: conn.destLat && conn.destLng ? { lat: conn.destLat, lng: conn.destLng, label: conn.destLabel ?? 'Destination' } : undefined,
     })
     setView('map')
-    // Let the rider know to get ready (shows up in their chat + notifications).
-    api.sendMessage(conn.id, "🚗 I'm on my way to pick you up.").catch(() => {})
+    // Let the rider know to get ready (shows up in their chat + notifications),
+    // and that their map can follow the car.
+    api.setTripPhase(conn.id, 'pickup').catch(() => {})
+    api.sendMessage(conn.id, "🚗 I'm on my way to pick you up — tap Track driver in your Inbox to follow me.").catch(() => {})
+  }, [])
+
+  // Rider: follow the driver's car on the map — to your pickup, then (once
+  // the driver reports you're on board) to the destination.
+  const onTrackDriver = useCallback((conn: Connection) => {
+    if (!conn.riderPickupLat || !conn.riderPickupLng) return
+    setTripRoute(null)
+    setDrivingTo({
+      connectionId: conn.id, phase: 'pickup', watchOnly: true,
+      targetLat: conn.riderPickupLat, targetLng: conn.riderPickupLng,
+      targetLabel: conn.riderPickupLabel ?? 'Your pickup', partnerName: conn.withUser.name,
+      dropoff: conn.destLat && conn.destLng ? { lat: conn.destLat, lng: conn.destLng, label: conn.destLabel ?? 'Destination' } : undefined,
+    })
+    setView('map')
   }, [])
 
   const onPickedUp = useCallback(() => {
+    if (drivingTo) api.setTripPhase(drivingTo.connectionId, 'dropoff').catch(() => {})
     setDrivingTo(prev => {
       if (!prev) return null
       if (!prev.dropoff) { showToast('Picked up — no destination on file to navigate to', 'error'); return null }
       return { ...prev, phase: 'dropoff', targetLat: prev.dropoff.lat, targetLng: prev.dropoff.lng, targetLabel: prev.dropoff.label }
     })
-  }, [showToast])
+  }, [drivingTo, showToast])
 
   const onStopDriving = useCallback(() => {
+    // Only the driver's own navigation reports a phase; a rider closing the
+    // tracking view changes nothing for anyone else.
+    if (drivingTo && !drivingTo.watchOnly) api.setTripPhase(drivingTo.connectionId, null).catch(() => {})
     setDrivingTo(null)
-    showToast('Trip navigation ended', 'success')
-  }, [showToast])
+    showToast(drivingTo?.watchOnly ? 'Stopped tracking' : 'Trip navigation ended', 'success')
+  }, [drivingTo, showToast])
 
   const onArrived = useCallback(async () => {
     const connectionId = drivingTo?.connectionId
     setDrivingTo(null)
     if (!connectionId) return
+    api.setTripPhase(connectionId, null).catch(() => {})
     try { await onComplete(connectionId); showToast('Ride completed — thanks for driving!', 'success') }
     catch (e) { showToast(e instanceof Error ? e.message : 'Could not complete the ride', 'error') }
     setView('connections')
@@ -2977,7 +3019,7 @@ export function Home() {
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onTrackDriver={onTrackDriver} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}

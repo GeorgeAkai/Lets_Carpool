@@ -78,6 +78,8 @@ export type ApiConnection = {
   ride_request: ApiRideRequest;
   driver_trip: ApiDriverTrip;
   completed_confirmed_by?: string[];
+  // "pickup" = driver heading to the rider, "dropoff" = rider on board.
+  trip_phase?: "pickup" | "dropoff" | null;
   rider_profile?: ApiProfile | null;
   driver_profile?: ApiProfile | null;
 };
@@ -412,6 +414,25 @@ export type ApiMessage = {
   kind: "canned" | "free_text";
   created_at: string;
 };
+
+// ─── Live ride tracking ───────────────────────────────────────────────────────
+
+export type TripPhase = "pickup" | "dropoff";
+
+export type RideDriverLocation = {
+  trip_phase: TripPhase | null;
+  location: { latitude: number; longitude: number; heading: number | null; speed_kmh: number | null; updated_at: string } | null;
+};
+
+// Driver only: tells the rider's map which leg the driver is on.
+export function setTripPhase(connectionId: string, phase: TripPhase | null): Promise<unknown> {
+  return request("POST", `/connections/${connectionId}/trip-phase`, { phase });
+}
+
+// Rider (or driver) of an accepted ride: the driver's latest position.
+export function getRideDriverLocation(connectionId: string): Promise<RideDriverLocation> {
+  return request<RideDriverLocation>("GET", `/connections/${connectionId}/driver-location`);
+}
 
 export function getMessages(connectionId: string): Promise<ApiMessage[]> {
   return request<ApiMessage[]>("GET", `/connections/${connectionId}/messages`);

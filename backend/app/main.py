@@ -131,6 +131,11 @@ class ConnectionAction(BaseModel):
     action: str
 
 
+class TripPhaseUpdate(BaseModel):
+    # "pickup" = driving to the rider, "dropoff" = rider on board, None = not driving.
+    phase: str | None = None
+
+
 class ExpireRequest(BaseModel):
     today: date
 
@@ -446,6 +451,18 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "status": connection.status,
         })
         return serialize_connection(app.state.store, connection)
+
+    # ── Live ride tracking ────────────────────────────────────────────────────
+
+    @app.post("/connections/{connection_id}/trip-phase")
+    def set_trip_phase(connection_id: str, payload: TripPhaseUpdate, user: CurrentUser) -> dict[str, Any]:
+        connection = app.state.store.set_trip_phase(user.id, connection_id, payload.phase)
+        return {"connection_id": connection.id, "trip_phase": connection.trip_phase}
+
+    @app.get("/connections/{connection_id}/driver-location")
+    def get_ride_driver_location(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        # Polled by the rider's map (serverless hosting can't hold websockets).
+        return app.state.store.get_ride_driver_location(user.id, connection_id)
 
     @app.post("/connections/{connection_id}/messages")
     async def add_message(connection_id: str, payload: MessageCreate, user: CurrentUser) -> dict[str, Any]:

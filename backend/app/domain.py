@@ -173,6 +173,9 @@ class Connection:
     created_at: datetime
     updated_at: datetime
     completed_confirmed_by: list[str] = field(default_factory=list)
+    # Where the driver is in the ride, set from their navigation: "pickup"
+    # (on the way to the rider), "dropoff" (rider on board), or None.
+    trip_phase: str | None = None
 
 
 @dataclass
@@ -365,6 +368,7 @@ def _row_to_connection(r: dict) -> Connection:
         status=r["status"], created_at=r["created_at"],
         updated_at=r["updated_at"],
         completed_confirmed_by=list(r["completed_confirmed_by"] or []),
+        trip_phase=r.get("trip_phase"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -1333,6 +1337,59 @@ class Store:
                 (user_id, loc.longitude, loc.latitude, loc.heading, loc.speed_kmh, loc.updated_at),
             )
         return loc
+
+    # ─── Live ride tracking ───────────────────────────────────────────────────
+    # Only the two people on an accepted connection can see where its driver
+    # is — never anyone else, and never before the rider has been accepted.
+
+    TRIP_PHASES = {"pickup", "dropoff"}
+
+    def _accepted_connection_parties(self, connection_id: str) -> tuple[Connection, str, str]:
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        return connection, rr.rider_id, trip.driver_id
+
+    def set_trip_phase(self, user_id: str, connection_id: str, phase: str | None) -> Connection:
+        connection, _, driver_id = self._accepted_connection_parties(connection_id)
+        if user_id != driver_id:
+            raise DomainError("Only the driver can update the trip", 403)
+        if connection.status != "accepted":
+            raise DomainError("Only accepted rides can be tracked")
+        if phase is not None and phase not in self.TRIP_PHASES:
+            raise DomainError(f"Invalid trip phase: {phase}")
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE connections SET trip_phase = %s, updated_at = %s WHERE id = %s",
+                (phase, now_utc(), connection_id),
+            )
+        connection.trip_phase = phase
+        return connection
+
+    def get_ride_driver_location(self, user_id: str, connection_id: str) -> dict[str, Any] | None:
+        connection, rider_id, driver_id = self._accepted_connection_parties(connection_id)
+        if user_id not in {rider_id, driver_id}:
+            raise DomainError("Connection not found", 404)
+        if connection.status != "accepted":
+            raise DomainError("Live location is only shared for accepted rides", 403)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT ST_Y(geog::geometry) AS latitude, ST_X(geog::geometry) AS longitude,
+                          heading, speed_kmh, updated_at
+                   FROM driver_locations WHERE user_id = %s""",
+                (driver_id,),
+            )
+            row = cur.fetchone()
+        return {
+            "trip_phase": connection.trip_phase,
+            "location": None if not row else {
+                "latitude": row["latitude"], "longitude": row["longitude"],
+                "heading": row["heading"], "speed_kmh": row["speed_kmh"],
+                "updated_at": row["updated_at"].isoformat(),
+            },
+        }
 
     def get_nearby_drivers(self, lat: float, lng: float, radius_meters: float = 10000) -> list[dict[str, Any]]:
         stale_before = now_utc() - timedelta(minutes=self.DRIVER_LOCATION_TTL_MINUTES)

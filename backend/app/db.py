@@ -304,6 +304,10 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
+    # Live ride tracking: where the driver is in an accepted ride ("pickup" /
+    # "dropoff" / NULL), so the rider's map knows what the driver is heading to.
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS trip_phase TEXT")
+
     # One-time backfill when for_connection is first added: flag listings the
     # app created to back connections before the flag existed. The app always
     # created a fresh listing on the initiator's side when connecting, so the

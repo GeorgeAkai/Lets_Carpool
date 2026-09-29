@@ -306,6 +306,40 @@ def test_profile_and_driver_readiness_are_editable_without_document_uploads() ->
     assert "document" not in vehicle
 
 
+def test_rider_can_track_their_driver_only_on_an_accepted_ride() -> None:
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    _, stranger_headers = auth(api, "stranger@example.com", "Stranger")
+    connection = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    }).json()
+    url = f"/connections/{connection['id']}/driver-location"
+
+    # Not before the driver accepts.
+    assert api.get(url, headers=rider_headers).status_code == 403
+    api.post(f"/connections/{connection['id']}/transition", headers=driver_headers, json={"action": "accept"})
+
+    # Accepted, but the driver hasn't set off yet.
+    assert api.get(url, headers=rider_headers).json() == {"trip_phase": None, "location": None}
+
+    # Driver starts the pickup leg and streams their position.
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "pickup"}).status_code == 200
+    api.put("/me/location", headers=driver_headers, json={"latitude": 37.8700, "longitude": -122.2700, "heading": 90})
+    seen = api.get(url, headers=rider_headers).json()
+    assert seen["trip_phase"] == "pickup"
+    assert round(seen["location"]["latitude"], 4) == 37.8700 and round(seen["location"]["longitude"], 4) == -122.2700
+    assert seen["location"]["updated_at"]
+
+    # Only the driver sets the phase; only the two riders on the ride can look.
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=rider_headers, json={"phase": "dropoff"}).status_code == 403
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "teleport"}).status_code == 400
+    assert api.get(url, headers=stranger_headers).status_code == 404
+
+    api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "dropoff"})
+    assert api.get(url, headers=rider_headers).json()["trip_phase"] == "dropoff"
+    assert api.get("/me/connections", headers=rider_headers).json()[0]["trip_phase"] == "dropoff"
+
+
 def test_public_profile_gives_riders_and_drivers_enough_to_judge_trust() -> None:
     # Riders check out a driver before requesting; drivers check out a rider
     # before accepting. Trust signals yes — contact details never.
