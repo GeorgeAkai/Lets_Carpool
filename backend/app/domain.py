@@ -423,6 +423,22 @@ class Store:
         # leaks the old pool's connections instead of releasing them.
         close_pool()
         init_pool(database_url)
+        self._last_search_expiry: datetime | None = None
+
+    # Search archives stale listings itself (see search_driver_trips), but
+    # Discover polls it continuously — running that UPDATE on every request
+    # kept the database busy around the clock. Once per interval per server
+    # instance is plenty; the cron and admin expire endpoints still call
+    # expire_listings() directly, and search's own date filter hides stale
+    # rows regardless.
+    SEARCH_EXPIRY_INTERVAL = timedelta(minutes=10)
+
+    def _expire_listings_if_due(self) -> None:
+        now = now_utc()
+        if self._last_search_expiry and now - self._last_search_expiry < self.SEARCH_EXPIRY_INTERVAL:
+            return
+        self.expire_listings(now.date())
+        self._last_search_expiry = now
 
     def _cur(self, conn):
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -759,9 +775,8 @@ class Store:
         # Actually archive stale listings here too, not just filter them out of
         # this result set — search is the one path guaranteed to run on every
         # page load, so it doesn't depend on the cron sweep (GET /cron/expire)
-        # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
-        # once a listing has already been archived once.
-        self.expire_listings(now_utc().date())
+        # actually being scheduled yet. Throttled — see _expire_listings_if_due.
+        self._expire_listings_if_due()
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "dt.destination_location_id", "dt.pickup_location_id",
         )
@@ -788,7 +803,7 @@ class Store:
         return [t for t in trips if self._listing_matches_query(t, query)]
 
     def search_ride_requests(self, user_id: str, query: dict[str, Any]) -> list[RideRequest]:
-        self.expire_listings(now_utc().date())
+        self._expire_listings_if_due()
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "rr.destination_location_id", "rr.pickup_location_id",
         )

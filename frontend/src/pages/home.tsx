@@ -2615,6 +2615,9 @@ export function Home() {
   // already enforced server-side) so the destination search bar and filter
   // sheet are what narrow the list, not a silent, invisible GPS distance
   // cutoff a listing could fall just outside of with no indication why.
+  // A failed load used to be swallowed, leaving an empty feed that looked
+  // exactly like "no listings" — keep the last good list, but say so.
+  const [feedError, setFeedError] = useState(false)
   const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
@@ -2623,18 +2626,23 @@ export function Home() {
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
       setAllListings(deduped)
-    } catch { } finally { setFeedLoading(false) }
+      setFeedError(false)
+    } catch { setFeedError(true) } finally { setFeedLoading(false) }
   }, [])
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
   // mount), and keep polling while it stays active so a listing posted while
-  // you're already browsing shows up without a manual reload.
+  // you're already browsing shows up without a manual reload. Polling pauses
+  // while the tab is hidden (a background tab polling forever kept the
+  // database busy around the clock) and catches up as soon as it's visible.
   useEffect(() => {
     if (!currentUser || view !== 'feed') return
     loadListings()
-    const id = setInterval(loadListings, 20000)
-    return () => clearInterval(id)
+    const id = setInterval(() => { if (document.visibilityState === 'visible') loadListings() }, 60000)
+    const onVisible = () => { if (document.visibilityState === 'visible') loadListings() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
@@ -2863,6 +2871,12 @@ export function Home() {
       <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
         <div>
           <main className="min-w-0">
+            {guardedView === 'feed' && feedError && (
+              <div role="alert" className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                <span>Couldn't load listings. Check your connection — what's shown may be out of date.</span>
+                <button onClick={loadListings} className="shrink-0 rounded-lg bg-card px-3 py-1.5 text-xs font-semibold text-foreground border border-border hover:bg-muted transition-colors">Retry</button>
+              </div>
+            )}
             {guardedView === 'feed' && (
               mode === 'driver' ? (
                 <DriverHomeView

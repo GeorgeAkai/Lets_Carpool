@@ -499,6 +499,40 @@ def test_search_excludes_listings_with_a_past_target_date() -> None:
     assert next(r for r in my_requests if r["id"] == past_request["id"])["status"] == "expired"
 
 
+def test_search_archives_stale_listings_at_most_once_per_interval() -> None:
+    # Discover polls search continuously; archiving on every request kept the
+    # database busy around the clock. Stale rows must still be hidden from
+    # results immediately, but the archiving UPDATE is throttled.
+    store = Store(TEST_DATABASE_URL)
+    settings = Settings(database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL, cron_secret=TEST_CRON_SECRET)
+    api = TestClient(create_app(store=store, settings=settings))
+    _, rider_headers = auth(api, "throttle-rider@example.edu", "Throttle Rider")
+    _, driver_headers = auth(api, "throttle-driver@example.com", "Throttle Driver")
+    api.get("/driver-trips/search", headers=rider_headers)  # runs the first sweep
+
+    pickup = location(api, driver_headers, "Cambridge", 42.3736, -71.1097)
+    destination = location(api, driver_headers, "Providence, RI", 41.8240, -71.4128)
+    stale = api.post(
+        "/driver-trips", headers=driver_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": (date.today() - timedelta(days=3)).isoformat(),
+            "flexibility": "morning", "seats_available": 2, "tags": [],
+        },
+    ).json()
+
+    def status() -> str:
+        return next(t for t in api.get("/me/driver-trips", headers=driver_headers).json() if t["id"] == stale["id"])["status"]
+
+    results = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert stale["id"] not in {t["id"] for t in results}
+    assert status() == "open"  # hidden, but not re-swept within the interval
+
+    store._last_search_expiry -= Store.SEARCH_EXPIRY_INTERVAL
+    api.get("/driver-trips/search", headers=rider_headers)
+    assert status() == "expired"
+
+
 def test_search_keeps_yesterdays_listings_visible_as_a_timezone_safety_buffer() -> None:
     # Regression test: a listing dated "yesterday" by the DB server's (UTC)
     # clock can still be "today" for a rider/driver west of UTC — which is

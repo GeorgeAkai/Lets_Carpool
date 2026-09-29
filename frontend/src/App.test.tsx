@@ -229,6 +229,17 @@ describe("Feed view", () => {
     );
   });
 
+  it("says so when listings fail to load instead of showing an empty feed", async () => {
+    // Regression test: a failed search used to be swallowed silently, which
+    // looked exactly like "nobody has posted anything".
+    mockFetch({ "GET /me": ME_RESPONSE });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/couldn't load listings/i));
+    expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
+  });
+
   it("loads ride requests from the API on mount", async () => {
     mockFetch({
       "GET /me": ME_RESPONSE,
