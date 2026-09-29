@@ -110,7 +110,7 @@ export function FilterSheet({
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Category</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-accent/20 text-amber-800 ring-1 ring-accent/40' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-secondary text-secondary-foreground ring-1 ring-primary' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
                 {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}

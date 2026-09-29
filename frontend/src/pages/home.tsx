@@ -4,9 +4,9 @@ import React, {
 } from 'react'
 import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
-  Check, X, Fuel, ChevronRight, Home as HomeIcon, Dot, Bell, LogOut,
+  Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
@@ -440,7 +440,7 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}
-      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-4 hover:shadow-lg hover:shadow-foreground/5 transition-shadow group"
+      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-4 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all group"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -1043,7 +1043,7 @@ function FeedView({
         ))}
         <div className="w-px h-5 bg-border mx-0.5" />
         {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-          <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-accent/20 text-amber-800 ring-1 ring-accent/40' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+          <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-secondary text-secondary-foreground ring-1 ring-primary' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
             {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
           </button>
         ))}
@@ -2108,32 +2108,48 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
-  setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
-  onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
-}) {
+function BrandMark({ size = 'md' }: { size?: 'sm' | 'md' }) {
   return (
-    <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
-      <div className="max-w-[1240px] mx-auto px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
-        <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
+    <span className={`${size === 'sm' ? 'size-7 rounded-lg' : 'size-8 rounded-lg'} bg-primary text-primary-foreground flex items-center justify-center shrink-0`}>
+      <Car className="size-4" />
+    </span>
+  )
+}
+
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode }: {
+  setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
+  onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
+}) {
+  const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
+  return (
+    <header className="sticky top-0 z-40 bg-card text-foreground border-b border-border">
+      <div className="px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
+        <button onClick={() => setView('feed')} className="flex items-center gap-2 xl:hidden">
+          <BrandMark size="sm" />
+          <span className="text-sm font-bold text-foreground">Let's Carpool</span>
+        </button>
+        <div className="hidden xl:flex items-center gap-2">
+          <span className="text-sm font-semibold text-muted-foreground">Riding as</span>
+          <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{mode === 'driver' ? '🚗 Driver' : '🧍 Rider'}</span>
+        </div>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={() => setView('notifications')} className="relative p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Notifications">
-              <Bell className="size-5" />
-              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[10px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
+            <button onClick={() => setView('notifications')} className={`relative ${iconBtn}`} aria-label="Notifications">
+              <Bell className="size-4" />
+              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-sidebar-accent text-sidebar-foreground text-xs font-semibold flex items-center justify-center hover:ring-2 hover:ring-sidebar-primary/40 transition-all" aria-label="Account" style={MONO}>{initials}</button>
-            <button onClick={onSignOut} className="flex items-center gap-1.5 p-2 xl:px-3 xl:py-1.5 rounded-xl text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent transition-colors" aria-label="Sign out"><LogOut className="size-5 xl:size-4" /><span className="hidden xl:inline">Sign out</span></button>
+            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>{initials}</button>
+            <button onClick={onSignOut} className={iconBtn} aria-label="Sign out"><LogOut className="size-4" /></button>
           </div>
         ) : (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-2xl bg-sidebar-primary text-white text-sm font-semibold hover:opacity-90 transition-colors">Sign in</button>
+            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Sign in</button>
           </div>
         )}
       </div>
@@ -2171,42 +2187,51 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   )
 }
 
-function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) => void; onSignOut: () => void }) {
-  const items: Array<{ id: View; label: string }> = [
-    { id: 'feed', label: 'Discover' }, { id: 'map', label: 'Live Map' }, { id: 'pools', label: 'Pools' },
-    { id: 'post', label: 'Post' }, { id: 'my-listings', label: 'My Rides' },
-    { id: 'connections', label: 'Connections' }, { id: 'notifications', label: 'Notifications' }, { id: 'profile', label: 'Profile' },
+function Sidebar({ view, setView, onSignOut, unreadCount }: { view: View; setView: (v: View) => void; onSignOut: () => void; unreadCount: number }) {
+  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
+    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
+    { id: 'map', label: 'Live Map', icon: <MapPin className="size-5" /> },
+    { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
+    { id: 'post', label: 'Post', icon: <PlusCircle className="size-5" /> },
+    { id: 'my-listings', label: 'My Rides', icon: <Calendar className="size-5" /> },
+    { id: 'connections', label: 'Connections', icon: <MessageCircle className="size-5" /> },
+    { id: 'notifications', label: 'Notifications', icon: <Bell className="size-5" /> },
+    { id: 'profile', label: 'Profile', icon: <User className="size-5" /> },
   ]
   return (
-    <aside className="bg-sidebar border border-sidebar-border rounded-[2rem] p-6 xl:h-fit">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <p className="text-sm text-sidebar-foreground/60">Carpooling app</p>
-          <h1 className="mt-2 text-2xl font-semibold text-sidebar-foreground">Let's Carpool</h1>
-        </div>
-        <div className="rounded-3xl bg-sidebar-primary px-3 py-2 text-white text-xs font-semibold">MVP</div>
+    <aside className="fixed left-0 top-0 bottom-0 w-60 z-30 flex flex-col bg-sidebar text-sidebar-foreground">
+      <div className="flex items-center gap-2.5 px-5 py-5 border-b border-sidebar-border">
+        <BrandMark />
+        <span className="text-sm font-semibold">Let's Carpool</span>
       </div>
-      <div className="mt-8 space-y-1.5">
-        {items.map(item => (
-          <button key={item.id} type="button" onClick={() => setView(item.id)} className={`w-full rounded-3xl px-4 py-3 text-left text-sm font-medium transition-all ${view === item.id ? 'bg-sidebar-primary text-white shadow-lg shadow-sidebar-primary/20' : 'text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
-            {item.label}
-          </button>
-        ))}
-        <button type="button" onClick={onSignOut} className="w-full rounded-3xl px-4 py-3 text-left text-sm font-medium text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-all flex items-center gap-2"><LogOut className="size-4" />Sign out</button>
+      <nav className="flex-1 py-4 px-3 flex flex-col gap-0.5 overflow-y-auto">
+        {items.map(item => {
+          const active = view === item.id
+          return (
+            <button
+              key={item.id} type="button" onClick={() => setView(item.id)}
+              aria-current={active ? 'page' : undefined}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium w-full text-left transition-colors ${active ? 'bg-sidebar-primary text-sidebar-primary-foreground' : 'text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+            >
+              <span className={active ? '' : 'text-sidebar-foreground/50'}>{item.icon}</span>
+              <span>{item.label}</span>
+              {item.id === 'notifications' && unreadCount > 0 && (
+                <span className="ml-auto min-w-5 text-center text-xs font-bold px-1.5 py-0.5 rounded-full bg-destructive text-white">{unreadCount > 9 ? '9+' : unreadCount}</span>
+              )}
+            </button>
+          )
+        })}
+      </nav>
+      <div className="px-3 pb-2">
+        <div className="rounded-xl p-3 text-xs bg-white/5 text-sidebar-foreground/50">
+          New here?{' '}
+          <button type="button" className="text-xs underline text-sidebar-foreground/80" onClick={() => setView('post')}>Post your first listing →</button>
+        </div>
       </div>
-      <div className="mt-8 rounded-[2rem] bg-card p-6 shadow-[0_36px_60px_-40px_rgba(0,0,0,0.18)]">
-        <div className="flex items-center gap-3">
-          <div className="rounded-2xl bg-primary/10 p-3 text-primary"><HomeIcon className="size-5" /></div>
-          <div>
-            <p className="text-sm text-muted-foreground">Quick start</p>
-            <p className="text-sm font-semibold text-foreground">Browse listings, post trips, and manage matches.</p>
-          </div>
-        </div>
-        <div className="mt-6 space-y-3 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2"><Dot className="size-2" />Search and filter rides across the marketplace.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Post one-off ride requests or driver trips.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Track pending connections and confirm gas split.</div>
-        </div>
+      <div className="px-3 pb-4">
+        <button type="button" onClick={onSignOut} className="flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm w-full text-sidebar-foreground/40 hover:bg-sidebar-accent hover:text-sidebar-foreground/70 transition-colors">
+          <LogOut className="size-4" />Sign out
+        </button>
       </div>
     </aside>
   )
@@ -2219,28 +2244,36 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
 
 function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
   const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
-    { mode: 'rider', icon: <Users className="size-7" />, title: 'I need a ride', desc: 'Find drivers heading your way.' },
-    { mode: 'driver', icon: <Car className="size-7" />, title: "I'm offering a ride", desc: 'Publish your route and find riders.' },
+    { mode: 'rider', icon: <Users className="size-8" />, title: 'I need a ride', desc: 'Find drivers heading your way and request a seat.' },
+    { mode: 'driver', icon: <Car className="size-8" />, title: "I'm offering a ride", desc: 'Publish your route, pick up riders, and split costs.' },
   ]
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-8 px-6 py-12 text-center">
-      <div>
-        <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground">How are you riding today?</h1>
-        <p className="mt-2 text-muted-foreground max-w-sm mx-auto">Choose how you'll use Carpool this session — you can switch anytime from Profile.</p>
-      </div>
-      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
-        {options.map(({ mode: m, icon, title, desc }) => (
-          <button
-            key={m}
-            type="button"
-            onClick={() => onChoose(m)}
-            className="flex-1 rounded-3xl border border-border bg-card p-6 text-left hover:border-primary/40 hover:shadow-lg transition-all"
-          >
-            <span className="inline-flex rounded-2xl bg-primary/10 p-3 text-primary">{icon}</span>
-            <h2 className="mt-4 text-lg font-semibold text-foreground">{title}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">{desc}</p>
-          </button>
-        ))}
+    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center px-4 py-10">
+      <div className="w-full max-w-lg">
+        <div className="mb-8">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="size-10 rounded-xl bg-primary text-primary-foreground flex items-center justify-center"><Car className="size-5" /></span>
+            <span className="text-sm font-semibold text-primary">Let's Carpool</span>
+          </div>
+          <h1 style={SERIF} className="text-3xl leading-tight text-foreground">How are you riding today?</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Choose your role for this session — you can switch anytime from your Profile.</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {options.map(({ mode: m, icon, title, desc }) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => onChoose(m)}
+              className="flex flex-col items-start gap-4 rounded-2xl border-2 border-border bg-card p-6 text-left shadow-sm hover:border-primary hover:-translate-y-0.5 hover:shadow-lg hover:shadow-primary/15 transition-all"
+            >
+              <span className="size-14 rounded-xl bg-secondary text-secondary-foreground flex items-center justify-center">{icon}</span>
+              <span>
+                <span className="block text-base font-bold leading-snug text-foreground">{title}</span>
+                <span className="block mt-1 text-sm leading-relaxed text-muted-foreground">{desc}</span>
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -2720,7 +2753,7 @@ export function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col">
+    <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
@@ -2734,14 +2767,13 @@ export function Home() {
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
       <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
-        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} />
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
-      <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
-        <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
-          <div className="hidden xl:block">
-            <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} />
-          </div>
+      {!isMobile && <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} unreadCount={unreadCount} />}
+
+      <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
+        <div>
           <main className="min-w-0">
             {guardedView === 'feed' && (
               mode === 'driver' ? (

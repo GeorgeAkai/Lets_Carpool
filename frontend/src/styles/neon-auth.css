@@ -8,12 +8,21 @@
   --neon-radius: var(--radius);
   font-family: 'Outfit', sans-serif;
 
-  /* Suppress the default card shadow/bg since we wrap with our own card */
-  & [class*="card"] {
+  /* Suppress the default card shadow/bg since we wrap with our own card.
+     Keyed on data-slot rather than [class*="card"], which also matched (and
+     blanked out) our own wrapper's bg-card utility. */
+  & [data-slot="card"] {
     box-shadow: none !important;
     background: transparent !important;
     border: none !important;
     padding: 0 !important;
+    max-width: none !important;
+  }
+
+  & [data-slot="card-header"],
+  & [data-slot="card-content"],
+  & [data-slot="card-footer"] {
+    padding-inline: 0 !important;
   }
 }
 
@@ -43,6 +52,7 @@
   font-family: 'Outfit', sans-serif;
   font-weight: 600;
   letter-spacing: 0;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 /* Social buttons */

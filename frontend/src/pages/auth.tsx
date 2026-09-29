@@ -28,7 +28,7 @@ export function Auth() {
       </div>
 
       {/* Centered content column */}
-      <div className="relative w-full max-w-[440px] mx-auto flex flex-col gap-6">
+      <div className="relative w-full max-w-sm mx-auto flex flex-col gap-6">
 
         {/* Brand header */}
         <div className="text-center">
@@ -40,7 +40,7 @@ export function Auth() {
         </div>
 
         {/* Auth card */}
-        <div className="overflow-hidden rounded-3xl border border-border bg-card shadow-2xl shadow-foreground/[0.06]">
+        <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
           <div className="p-7">
             <AuthView pathname={pathname} />
           </div>
@@ -49,8 +49,8 @@ export function Auth() {
         {/* Feature tiles */}
         <div className="grid grid-cols-3 gap-3">
           {FEATURES.map(({ Icon, title, desc }) => (
-            <div key={title} className="flex flex-col items-center gap-2 rounded-2xl bg-muted/60 p-3 text-center">
-              <div className="flex size-8 items-center justify-center rounded-xl bg-primary/10">
+            <div key={title} className="flex flex-col items-center gap-2 rounded-xl bg-secondary p-3 text-center">
+              <div className="flex size-8 items-center justify-center rounded-xl bg-card/70">
                 <Icon className="size-4 text-primary" />
               </div>
               <div>
