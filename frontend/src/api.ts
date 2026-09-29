@@ -499,8 +499,18 @@ export type ApiPublicProfile = {
   display_name: string;
   photo_url: string | null;
   photo_verified: boolean;
+  bio?: string | null;
   interests: string[];
   nationality: string | null;
+  // Trust signals (optional so older backends still type-check).
+  email_domain?: string;
+  member_since?: string;
+  completed_rides?: { as_driver: number; as_rider: number };
+  vehicle?: {
+    make: string | null; model: string | null; color: string | null;
+    seats: number | null; car_type: string | null;
+    has_license: boolean; has_insurance: boolean; has_good_driving_record: boolean;
+  } | null;
 };
 
 export function getUserProfile(targetUserId: string): Promise<ApiPublicProfile> {

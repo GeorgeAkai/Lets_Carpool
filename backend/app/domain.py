@@ -875,6 +875,24 @@ class Store:
             raise DomainError("Only the rider or driver can initiate this connection", 403)
         if self.is_blocked(rr.rider_id, trip.driver_id):
             raise DomainError("Blocked users cannot connect", 403)
+        # One live connection per pair of people per day — whichever of them
+        # is the rider. Without this, a driver offering on the request the
+        # rider's own "Request to join" had created left the two of them with
+        # two connections (and two chats) for the same ride.
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT 1 FROM connections c
+                   JOIN ride_requests r ON r.id = c.ride_request_id
+                   JOIN driver_trips t ON t.id = c.driver_trip_id
+                   WHERE c.status IN ('pending', 'accepted')
+                     AND t.target_date = %s
+                     AND ((r.rider_id = %s AND t.driver_id = %s) OR (r.rider_id = %s AND t.driver_id = %s))
+                   LIMIT 1""",
+                (trip.target_date, rr.rider_id, trip.driver_id, trip.driver_id, rr.rider_id),
+            )
+            if cur.fetchone():
+                raise DomainError("You already have an active connection with this person for that day — check your Inbox.", 409)
 
         conn_obj = Connection(
             id=new_id("con"), ride_request_id=rr.id,
@@ -1451,6 +1469,24 @@ class Store:
                 (user_a, user_b, user_b, user_a),
             )
             return cur.fetchone() is not None
+
+    def completed_ride_counts(self, user_id: str) -> dict[str, int]:
+        """Completed rides this user took part in, split by role — a trust
+        signal shown on their public profile."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT
+                       COUNT(*) FILTER (WHERE t.driver_id = %s) AS as_driver,
+                       COUNT(*) FILTER (WHERE r.rider_id = %s) AS as_rider
+                   FROM connections c
+                   JOIN ride_requests r ON r.id = c.ride_request_id
+                   JOIN driver_trips t ON t.id = c.driver_trip_id
+                   WHERE c.status = 'completed' AND (t.driver_id = %s OR r.rider_id = %s)""",
+                (user_id, user_id, user_id, user_id),
+            )
+            row = cur.fetchone() or {}
+            return {"as_driver": int(row.get("as_driver") or 0), "as_rider": int(row.get("as_rider") or 0)}
 
     # ─── Admin ────────────────────────────────────────────────────────────────
 

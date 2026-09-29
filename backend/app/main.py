@@ -538,17 +538,34 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.get("/users/{target_user_id}/profile")
     def get_user_profile(target_user_id: str, user: CurrentUser) -> dict[str, Any]:
-        _ = user
-        profile = app.state.store.get_profile(target_user_id)
-        if not profile:
+        # What riders and drivers see about each other before deciding to
+        # request or accept a ride: enough to judge trust, never contact
+        # details (email/phone stay private).
+        store = app.state.store
+        profile = store.get_profile(target_user_id)
+        if not profile or store.is_blocked(user.id, target_user_id):
             raise HTTPException(status_code=404, detail="Profile not found")
+        target = store.user_for_id(target_user_id)
+        if target.status == "suspended":
+            raise HTTPException(status_code=404, detail="Profile not found")
+        vehicle = store.get_vehicle(target_user_id)
         return {
             "user_id": profile.user_id,
             "display_name": profile.display_name,
             "photo_url": profile.photo_url,
             "photo_verified": profile.photo_verified,
+            "bio": profile.bio,
             "interests": profile.interests,
             "nationality": profile.nationality,
+            "email_domain": target.email_domain,
+            "member_since": target.created_at.isoformat(),
+            "completed_rides": store.completed_ride_counts(target_user_id),
+            "vehicle": None if not vehicle else {
+                "make": vehicle.make, "model": vehicle.model, "color": vehicle.color,
+                "seats": vehicle.seats, "car_type": vehicle.car_type,
+                "has_license": vehicle.has_license, "has_insurance": vehicle.has_insurance,
+                "has_good_driving_record": vehicle.has_good_driving_record,
+            },
         }
 
     # ── User actions ──────────────────────────────────────────────────────────

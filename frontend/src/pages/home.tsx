@@ -23,6 +23,7 @@ import {
   ViewToggleFab, OfferRideFab,
 } from './discover-mobile'
 import { AdminView } from './admin'
+import { ProfileAvatar, ProfileSheetProvider, useOpenProfile, type ProfileTarget } from './profile-sheet'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -485,16 +486,21 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
   const luggage = isDriver ? listing.luggageCapacity : listing.luggageSize
+  const openProfile = useOpenProfile()
+  const profileTarget: ProfileTarget = {
+    userId: listing.ownerId, name: listing.user.name, photoUrl: listing.user.photoUrl, role: isDriver ? 'driver' : 'rider',
+    action: isOwn || alreadyConnected ? undefined : { label: isDriver ? 'Request to join' : 'Offer a ride', onClick: () => onConnect(listing) },
+  }
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}
       className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
       <div className="flex items-start gap-3">
-        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
+        <ProfileAvatar target={profileTarget} size={40} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm font-semibold">{listing.user.name}</span>
+            <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold hover:underline">{listing.user.name}</button>
             {listing.user.verified && (
               <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0" title="Verified">
                 <Check className="size-2.5 text-primary" />
@@ -689,13 +695,18 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   const [expanded, setExpanded] = useState(false)
   const [requesting, setRequesting] = useState(false)
   const name = profile?.display_name ?? listing.user.name
-  const initials = toInitials(name)
+  const openProfile = useOpenProfile()
 
   const handleRequest = async () => {
     setRequesting(true)
     try { await onConnect(listing); showToast('Match requested!', 'success') }
     catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
     finally { setRequesting(false) }
+  }
+  const profileTarget: ProfileTarget = {
+    userId: listing.ownerId, name, photoUrl: profile?.photo_url ?? listing.user.photoUrl,
+    role: isDriverListing ? 'driver' : 'rider',
+    action: alreadyConnected ? undefined : { label: 'Instant Request Match', onClick: handleRequest },
   }
 
   return (
@@ -707,14 +718,10 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
         {rank === 0 ? '✨ Top match' : '✨ Best match'}
       </span>
       <div className="flex items-start gap-3 mt-1">
-        {profile?.photo_url ? (
-          <img src={profile.photo_url} alt="" className="size-10 rounded-full object-cover ring-1 ring-border shrink-0" />
-        ) : (
-          <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{initials}</div>
-        )}
+        <ProfileAvatar target={profileTarget} size={40} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm font-semibold truncate">{name}</span>
+            <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold truncate hover:underline">{name}</button>
             {profile?.photo_verified && (
               <span className="size-4 rounded-full bg-emerald-600 flex items-center justify-center shrink-0" title="Photo verified"><Check className="size-2.5 text-white" /></span>
             )}
@@ -828,6 +835,7 @@ function DriverHomeView({
   const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
   const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
   const isMobile = useIsMobile()
+  const openProfile = useOpenProfile()
 
   // Mobile-only: candidates are always ride requests (type 'rider'), so the
   // vehicle-size filter and rider-facing "seats needed" pill never apply here
@@ -939,17 +947,18 @@ function DriverHomeView({
             {matches.map(m => {
               const name = m.profile?.display_name ?? m.listing.user.name
               const l = m.listing
+              const offer = () => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))
+              const profileTarget: ProfileTarget = {
+                userId: l.ownerId, name, photoUrl: m.profile?.photo_url ?? l.user.photoUrl, role: 'rider',
+                action: connectedListingIds.has(l.apiId) ? undefined : { label: 'Offer to drive', onClick: offer },
+              }
               return (
                 <div key={l.id} className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all">
                   <div className="flex items-start gap-3">
-                    {m.profile?.photo_url ? (
-                      <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
-                    ) : (
-                      <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
-                    )}
+                    <ProfileAvatar target={profileTarget} size={40} />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-sm font-semibold">{name}</span>
+                        <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold hover:underline">{name}</button>
                         <span className="text-xs text-muted-foreground">🧍 {l.passengers} passenger{(l.passengers ?? 0) > 1 ? 's' : ''}</span>
                       </div>
                       <RouteLine from={l.from} to={l.to} flexibility={l.flexibility} />
@@ -971,7 +980,7 @@ function DriverHomeView({
                     {connectedListingIds.has(l.apiId) ? (
                       <span className="px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center gap-1.5"><Check className="size-4" />Offered</span>
                     ) : (
-                      <button onClick={() => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
+                      <button onClick={offer} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
                         Offer to drive
                       </button>
                     )}
@@ -1426,6 +1435,13 @@ function ConnectionCard({
   onActivate: () => void
 }) {
   const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | null>(null)
+  const openProfile = useOpenProfile()
+  // The other person on this connection — so a driver can size up a rider
+  // before accepting, and vice versa.
+  const partnerProfile: ProfileTarget = {
+    userId: connection.withUserId, name: connection.withUser.name, photoUrl: connection.withUser.photoUrl,
+    role: connection.myRole === 'driver' ? 'rider' : 'driver',
+  }
 
   // Another card became the active one — collapse this one so only a single
   // panel is ever open across the inbox at a time.
@@ -1489,14 +1505,16 @@ function ConnectionCard({
       <div className="px-5 pt-5 pb-3">
         <div className="flex items-start gap-3">
           <div className="relative shrink-0">
-            <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="card" />
+            <ProfileAvatar target={partnerProfile} size={40} />
             {connection.unreadMessages > 0 && (
-              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
+              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold pointer-events-none">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
             )}
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+              <h2 className="text-sm font-semibold text-foreground truncate">
+                <button type="button" onClick={() => openProfile(partnerProfile)} className="hover:underline">{connection.withUser.name}</button>
+              </h2>
               <ConnStatusBadge status={status} />
               <span className={CHIP}>{connection.myRole === 'driver' ? "You're driving" : "You're riding"}</span>
             </div>
@@ -1517,6 +1535,9 @@ function ConnectionCard({
             <button onClick={handleAccept} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
             <button onClick={handleDecline} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-muted px-4 py-2.5 text-sm font-semibold text-muted-foreground hover:text-foreground disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
             <div className="basis-full flex flex-wrap gap-2">
+              <button onClick={() => openProfile(partnerProfile)} className={GHOST_BTN}>
+                <User className="size-4" />View profile
+              </button>
               <button onClick={() => onOpenChat(connection)} className={`${GHOST_BTN} relative`}>
                 <MessageCircle className="size-4" />Message
                 {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
@@ -1613,6 +1634,11 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
   const [sending, setSending] = useState(false)
   const msgEndRef = useRef<HTMLDivElement>(null)
   const { status } = connection
+  const openProfile = useOpenProfile()
+  const partnerProfile: ProfileTarget = {
+    userId: connection.withUserId, name: connection.withUser.name, photoUrl: connection.withUser.photoUrl,
+    role: connection.myRole === 'driver' ? 'rider' : 'driver',
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -1659,11 +1685,11 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
         <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-muted-foreground hover:text-foreground transition-colors">
           <ChevronLeft className="size-5" />
         </button>
-        <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+        <ProfileAvatar target={partnerProfile} size={36} />
+        <button type="button" onClick={() => openProfile(partnerProfile)} className="min-w-0 text-left">
+          <h2 className="text-sm font-semibold text-foreground truncate hover:underline">{connection.withUser.name}</h2>
           <p className="text-xs text-muted-foreground truncate">{connection.route} · {status === 'pending' ? 'Pending connection' : 'Accepted'}</p>
-        </div>
+        </button>
       </div>
 
       {/* Messages */}
@@ -2210,7 +2236,9 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
               <Bell className="size-4" />
               {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>{initials}</button>
+            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center overflow-hidden hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>
+              {currentUser.profile.photo_url ? <img src={currentUser.profile.photo_url} alt="" className="size-full object-cover" /> : initials}
+            </button>
             <button onClick={onSignOut} className={iconBtn} aria-label="Sign out"><LogOut className="size-4" /></button>
           </div>
         ) : (
@@ -2680,11 +2708,15 @@ export function Home() {
       if (listing.type === 'driver') {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [], for_connection: true })
-        conn = await api.createConnection(rr.id, listing.apiId)
+        // If the connection is refused (e.g. you're already connected with this
+        // person that day), don't leave the backing request behind.
+        try { conn = await api.createConnection(rr.id, listing.apiId) }
+        catch (e) { api.cancelRideRequest(rr.id).catch(() => {}); throw e }
       } else {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [], for_connection: true })
-        conn = await api.createConnection(listing.apiId, trip.id)
+        try { conn = await api.createConnection(listing.apiId, trip.id) }
+        catch (e) { api.cancelDriverTrip(trip.id).catch(() => {}); throw e }
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
       setConnections(prev => [newConn, ...prev]); showToast('Connection created!', 'success'); setView('connections')
@@ -2842,6 +2874,7 @@ export function Home() {
   }
 
   return (
+    <ProfileSheetProvider myInterests={currentUser.profile.interests ?? []}>
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
       <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
@@ -2919,5 +2952,6 @@ export function Home() {
 
       <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} />
     </div>
+    </ProfileSheetProvider>
   )
 }

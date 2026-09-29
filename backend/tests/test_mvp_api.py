@@ -306,6 +306,43 @@ def test_profile_and_driver_readiness_are_editable_without_document_uploads() ->
     assert "document" not in vehicle
 
 
+def test_public_profile_gives_riders_and_drivers_enough_to_judge_trust() -> None:
+    # Riders check out a driver before requesting; drivers check out a rider
+    # before accepting. Trust signals yes — contact details never.
+    api = client()
+    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    api.patch("/me/profile", headers=driver_headers, json={"display_name": "Dee Driver", "bio": "Campus commuter"})
+    api.put("/me/driver-readiness", headers=driver_headers, json={
+        "make": "Toyota", "model": "Prius", "color": "Blue", "seats": 3, "car_type": "sedan",
+        "has_license": True, "has_insurance": True, "has_good_driving_record": False,
+    })
+    connection = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    }).json()
+    api.post(f"/connections/{connection['id']}/transition", headers=rider_headers, json={"action": "accept"})
+    api.post(f"/connections/{connection['id']}/gas-split/confirm", headers=driver_headers,
+             json={"amount_cents": 1200, "currency": "USD", "assumptions": {"manual": True}})
+    api.post(f"/connections/{connection['id']}/transition", headers=rider_headers, json={"action": "complete"})
+
+    seen_by_rider = api.get(f"/users/{driver['id']}/profile", headers=rider_headers)
+    seen_by_driver = api.get(f"/users/{rider['id']}/profile", headers=driver_headers)
+
+    assert seen_by_rider.status_code == 200
+    body = seen_by_rider.json()
+    assert body["display_name"] == "Dee Driver"
+    assert body["bio"] == "Campus commuter"
+    assert body["email_domain"] == "example.com"
+    assert body["member_since"]
+    assert body["completed_rides"] == {"as_driver": 1, "as_rider": 0}
+    assert body["vehicle"]["make"] == "Toyota" and body["vehicle"]["has_license"] is True
+    assert "email" not in body
+    assert seen_by_driver.json()["completed_rides"] == {"as_driver": 0, "as_rider": 1}
+
+    # Blocking hides the profile both ways.
+    api.post(f"/users/{driver['id']}/block", headers=rider_headers)
+    assert api.get(f"/users/{rider['id']}/profile", headers=driver_headers).status_code == 404
+
+
 def test_profile_stores_optional_interests_and_nationality() -> None:
     api = client()
     _, headers = auth(api, "traveler@example.com", "Traveler")
@@ -441,6 +478,38 @@ def test_driver_trips_and_ride_requests_carry_an_optional_free_text_note() -> No
         },
     )
     assert too_long.status_code == 422
+
+
+def test_the_same_two_people_cannot_open_a_second_live_connection_for_the_same_day() -> None:
+    # Regression test: the rider requested the driver's post, then the driver
+    # offered on the rider's backing request — two connections (and two
+    # chats in the Inbox) for the same ride.
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    first = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    })
+    assert first.status_code == 200
+
+    # The driver tries the mirror direction with a fresh trip on the same day.
+    offer_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": driver_trip["pickup_location_id"],
+        "destination_location_id": driver_trip["destination_location_id"],
+        "target_date": driver_trip["target_date"], "flexibility": "morning",
+        "seats_available": 1, "tags": [], "for_connection": True,
+    }).json()
+    second = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": offer_trip["id"],
+    })
+    assert second.status_code == 409
+    assert len(api.get("/me/connections", headers=rider_headers).json()) == 1
+
+    # Once the first is cancelled, connecting again is allowed.
+    api.post(f"/connections/{first.json()['id']}/transition", headers=rider_headers, json={"action": "cancel"})
+    third = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": offer_trip["id"],
+    })
+    assert third.status_code == 200
 
 
 def test_listings_created_to_back_a_connection_stay_out_of_discover() -> None:
