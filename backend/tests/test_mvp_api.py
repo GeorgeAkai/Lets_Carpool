@@ -563,6 +563,30 @@ def test_listings_created_to_back_a_connection_stay_out_of_discover() -> None:
     assert conns[0]["ride_request"]["id"] == backing_request["id"]
 
 
+def test_migration_repoints_backing_listings_saved_with_the_users_gps_as_destination() -> None:
+    # Regression test: onConnect used to save the other listing's destination
+    # at the connecting user's own GPS position, so the trip route was
+    # 0 m / 0 min / $0. Startup migration re-points it at the real one.
+    api = client()
+    _, _, _, driver_headers, ride_request, _ = make_request_and_trip(api)
+    here = location(api, driver_headers, "924, Chico, California", 39.7285, -121.8375)
+    wrong_destination = location(api, driver_headers, "Lake Tahoe, California", 39.7285, -121.8375)
+    backing_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": here["id"], "destination_location_id": wrong_destination["id"],
+        "target_date": ride_request["target_date"], "flexibility": "morning",
+        "seats_available": 1, "tags": [], "for_connection": True,
+    }).json()
+    assert api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": backing_trip["id"],
+    }).status_code == 200
+
+    run_migrations(TEST_DATABASE_URL)
+
+    trip = next(t for t in api.get("/me/driver-trips", headers=driver_headers).json() if t["id"] == backing_trip["id"])
+    assert trip["destination_location_id"] == ride_request["destination_location_id"]
+    assert trip["pickup_location_id"] == here["id"]  # the driver's own start is kept
+
+
 def test_migration_backfills_connection_backing_listings_created_before_the_flag() -> None:
     api = client()
     rider, rider_headers, driver, _, real_request, real_trip = make_request_and_trip(api)

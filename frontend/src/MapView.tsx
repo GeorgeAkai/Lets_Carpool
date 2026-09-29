@@ -796,7 +796,13 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
               </div>
             </div>
             {loadingRoute && <p className="text-sm text-muted-foreground animate-pulse text-center">Calculating route…</p>}
-            {osrmResult && (
+            {osrmResult && osrmResult.distanceMeters < 50 ? (
+              // Same point twice (e.g. a destination saved at the pickup) —
+              // say so instead of a confident "0 min · 0 m · $0.00".
+              <p className="rounded-2xl bg-muted p-3 text-sm text-center text-muted-foreground">
+                Couldn't work out this route — the pickup and destination are at the same spot.
+              </p>
+            ) : osrmResult && (
               <div className="grid grid-cols-3 gap-3">
                 {[{ Icon: Clock, label: "Est. time", value: formatDuration(osrmResult.durationSeconds) }, { Icon: Ruler, label: "Distance", value: formatDistance(osrmResult.distanceMeters) }, { Icon: DollarSign, label: "Fare / person", value: fareEstimate != null ? `$${(fareEstimate / 100).toFixed(2)}` : "—" }].map(({ Icon, label, value }) => (
                   <div key={label} className="bg-muted rounded-2xl p-3 text-center">

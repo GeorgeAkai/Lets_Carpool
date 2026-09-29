@@ -321,5 +321,23 @@ def run_migrations(database_url: str) -> None:
             WHERE c.driver_trip_id = dt.id AND c.initiator_user_id = dt.driver_id
         """)
 
+    # Repair backing listings saved before the app reused the other side's
+    # destination: their destination had been stored at the connecting user's
+    # own GPS position, so the trip route came out 0 m / 0 min / $0. A backing
+    # listing always heads where the listing it connected to heads. Requests
+    # first, since a backing trip can point at a backing request. Idempotent.
+    cur.execute("""
+        UPDATE ride_requests rr SET destination_location_id = dt.destination_location_id
+        FROM connections c JOIN driver_trips dt ON dt.id = c.driver_trip_id
+        WHERE rr.for_connection AND c.ride_request_id = rr.id AND c.initiator_user_id = rr.rider_id
+          AND rr.destination_location_id <> dt.destination_location_id
+    """)
+    cur.execute("""
+        UPDATE driver_trips dt SET destination_location_id = rr.destination_location_id
+        FROM connections c JOIN ride_requests rr ON rr.id = c.ride_request_id
+        WHERE dt.for_connection AND c.driver_trip_id = dt.id AND c.initiator_user_id = dt.driver_id
+          AND dt.destination_location_id <> rr.destination_location_id
+    """)
+
     cur.close()
     conn.close()

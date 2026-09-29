@@ -39,6 +39,9 @@ export interface Listing {
   id: string; type: ListingType; apiId: string; ownerId: string
   user: { name: string; initials: string; verified: boolean; photoUrl?: string | null }
   from: string; to: string; date: string; flexibility: Flexibility
+  // Location record ids — coordinates stay private until connected, but the
+  // ids let a connection's backing listing share this listing's endpoints.
+  fromLocationId: string; toLocationId: string
   seats?: number; seatsUsed?: number; passengers?: number; estimatedGas?: number
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
@@ -294,6 +297,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: trip.driver_photo_url },
     from: trip.pickup.label, to: trip.destination.label,
+    fromLocationId: trip.pickup.id, toLocationId: trip.destination.id,
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
     tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -310,6 +314,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
     id: req.id, type: 'rider', apiId: req.id, ownerId: req.rider_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: req.rider_photo_url },
     from: req.pickup.label, to: req.destination.label,
+    fromLocationId: req.pickup.id, toLocationId: req.destination.id,
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -2702,19 +2707,25 @@ export function Home() {
   // ── Handlers ──
   const onConnect = useCallback(async (listing: Listing) => {
     try {
-      const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
-      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      // The backing listing heads to the same place as the listing you're
+      // connecting to, so reuse its destination location as-is — creating a
+      // new one from your GPS saved the destination at your own position,
+      // which made the trip route 0 m / 0 min / $0. Your pickup is where you
+      // are now, or the other listing's pickup if location isn't available
+      // (never 0,0).
+      const pickupId = userCoords
+        ? (await api.createLocation(await reverseGeocode(userCoords.lat, userCoords.lng), userCoords.lat, userCoords.lng)).id
+        : listing.fromLocationId
+      const destinationId = listing.toLocationId
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [], for_connection: true })
+        const rr = await api.createRideRequest({ pickup_location_id: pickupId, destination_location_id: destinationId, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [], for_connection: true })
         // If the connection is refused (e.g. you're already connected with this
         // person that day), don't leave the backing request behind.
         try { conn = await api.createConnection(rr.id, listing.apiId) }
         catch (e) { api.cancelRideRequest(rr.id).catch(() => {}); throw e }
       } else {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [], for_connection: true })
+        const trip = await api.createDriverTrip({ pickup_location_id: pickupId, destination_location_id: destinationId, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [], for_connection: true })
         try { conn = await api.createConnection(listing.apiId, trip.id) }
         catch (e) { api.cancelDriverTrip(trip.id).catch(() => {}); throw e }
       }

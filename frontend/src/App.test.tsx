@@ -307,7 +307,13 @@ describe("Feed view", () => {
     // shows up in anyone's Discover as if it were a real post.
     const createCall = vi.mocked(fetch).mock.calls.find(([url, init]) =>
       String(url).endsWith("/ride-requests") && (init as RequestInit | undefined)?.method === "POST");
-    expect(JSON.parse(String((createCall![1] as RequestInit).body)).for_connection).toBe(true);
+    const body = JSON.parse(String((createCall![1] as RequestInit).body));
+    expect(body.for_connection).toBe(true);
+    // Heads to the driver's actual destination — not a copy saved at the
+    // rider's own position (which made the trip route 0 m / $0) — and with
+    // no location permission, starts at the driver's pickup, never 0,0.
+    expect(body.destination_location_id).toBe(DRIVER_TRIP_1.destination.id);
+    expect(body.pickup_location_id).toBe(DRIVER_TRIP_1.pickup.id);
   });
 });
 
