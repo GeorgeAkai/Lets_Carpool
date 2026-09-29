@@ -1559,7 +1559,7 @@ function ConnectionCard({
             </button>
             {connection.myRole === 'driver' && hasRiderPickupCoords && (
               <button onClick={() => onStartDriving(connection)} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-emerald-700 transition-colors">
-                <Car className="size-4" />Start Driving
+                <Car className="size-4" />Go pick up {connection.withUser.name.split(' ')[0]}
               </button>
             )}
             <div className="basis-full flex flex-wrap gap-2">
@@ -2777,20 +2777,44 @@ export function Home() {
     setView('map')
   }, [])
 
+  // Driver's trip, in two legs: navigate to the rider's pickup first; once
+  // they've met, "Picked up" switches navigation to the destination; arriving
+  // there completes the ride.
   const onStartDriving = useCallback((conn: Connection) => {
     if (!conn.riderPickupLat || !conn.riderPickupLng) return
     setTripRoute(null)
     setDrivingTo({
-      connectionId: conn.id, pickupLat: conn.riderPickupLat, pickupLng: conn.riderPickupLng,
-      pickupLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+      connectionId: conn.id, phase: 'pickup',
+      targetLat: conn.riderPickupLat, targetLng: conn.riderPickupLng,
+      targetLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+      dropoff: conn.destLat && conn.destLng ? { lat: conn.destLat, lng: conn.destLng, label: conn.destLabel ?? 'Destination' } : undefined,
     })
     setView('map')
+    // Let the rider know to get ready (shows up in their chat + notifications).
+    api.sendMessage(conn.id, "🚗 I'm on my way to pick you up.").catch(() => {})
   }, [])
+
+  const onPickedUp = useCallback(() => {
+    setDrivingTo(prev => {
+      if (!prev) return null
+      if (!prev.dropoff) { showToast('Picked up — no destination on file to navigate to', 'error'); return null }
+      return { ...prev, phase: 'dropoff', targetLat: prev.dropoff.lat, targetLng: prev.dropoff.lng, targetLabel: prev.dropoff.label }
+    })
+  }, [showToast])
 
   const onStopDriving = useCallback(() => {
     setDrivingTo(null)
     showToast('Trip navigation ended', 'success')
   }, [showToast])
+
+  const onArrived = useCallback(async () => {
+    const connectionId = drivingTo?.connectionId
+    setDrivingTo(null)
+    if (!connectionId) return
+    try { await onComplete(connectionId); showToast('Ride completed — thanks for driving!', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Could not complete the ride', 'error') }
+    setView('connections')
+  }, [drivingTo?.connectionId, onComplete, showToast])
 
   const onMarkAllReadNotifs = useCallback(() => {
     setNotifications(prev => prev.map(n => ({ ...n, read: true })))
@@ -2949,7 +2973,7 @@ export function Home() {
                 <OfferRideFab mode={mode} onClick={() => setView('post')} />
               </>
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} onPickedUp={onPickedUp} onArrived={onArrived} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
