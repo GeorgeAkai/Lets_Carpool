@@ -4,9 +4,9 @@ import React, {
 } from 'react'
 import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
-  Check, X, Fuel, ChevronRight, Home as HomeIcon, Dot, Bell, LogOut,
+  Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, ChevronLeft,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
@@ -185,9 +185,9 @@ function LocationInput({
 
   return (
     <div ref={containerRef} className="space-y-1.5">
-      <label className="text-sm font-medium">{label}</label>
+      <label className="text-sm font-semibold">{label}</label>
       <div className="relative">
-        <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+        <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
         <input
           type="text"
           required={required}
@@ -203,7 +203,7 @@ function LocationInput({
             search(e.target.value)
           }}
           onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
-          className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors text-foreground placeholder:text-muted-foreground"
+          className="w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground"
         />
         {loading && (
           <div className="absolute right-3 top-1/2 -translate-y-1/2 size-3.5 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
@@ -240,6 +240,11 @@ function LocationInput({
 
 export const FLEX_LABEL: Record<Flexibility, string> = {
   morning: 'Morning', afternoon: 'Afternoon', evening: 'Evening', flexible: 'Flexible',
+}
+
+// Time-of-day dot shown next to a route, matching the Figma Make cards.
+export const FLEX_DOT: Record<Flexibility, string> = {
+  morning: 'bg-amber-500', afternoon: 'bg-blue-600', evening: 'bg-violet-600', flexible: 'bg-emerald-600',
 }
 
 const CANNED_MESSAGES: Record<string, string> = {
@@ -366,8 +371,8 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
 
 // ─── Small utility components ─────────────────────────────────────────────────
 
-export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'lg'; photoUrl?: string | null }) {
-  const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', lg: 'size-14 text-xl' }[size]
+export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'card' | 'lg'; photoUrl?: string | null }) {
+  const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', 'card': 'size-10 text-sm', lg: 'size-14 text-xl' }[size]
   if (photoUrl) {
     return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
   }
@@ -389,36 +394,79 @@ function SeatDots({ total, used }: { total: number; used: number }) {
 }
 
 function TagPill({ tag }: { tag: RideTag }) {
-  return <span className="text-xs px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">{tag}</span>
+  return <span className={`${CHIP} capitalize`}>{tag}</span>
+}
+
+const STATUS_CHIP = {
+  amber: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  green: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  red: 'bg-destructive/10 text-destructive dark:text-red-300',
+  blue: 'bg-secondary text-secondary-foreground',
+  grey: 'bg-muted text-muted-foreground',
 }
 
 function ConnStatusBadge({ status }: { status: ConnStatus }) {
   const cfg: Record<ConnStatus, { label: string; cls: string }> = {
-    pending:   { label: 'Pending',   cls: 'bg-amber-100 text-amber-800' },
-    accepted:  { label: 'Accepted',  cls: 'bg-green-100 text-green-800' },
-    declined:  { label: 'Declined',  cls: 'bg-red-100 text-red-700' },
-    completed: { label: 'Completed', cls: 'bg-slate-100 text-slate-600' },
-    cancelled: { label: 'Cancelled', cls: 'bg-slate-100 text-slate-500' },
-    expired:   { label: 'Expired',   cls: 'bg-slate-100 text-slate-400' },
+    pending:   { label: 'Pending',   cls: STATUS_CHIP.amber },
+    accepted:  { label: 'Accepted',  cls: STATUS_CHIP.green },
+    declined:  { label: 'Declined',  cls: STATUS_CHIP.red },
+    completed: { label: 'Completed', cls: STATUS_CHIP.grey },
+    cancelled: { label: 'Cancelled', cls: STATUS_CHIP.red },
+    expired:   { label: 'Expired',   cls: STATUS_CHIP.grey },
   }
   const { label, cls } = cfg[status]
-  return <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}`}>{label}</span>
+  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cls}`}>{label}</span>
 }
 
 function ListingStatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
-    open:      'bg-green-100 text-green-800',
-    matched:   'bg-blue-100 text-blue-800',
-    expired:   'bg-slate-100 text-slate-500',
-    cancelled: 'bg-red-100 text-red-600',
-    completed: 'bg-slate-100 text-slate-600',
+    open:      STATUS_CHIP.blue,
+    matched:   STATUS_CHIP.green,
+    expired:   STATUS_CHIP.grey,
+    cancelled: STATUS_CHIP.red,
+    completed: STATUS_CHIP.grey,
   }
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${colors[status] ?? 'bg-muted text-muted-foreground'}`}>
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${colors[status] ?? STATUS_CHIP.grey}`}>
       {status.charAt(0).toUpperCase() + status.slice(1)}
     </span>
   )
 }
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-3">{children}</p>
+}
+
+// Route line shared by listing and match cards: "From → To • Morning".
+function RouteLine({ from, to, flexibility }: { from: string; to: string; flexibility: Flexibility }) {
+  return (
+    <div className="flex items-center gap-1.5 mt-0.5 flex-wrap text-xs">
+      <span className="font-medium text-foreground">{from}</span>
+      <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+      <span className="font-medium text-foreground">{to}</span>
+      <span className={`size-1.5 rounded-full shrink-0 ${FLEX_DOT[flexibility]}`} />
+      <span className="text-muted-foreground">{FLEX_LABEL[flexibility]}</span>
+    </div>
+  )
+}
+
+// Note preview clamped to two lines with a Show more toggle for long notes.
+function NotePreview({ notes }: { notes: string }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div>
+      <p className={`text-xs text-muted-foreground whitespace-pre-wrap ${expanded ? '' : 'line-clamp-2'}`}>“{notes}”</p>
+      {notes.length > 60 && (
+        <button type="button" onClick={() => setExpanded(v => !v)} className="text-xs mt-0.5 text-primary hover:underline">
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+const CHIP = 'text-xs px-2 py-0.5 rounded-full font-medium bg-muted text-muted-foreground'
+const GHOST_BTN = 'inline-flex items-center gap-1.5 rounded-xl border border-border bg-card px-3 py-2 text-xs font-semibold text-foreground hover:bg-muted disabled:opacity-60 transition-colors'
 
 function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' } | null }) {
   if (!toast) return null
@@ -437,103 +485,77 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
+  const luggage = isDriver ? listing.luggageCapacity : listing.luggageSize
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}
-      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-4 hover:shadow-lg hover:shadow-foreground/5 transition-shadow group"
+      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-semibold">{listing.user.name}</span>
-              {listing.user.verified && (
-                <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                  <Check className="size-2.5 text-primary" />
-                </span>
-              )}
-            </div>
-            <span className="text-xs text-muted-foreground">{listing.postedAt}</span>
+      <div className="flex items-start gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-semibold">{listing.user.name}</span>
+            {listing.user.verified && (
+              <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0" title="Verified">
+                <Check className="size-2.5 text-primary" />
+              </span>
+            )}
+            {isDriver && (listing.carType || listing.vehicle) && (
+              <span className="text-xs text-muted-foreground">
+                {listing.carType ? `${CAR_TYPE_EMOJI[listing.carType]} ${listing.vehicle ?? CAR_TYPE_LABELS[listing.carType]}` : listing.vehicle}
+              </span>
+            )}
+            {!isDriver && (
+              <span className="text-xs text-muted-foreground">🧍 {listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
+            )}
           </div>
+          <RouteLine from={listing.from} to={listing.to} flexibility={listing.flexibility} />
         </div>
-        <span className={`text-xs font-medium px-2.5 py-1 rounded-full shrink-0 ${isDriver ? 'bg-primary/10 text-primary' : 'bg-accent/15 text-amber-700'}`}>
-          {isDriver ? 'Offering ride' : 'Needs ride'}
-        </span>
-      </div>
-
-      <div className="space-y-1.5">
-        <div className="flex items-center gap-2 text-sm">
-          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
-          <span className="text-muted-foreground">{listing.from}</span>
-          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
-          <span className="font-semibold text-foreground">{listing.to}</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
-          <Calendar className="size-3" /><span>{listing.date}</span>
-          <Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
+        <div className="flex flex-col items-end gap-1 shrink-0">
+          {isDriver ? (
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${freeSeats > 0 ? 'bg-secondary text-secondary-foreground' : STATUS_CHIP.red}`}>
+              <span style={MONO}>{freeSeats}</span> of {listing.seats} seats free
+            </span>
+          ) : (
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.amber}`}>Needs ride</span>
+          )}
+          <span className="text-xs text-muted-foreground">{listing.date}</span>
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
-        {isDriver ? (
-          <span className="flex items-center gap-1.5">
-            <SeatDots total={listing.seats!} used={listing.seatsUsed!} />
-            <span><span style={MONO} className="text-foreground font-medium">{freeSeats}</span>{' of '}{listing.seats} seats free</span>
+      {(listing.tags.length > 0 || (luggage && luggage !== 'none')) && (
+        <div className="flex flex-wrap gap-1.5">
+          {listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}
+          {luggage && luggage !== 'none' && (
+            <span className={CHIP}>🧳 {isDriver ? `Up to ${LUGGAGE_LABELS[luggage]}` : LUGGAGE_LABELS[luggage]}</span>
+          )}
+        </div>
+      )}
+
+      {listing.notes && <NotePreview notes={listing.notes} />}
+
+      <div className="flex items-center justify-between gap-3 mt-1">
+        {listing.estimatedGas != null ? (
+          <span style={MONO} className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">⛽ ~${listing.estimatedGas}/person</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">Posted {listing.postedAt}</span>
+        )}
+        {isOwn ? (
+          <span className="text-sm font-semibold px-4 py-2 rounded-xl bg-muted text-muted-foreground">Your post</span>
+        ) : alreadyConnected ? (
+          <span className="text-sm font-semibold px-4 py-2 rounded-xl bg-muted text-muted-foreground flex items-center gap-1.5">
+            <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
           </span>
         ) : (
-          <span className="flex items-center gap-1">
-            <Users className="size-3" />
-            {listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}
-          </span>
-        )}
-        {listing.estimatedGas != null && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Fuel className="size-3" />~<span style={MONO} className="text-foreground font-medium">${listing.estimatedGas}</span>/person</span></>
-        )}
-        {isDriver && listing.carType && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><span>{CAR_TYPE_EMOJI[listing.carType]}</span>{CAR_TYPE_LABELS[listing.carType]}</span></>
-        )}
-        {isDriver && listing.vehicle && !listing.carType && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Car className="size-3" />{listing.vehicle}</span></>
-        )}
-        {isDriver && listing.luggageCapacity && listing.luggageCapacity !== 'none' && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</span></>
-        )}
-        {!isDriver && listing.luggageSize && listing.luggageSize !== 'none' && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</span></>
+          <button
+            onClick={() => onConnect(listing)}
+            className="text-sm font-semibold px-4 py-2 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 active:scale-[0.98] transition-all"
+          >
+            {isDriver ? 'Request to join' : 'Offer a ride'}
+          </button>
         )}
       </div>
-
-      {listing.tags.length > 0 && (
-        <div className="flex gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>
-      )}
-
-      {listing.notes && (
-        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 whitespace-pre-wrap">{listing.notes}</p>
-      )}
-
-      {isOwn ? (
-        <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
-          Your post
-        </div>
-      ) : alreadyConnected ? (
-        <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
-          <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
-        </div>
-      ) : (
-        <button
-          onClick={() => onConnect(listing)}
-          className="mt-auto w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-        >
-          {isDriver ? 'Request to join' : 'Offer a ride'}
-          <ChevronRight className="size-4 group-hover:translate-x-0.5 transition-transform" />
-        </button>
-      )}
     </motion.div>
   )
 }
@@ -680,59 +702,49 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: rank * 0.05 }}
-      className="relative bg-card rounded-[1.25rem] border border-border p-5 flex flex-col gap-4"
+      className="relative w-80 shrink-0 snap-start bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
-      {rank === 0 && (
-        <span className="absolute -top-2.5 left-5 bg-primary text-primary-foreground text-[10px] font-bold px-2.5 py-1 rounded-full tracking-wide">TOP MATCH</span>
-      )}
-      <div className="flex items-start justify-between gap-3 mt-1">
-        <div className="flex items-center gap-3 min-w-0">
-          {profile?.photo_url ? (
-            <img src={profile.photo_url} alt="" className="size-11 rounded-full object-cover ring-1 ring-border shrink-0" />
-          ) : (
-            <div style={MONO} className="size-11 rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0">{initials}</div>
-          )}
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-semibold truncate">{name}</span>
-              {profile?.photo_verified && (
-                <span className="size-4 rounded-full bg-green-500 flex items-center justify-center shrink-0"><Check className="size-2.5 text-white" /></span>
-              )}
-            </div>
-            <div className="flex flex-wrap gap-1.5 mt-1">
-              {profile?.nationality && <span className="text-[11px] px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">{profile.nationality}</span>}
-              {sharedInterests.slice(0, 2).map(tag => (
-                <span key={tag} className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{tag}</span>
-              ))}
-            </div>
+      <span className="absolute -top-2.5 left-4 bg-primary text-primary-foreground text-xs font-bold px-2 py-0.5 rounded-full">
+        {rank === 0 ? '✨ Top match' : '✨ Best match'}
+      </span>
+      <div className="flex items-start gap-3 mt-1">
+        {profile?.photo_url ? (
+          <img src={profile.photo_url} alt="" className="size-10 rounded-full object-cover ring-1 ring-border shrink-0" />
+        ) : (
+          <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{initials}</div>
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="text-sm font-semibold truncate">{name}</span>
+            {profile?.photo_verified && (
+              <span className="size-4 rounded-full bg-emerald-600 flex items-center justify-center shrink-0" title="Photo verified"><Check className="size-2.5 text-white" /></span>
+            )}
           </div>
+          <RouteLine from={listing.from} to={listing.to} flexibility={listing.flexibility} />
         </div>
         <UserMenuButton targetUserId={listing.ownerId} showToast={showToast} />
       </div>
 
-      <div className="space-y-1.5">
-        <div className="flex items-center gap-2 text-sm">
-          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
-          <span className="text-muted-foreground truncate">{listing.from}</span>
-          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
-          <span className="font-semibold text-foreground truncate">{listing.to}</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
-          <Calendar className="size-3" /><span>{listing.date}</span>
-          <Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
-        </div>
+      <div className="flex items-center justify-between gap-2 text-xs">
+        {isDriverListing ? (
+          <span className="font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground"><span style={MONO}>{freeSeats}</span> of {listing.seats} seats free</span>
+        ) : (
+          <span className="font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
+        )}
+        <span className="text-muted-foreground">{listing.date}</span>
       </div>
 
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        {isDriverListing ? (
-          <span className="flex items-center gap-1.5"><Users className="size-3.5" /><span style={MONO} className="text-foreground font-medium">{freeSeats}</span> of {listing.seats} seats free</span>
-        ) : (
-          <span className="flex items-center gap-1.5"><Users className="size-3.5" />{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
-        )}
-      </div>
+      {(profile?.nationality || sharedInterests.length > 0) && (
+        <div className="flex flex-wrap gap-1.5">
+          {profile?.nationality && <span className={CHIP}>{profile.nationality}</span>}
+          {sharedInterests.slice(0, 2).map(tag => (
+            <span key={tag} className="text-xs px-2 py-0.5 rounded-full font-medium bg-secondary text-secondary-foreground">{tag}</span>
+          ))}
+        </div>
+      )}
 
       {expanded && (
-        <div className="rounded-xl bg-muted/50 p-3 space-y-1.5 text-xs text-muted-foreground">
+        <div className="rounded-xl bg-muted p-3 space-y-1.5 text-xs text-muted-foreground">
           {listing.tags.length > 0 && <div className="flex gap-1.5 flex-wrap">{listing.tags.map(t => <TagPill key={t} tag={t} />)}</div>}
           {isDriverListing && listing.carType && <p className="flex items-center gap-1.5"><Car className="size-3" />{CAR_TYPE_EMOJI[listing.carType]} {CAR_TYPE_LABELS[listing.carType]}</p>}
           {isDriverListing && listing.luggageCapacity && listing.luggageCapacity !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</p>}
@@ -742,17 +754,17 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
         </div>
       )}
 
-      <div className="flex gap-2">
+      <div className="mt-auto flex gap-2">
         {alreadyConnected ? (
-          <div className="flex-1 py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
+          <div className="flex-1 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center justify-center gap-1.5">
             <Check className="size-4" />Request sent
           </div>
         ) : (
-          <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all whitespace-nowrap">
             {requesting ? 'Requesting…' : 'Instant Request Match'}
           </button>
         )}
-        <button onClick={() => setExpanded(v => !v)} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors">
+        <button onClick={() => setExpanded(v => !v)} className="px-3 py-2 rounded-xl bg-muted text-sm font-semibold text-foreground hover:bg-border transition-colors whitespace-nowrap">
           {expanded ? 'Hide' : 'View Route'}
         </button>
       </div>
@@ -778,18 +790,16 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
   if (!loading && matches.length === 0) return null
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h2 className="text-lg font-semibold text-foreground">Best matches for you</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">Ranked by departure window and what you have in common.</p>
-      </div>
+    <div>
+      <SectionLabel>✨ Best matches for you</SectionLabel>
       {loading ? (
         <p className="text-sm text-muted-foreground animate-pulse">Finding your best matches…</p>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="flex gap-4 overflow-x-auto snap-x pt-3 pb-2 -mx-1 px-1 items-stretch">
           {matches.map((m, i) => <MatchCard key={m.listing.id} match={m} rank={i} onConnect={onConnect} showToast={showToast} alreadyConnected={connectedListingIds.has(m.listing.apiId)} />)}
         </div>
       )}
+      <p className="text-xs text-muted-foreground mt-1">Ranked by departure window and what you have in common.</p>
     </div>
   )
 }
@@ -851,9 +861,9 @@ function DriverHomeView({
           seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
         />
         {!myOpenTrip && (
-          <div className="rounded-3xl border border-dashed border-border p-5 text-center">
+          <div className="rounded-2xl border border-dashed border-border bg-card p-5 text-center">
             <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
-            <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+            <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
           </div>
         )}
         <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
@@ -891,7 +901,7 @@ function DriverHomeView({
       </div>
 
       {myOpenTrip ? (
-        <div className="rounded-3xl bg-primary text-primary-foreground p-6">
+        <div className="rounded-2xl bg-primary text-primary-foreground p-6 shadow-lg shadow-primary/25">
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs font-semibold uppercase tracking-wide text-primary-foreground/70">Active trip</span>
             <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-white/15">Open</span>
@@ -907,55 +917,74 @@ function DriverHomeView({
           </div>
         </div>
       ) : (
-        <div className="rounded-3xl border border-dashed border-border p-6 text-center">
+        <div className="rounded-2xl border border-dashed border-border bg-card p-6 text-center">
           <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
-          <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+          <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
         </div>
       )}
 
-      <div className="flex items-center justify-between">
-        <h2 className="text-base font-semibold text-foreground">Requests along your route</h2>
-        {!loading && <span className="text-xs text-muted-foreground">{matches.length} nearby</span>}
-      </div>
+      <div>
+        <div className="flex items-center justify-between">
+          <SectionLabel>Riders needing a driver</SectionLabel>
+          {!loading && <span className="text-xs text-muted-foreground mb-3">{matches.length} nearby</span>}
+        </div>
 
-      {loading ? (
-        <p className="text-sm text-muted-foreground animate-pulse">Finding nearby requests…</p>
-      ) : matches.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-6 text-center">No ride requests to show yet.</p>
-      ) : (
-        <div className="space-y-2.5">
-          {matches.map(m => {
-            const name = m.profile?.display_name ?? m.listing.user.name
-            return (
-              <div key={m.listing.id} className="bg-card border border-border rounded-2xl p-4 flex items-center gap-3.5">
-                {m.profile?.photo_url ? (
-                  <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
-                ) : (
-                  <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
-                )}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-semibold">{name}</span>
-                    {m.sharedInterests.length > 0 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{m.sharedInterests[0]}</span>}
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse">Finding nearby requests…</p>
+        ) : matches.length === 0 ? (
+          <div className="text-center py-12 text-muted-foreground">
+            <p className="text-4xl mb-3">🧍</p>
+            <p className="font-semibold">No ride requests to show yet</p>
+            <p className="text-sm mt-1">New requests along your route will show up here.</p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {matches.map(m => {
+              const name = m.profile?.display_name ?? m.listing.user.name
+              const l = m.listing
+              return (
+                <div key={l.id} className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all">
+                  <div className="flex items-start gap-3">
+                    {m.profile?.photo_url ? (
+                      <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
+                    ) : (
+                      <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-semibold">{name}</span>
+                        <span className="text-xs text-muted-foreground">🧍 {l.passengers} passenger{(l.passengers ?? 0) > 1 ? 's' : ''}</span>
+                      </div>
+                      <RouteLine from={l.from} to={l.to} flexibility={l.flexibility} />
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <span className="text-xs text-muted-foreground">{l.date}</span>
+                    </div>
+                    <UserMenuButton targetUserId={l.ownerId} showToast={showToast} />
                   </div>
-                  <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                    <span>{m.listing.from}</span> → <span>{m.listing.to}</span> · {m.listing.passengers} passenger{(m.listing.passengers ?? 0) > 1 ? 's' : ''} · {m.listing.date}
-                  </p>
-                  {m.listing.notes && <p className="text-xs text-muted-foreground/80 mt-0.5 truncate italic">"{m.listing.notes}"</p>}
+                  {(l.tags.length > 0 || m.sharedInterests.length > 0 || (l.luggageSize && l.luggageSize !== 'none')) && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {m.sharedInterests.slice(0, 1).map(t => <span key={t} className="text-xs px-2 py-0.5 rounded-full font-medium bg-secondary text-secondary-foreground">{t}</span>)}
+                      {l.tags.map(t => <TagPill key={t} tag={t} />)}
+                      {l.luggageSize && l.luggageSize !== 'none' && <span className={CHIP}>🧳 {LUGGAGE_LABELS[l.luggageSize]}</span>}
+                    </div>
+                  )}
+                  {l.notes && <NotePreview notes={l.notes} />}
+                  <div className="flex items-center justify-end">
+                    {connectedListingIds.has(l.apiId) ? (
+                      <span className="px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center gap-1.5"><Check className="size-4" />Offered</span>
+                    ) : (
+                      <button onClick={() => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
+                        Offer to drive
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <UserMenuButton targetUserId={m.listing.ownerId} showToast={showToast} />
-                {connectedListingIds.has(m.listing.apiId) ? (
-                  <span className="shrink-0 px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center gap-1.5"><Check className="size-4" />Offered</span>
-                ) : (
-                  <button onClick={() => onConnect(m.listing).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="shrink-0 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                    Offer Ride
-                  </button>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      )}
+              )
+            })}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -967,7 +996,7 @@ function FeedView({
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
-  listings, onConnect, loading, currentUserId, setView, connectedListingIds,
+  listings, onConnect, loading, currentUserId, setView, connectedListingIds, bestMatches,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
@@ -980,6 +1009,7 @@ function FeedView({
   listings: Listing[]; onConnect: (l: Listing) => void; loading: boolean; currentUserId: string
   setView: (v: View) => void
   connectedListingIds: Set<string>
+  bestMatches?: React.ReactNode
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const isMobile = useIsMobile()
@@ -1022,78 +1052,88 @@ function FeedView({
     )
   }
 
+  const pill = (active: boolean) => `text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`
+  const chip = (active: boolean) => `text-xs font-medium px-3 py-1.5 rounded-full border transition-colors ${active ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`
   return (
     <div className="space-y-6">
-      <div className="pb-2">
+      <div>
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Find your ride</h1>
-        <p className="text-muted-foreground mt-1">Connect with drivers and riders heading your way.</p>
+        <p className="text-sm text-muted-foreground mt-1">Connect with drivers and riders heading your way.</p>
       </div>
 
-      <div className="flex items-center gap-3 rounded-2xl bg-card border border-border px-8 py-6 focus-within:ring-2 focus-within:ring-ring/25 focus-within:border-primary/30 transition-colors">
-        <Search className="size-5 shrink-0 text-muted-foreground" />
-        <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-          className="flex-1 bg-transparent text-base text-foreground placeholder:text-muted-foreground focus:outline-none pl-2" />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        {(['all', 'driver', 'rider'] as const).map(t => (
-          <button key={t} onClick={() => setFilterType(t)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterType === t ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-            {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-          </button>
-        ))}
-        <div className="w-px h-5 bg-border mx-0.5" />
-        {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-          <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-accent/20 text-amber-800 ring-1 ring-accent/40' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-            {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
-          </button>
-        ))}
-        <button onClick={() => setShowAdvanced(v => !v)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${showAdvanced ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-          Filters {showAdvanced ? '▲' : '▼'}
-        </button>
-      </div>
-
-      {showAdvanced && (
-        <div className="rounded-2xl bg-muted p-4 space-y-3">
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Vehicle size</p>
-            <div className="flex flex-wrap gap-2">
-              {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
-                <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
-                  {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Luggage I'm bringing</p>
-            <div className="flex flex-wrap gap-2">
-              {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
-                <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
-                  {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
-                </button>
-              ))}
-            </div>
-          </div>
+      <div className="space-y-4">
+        <div className="relative">
+          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+          <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            className="w-full pl-10 pr-4 py-3 rounded-xl bg-card border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary focus:ring-3 focus:ring-primary/15 transition-colors" />
         </div>
-      )}
 
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        {loading ? <span className="animate-pulse">Loading…</span> : (
-          <><span style={MONO} className="text-foreground font-medium">{listings.length}</span><span>listing{listings.length !== 1 ? 's' : ''} found</span></>
+        <div className="flex flex-wrap items-center gap-2">
+          {(['all', 'driver', 'rider'] as const).map(t => (
+            <button key={t} onClick={() => setFilterType(t)} className={pill(filterType === t)}>
+              {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {(['', 'airport', 'student', 'church', 'college', 'work', 'event'] as const).map(tag => (
+            <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={chip(filterTag === tag)}>
+              {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
+            </button>
+          ))}
+          <button onClick={() => setShowAdvanced(v => !v)} className={chip(showAdvanced)}>
+            More filters {showAdvanced ? '▲' : '▼'}
+          </button>
+        </div>
+
+        {showAdvanced && (
+          <div className="rounded-2xl bg-card border border-border p-4 space-y-3">
+            <div className="space-y-1.5">
+              <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Vehicle size</p>
+              <div className="flex flex-wrap gap-2">
+                {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
+                  <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={pill(filterCarType === ct)}>
+                    {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Luggage I'm bringing</p>
+              <div className="flex flex-wrap gap-2">
+                {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
+                  <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={pill(filterLuggage === ls)}>
+                    {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
-      {!loading && listings.length > 0 ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} alreadyConnected={connectedListingIds.has(l.apiId)} />)}
+      {bestMatches}
+
+      <div>
+        <div className="flex items-center justify-between">
+          <SectionLabel>All listings</SectionLabel>
+          {!loading && <span className="text-xs text-muted-foreground mb-3"><span style={MONO} className="text-foreground font-medium">{listings.length}</span> found</span>}
         </div>
-      ) : !loading ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <p className="text-4xl mb-4 opacity-50">🚗</p>
-          <p className="font-medium">No nearby drivers right now</p>
-          <p className="text-sm mt-1">Try searching for a specific destination above or post a request.</p>
-        </div>
-      ) : null}
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse">Loading…</p>
+        ) : listings.length > 0 ? (
+          <div className="flex flex-col gap-4">
+            {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} alreadyConnected={connectedListingIds.has(l.apiId)} />)}
+          </div>
+        ) : (
+          <div className="text-center py-12 text-muted-foreground">
+            <p className="text-4xl mb-3">🚗</p>
+            <p className="font-semibold">No rides found</p>
+            <p className="text-sm mt-1">Try adjusting your search or filters, or post a request.</p>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -1161,59 +1201,73 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
     } catch (err) { setError(err instanceof Error ? err.message : 'Failed to post'); setSubmitted(false); submittingRef.current = false }
   }
 
-  const inputCls = 'w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors'
-  const iconInputCls = 'pl-9 ' + inputCls
+  const inputCls = 'w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors'
+  const iconInputCls = 'pl-10 ' + inputCls
+  const optionCls = (active: boolean) => `px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`
+  const countValue = type === 'driver' ? seats : passengers
+  const setCount = (n: number) => { const v = String(Math.min(8, Math.max(1, n))); type === 'driver' ? setSeats(v) : setPassengers(v) }
 
   return (
-    <div className="max-w-lg mx-auto">
-      <div className="mb-8">
+    <div className="max-w-2xl mx-auto">
+      <div className="mb-6">
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Post a listing</h1>
-        <p className="text-muted-foreground mt-1">Share your trip or request a ride.</p>
+        <p className="text-sm text-muted-foreground mt-1">Share your route and connect with the community.</p>
       </div>
 
-      <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-muted text-sm font-medium text-foreground mb-8">
-        {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
+      <div className="flex items-center justify-between gap-3 rounded-2xl p-1 pr-4 mb-8 bg-card border border-border">
+        <span className="px-4 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold">
+          {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
+        </span>
+        <span className="text-xs text-muted-foreground">Switch mode from your Profile</span>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-5">
-        <div className="grid grid-cols-2 gap-3">
+      <form onSubmit={handleSubmit} className="flex flex-col gap-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required nearCoords={userCoords} />
           <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required nearCoords={userCoords} />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Date</label>
+            <label className="text-sm font-semibold">Date</label>
             <div className="relative">
               <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <input required type="date" value={date} onChange={e => setDate(e.target.value)} className={iconInputCls} />
             </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Flexibility</label>
-            <select value={flexibility} onChange={e => setFlexibility(e.target.value as Flexibility)} className={inputCls}>
-              {Object.entries(FLEX_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-            </select>
+            <label className="text-sm font-semibold">Flexibility</label>
+            <div className="flex gap-2 flex-wrap" role="radiogroup" aria-label="Flexibility">
+              {(Object.entries(FLEX_LABEL) as [Flexibility, string][]).map(([k, l]) => (
+                <button key={k} type="button" role="radio" aria-checked={flexibility === k} onClick={() => setFlexibility(k)} className={`${optionCls(flexibility === k)} flex items-center gap-1.5`}>
+                  <span className={`size-1.5 rounded-full ${flexibility === k ? 'bg-primary-foreground' : FLEX_DOT[k]}`} />{l}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">{type === 'driver' ? 'Seats available' : 'Passengers'}</label>
-            <input required type="number" min="1" value={type === 'driver' ? seats : passengers} onChange={e => type === 'driver' ? setSeats(e.target.value) : setPassengers(e.target.value)} className={inputCls} />
+            <label className="text-sm font-semibold" id="post-count-label">{type === 'driver' ? 'Seats available' : 'Passengers'}</label>
+            <div className="flex items-center gap-3" role="group" aria-labelledby="post-count-label">
+              <button type="button" aria-label="Decrease" onClick={() => setCount(parseInt(countValue, 10) - 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">−</button>
+              <span style={MONO} className="w-8 text-center text-xl font-bold text-foreground">{countValue}</span>
+              <button type="button" aria-label="Increase" onClick={() => setCount(parseInt(countValue, 10) + 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">+</button>
+            </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Gas split estimate</label>
+            <label className="text-sm font-semibold">Gas split ($/person)</label>
             <div className="relative">
-              <Fuel className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
-              <input value={gasEstimate} onChange={e => setGasEstimate(e.target.value)} placeholder="$ per person" className={iconInputCls} />
+              <span style={MONO} className="absolute left-4 top-1/2 -translate-y-1/2 font-semibold text-muted-foreground pointer-events-none">$</span>
+              <input value={gasEstimate} onChange={e => setGasEstimate(e.target.value)} placeholder="0.00" inputMode="decimal" style={MONO} className={iconInputCls.replace('pl-10', 'pl-8')} />
             </div>
           </div>
         </div>
 
         {type === 'driver' && (
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">
+            <label className="text-sm font-semibold">
               Vehicle{autoFilledFromProfile && <span className="text-muted-foreground font-normal"> · auto-filled from your profile</span>}
             </label>
             <input value={vehicle} onChange={e => setVehicle(e.target.value)} placeholder="e.g. Subaru Outback '23" className={inputCls} />
@@ -1222,10 +1276,10 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
         {type === 'driver' && (
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Vehicle type</label>
+            <label className="text-sm font-semibold">Vehicle type</label>
             <div className="flex flex-wrap gap-2">
               {(['sedan', 'suv', 'van', 'minivan', 'truck'] as CarType[]).map(ct => (
-                <button key={ct} type="button" onClick={() => setCarType(carType === ct ? '' : ct)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${carType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                <button key={ct} type="button" onClick={() => setCarType(carType === ct ? '' : ct)} className={optionCls(carType === ct)}>
                   {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
                 </button>
               ))}
@@ -1234,13 +1288,13 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         )}
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">{type === 'driver' ? 'Max luggage accepted' : "Luggage I'm bringing"}</label>
+          <label className="text-sm font-semibold">{type === 'driver' ? 'Max luggage accepted' : "Luggage I'm bringing"}</label>
           <div className="flex flex-wrap gap-2">
             {(['none', 'small', 'medium', 'large', 'oversized'] as LuggageSize[]).map(ls => {
               const current = type === 'driver' ? luggageCapacity : luggageSize
               const setter = type === 'driver' ? setLuggageCapacity : setLuggageSize
               return (
-                <button key={ls} type="button" onClick={() => setter(ls)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${current === ls ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                <button key={ls} type="button" onClick={() => setter(ls)} className={optionCls(current === ls)}>
                   {LUGGAGE_LABELS[ls]}
                 </button>
               )
@@ -1249,10 +1303,10 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         </div>
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">Tags</label>
+          <label className="text-sm font-semibold">Tags</label>
           <div className="flex gap-2 flex-wrap">
             {(['airport', 'student', 'church', 'college', 'work', 'event'] as RideTag[]).map(tag => (
-              <button key={tag} type="button" onClick={() => toggleTag(tag)} className={`px-3.5 py-2 rounded-xl text-sm font-medium transition-colors ${tags.has(tag) ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={tag} type="button" aria-pressed={tags.has(tag)} onClick={() => toggleTag(tag)} className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${tags.has(tag) ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`}>
                 {tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}
@@ -1260,7 +1314,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
         </div>
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">Add a note <span className="text-muted-foreground font-normal">(optional)</span></label>
+          <label className="text-sm font-semibold">Optional note</label>
           <textarea
             value={notes} onChange={e => setNotes(e.target.value)} rows={3} maxLength={500}
             placeholder={type === 'driver'
@@ -1270,14 +1324,14 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
           />
         </div>
 
-        <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">
-          <input type="checkbox" checked={declared} onChange={() => setDeclared(v => !v)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
-          I confirm the information is accurate.
+        <label className="flex items-start gap-3 text-sm leading-relaxed text-muted-foreground cursor-pointer">
+          <input type="checkbox" checked={declared} onChange={() => setDeclared(v => !v)} className="mt-0.5 size-5 shrink-0 rounded accent-primary" />
+          I confirm this listing is accurate and I agree to Let's Carpool's community guidelines.
         </label>
 
-        {error && <p className="text-sm text-red-500">{error}</p>}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <button type="submit" disabled={submitted} className="w-full py-3 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">
+        <button type="submit" disabled={submitted} className="w-full py-4 rounded-xl bg-primary text-primary-foreground text-sm font-bold shadow-lg shadow-primary/30 hover:bg-primary/90 disabled:opacity-60 disabled:shadow-none transition-all">
           {submitted ? 'Posting...' : 'Post listing'}
         </button>
       </form>
@@ -1287,11 +1341,12 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
 
 // ─── My Listings view ─────────────────────────────────────────────────────────
 
-function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast, mode }: {
+function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast, mode, onGoPost }: {
   myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void>
   userCoords: { lat: number; lng: number } | null; currentUserId: string
   showToast: (msg: string, type: 'success' | 'error') => void
   mode: ListingType
+  onGoPost: () => void
 }) {
   const isMobile = useIsMobile()
   // Only the listing type matching the current app-wide mode is shown — no
@@ -1309,11 +1364,11 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
     <div className="space-y-6">
       <div>
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">My Rides</h1>
-        <p className="text-muted-foreground mt-1">Your posted driver trips and ride requests.</p>
+        <p className="text-sm text-muted-foreground mt-1">Track your listings and bookings.</p>
       </div>
-      <div className="flex rounded-xl bg-muted p-1 gap-1">
+      <div className={`flex gap-1 p-1 rounded-xl bg-card border border-border ${tabs.length === 1 ? 'w-fit' : ''}`}>
         {tabs.map(t => (
-          <button key={t} onClick={() => setTab(t)} className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-all ${tab === t ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+          <button key={t} onClick={() => setTab(t)} className={`${tabs.length === 1 ? 'px-6' : 'flex-1'} py-2 rounded-lg text-sm font-semibold transition-all ${tab === t ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
             {t === 'driver' ? 'Driver Trips' : t === 'rider' ? 'Ride Requests' : 'Pools'}
           </button>
         ))}
@@ -1321,40 +1376,43 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
       {tab === 'pools' ? (
         <PoolView userCoords={userCoords} currentUserId={currentUserId} showToast={showToast} />
       ) : shown.length === 0 ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <ClipboardList className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No {tab === 'driver' ? 'driver trips' : 'ride requests'} yet</p>
-          <p className="text-sm mt-1">Post one from the Post tab.</p>
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <p className="text-5xl mb-4">{tab === 'driver' ? '🚗' : '🧍'}</p>
+          <p className="font-bold text-base text-foreground mb-1">No {tab === 'driver' ? 'driver trips' : 'ride requests'} yet</p>
+          <p className="text-sm text-muted-foreground mb-5">Post your first listing to get started.</p>
+          <button onClick={onGoPost} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Create a listing</button>
         </div>
       ) : (
-        <div className="space-y-3">
+        <div className="flex flex-col gap-4">
           {shown.map(listing => (
-            <motion.div key={listing.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="bg-card rounded-2xl border border-border p-5">
-              <div className="flex items-start justify-between gap-4">
-                <div className="space-y-1 min-w-0">
-                  <div className="flex items-center gap-2 text-sm">
-                    <MapPin className="size-3.5 text-muted-foreground shrink-0" />
-                    <span className="text-muted-foreground truncate">{listing.from}</span>
+            <motion.div key={listing.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-2">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                    <span className="truncate">{listing.from}</span>
                     <ArrowRight className="size-3 text-muted-foreground shrink-0" />
-                    <span className="font-semibold truncate">{listing.to}</span>
+                    <span className="truncate">{listing.to}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
-                    <Calendar className="size-3" /><span>{listing.date}</span><Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
-                    {listing.seats != null && <><Dot className="size-3" /><span>{listing.seats} seats</span></>}
-                    {listing.passengers != null && <><Dot className="size-3" /><span>{listing.passengers} passenger{listing.passengers > 1 ? 's' : ''}</span></>}
-                  </div>
-                  {listing.tags.length > 0 && <div className="flex gap-1.5 pl-5 pt-1">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>}
-                  {listing.notes && <p className="text-sm text-muted-foreground pl-5 pt-1">{listing.notes}</p>}
+                  <p className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
+                    <span>{listing.date}</span>
+                    <span>·</span>
+                    <span className={`size-1.5 rounded-full ${FLEX_DOT[listing.flexibility]}`} />
+                    <span>{FLEX_LABEL[listing.flexibility]}</span>
+                    {listing.seats != null && <><span>·</span><span>{listing.seats} seats</span></>}
+                    {listing.passengers != null && <><span>·</span><span>{listing.passengers} passenger{listing.passengers > 1 ? 's' : ''}</span></>}
+                  </p>
                 </div>
-                <div className="flex flex-col items-end gap-2 shrink-0">
-                  <ListingStatusBadge status={listing.status} />
-                  {listing.status === 'open' && (
-                    <button onClick={() => handleCancel(listing)} disabled={cancelling === listing.id} className="text-xs text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50">
-                      {cancelling === listing.id ? 'Cancelling…' : 'Cancel'}
-                    </button>
-                  )}
-                </div>
+                <ListingStatusBadge status={listing.status} />
               </div>
+              {listing.tags.length > 0 && <div className="flex flex-wrap gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>}
+              {listing.notes && <NotePreview notes={listing.notes} />}
+              {listing.status === 'open' && (
+                <div className="flex justify-end">
+                  <button onClick={() => handleCancel(listing)} disabled={cancelling === listing.id} className="text-xs font-semibold px-3 py-1.5 rounded-xl text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors disabled:opacity-50">
+                    {cancelling === listing.id ? 'Cancelling…' : 'Cancel listing'}
+                  </button>
+                </div>
+              )}
             </motion.div>
           ))}
         </div>
@@ -1439,92 +1497,86 @@ function ConnectionCard({
   const hasRiderPickupCoords = !!(connection.riderPickupLat && connection.riderPickupLng)
 
   return (
-    <motion.div ref={cardRef} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className={`bg-card rounded-3xl border overflow-hidden transition-colors ${autoOpen ? 'border-primary/50 ring-2 ring-primary/20' : 'border-border'}`}>
+    <motion.div ref={cardRef} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className={`rounded-2xl border overflow-hidden transition-colors ${['declined', 'cancelled', 'completed', 'expired'].includes(status) ? 'bg-muted/60 opacity-80' : 'bg-card'} ${autoOpen ? 'border-primary/50 ring-2 ring-primary/20' : 'border-border'}`}>
       {/* Header strip */}
-      <div className="px-6 pt-6 pb-4 space-y-4">
-        <div className="flex items-start justify-between gap-4">
-          {/* Partner info */}
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="relative shrink-0">
-              <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
-              {connection.unreadMessages > 0 && (
-                <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
-              )}
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">{connection.myRole === 'driver' ? 'You are driving' : 'You are riding with'}</span>
-              </div>
-              <h2 className="text-base font-semibold text-foreground truncate">{connection.withUser.name}</h2>
-              <p className="text-xs text-muted-foreground mt-0.5 truncate">{connection.route}</p>
-            </div>
+      <div className="px-5 pt-5 pb-3">
+        <div className="flex items-start gap-3">
+          <div className="relative shrink-0">
+            <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="card" />
+            {connection.unreadMessages > 0 && (
+              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
+            )}
           </div>
-          <div className="flex flex-col items-end gap-2 shrink-0">
-            <div className="flex items-center gap-1">
-              <button onClick={() => toggleSection('blockreport')} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors"><MoreHorizontal className="size-4" /></button>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+              <ConnStatusBadge status={status} />
+              <span className={CHIP}>{connection.myRole === 'driver' ? "You're driving" : "You're riding"}</span>
             </div>
-            <ConnStatusBadge status={status} />
+            <p className="text-xs text-muted-foreground mt-0.5 truncate">{connection.route} · {connection.date}</p>
+            {splitDone && <p className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400"><Check className="size-3.5" />Gas split confirmed</p>}
           </div>
+          <button onClick={() => toggleSection('blockreport')} aria-label="More actions" className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors shrink-0"><MoreHorizontal className="size-4" /></button>
         </div>
-
-        <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-          <span className="inline-flex items-center gap-1"><Calendar className="size-3.5" />{connection.date}</span>
-          {splitDone && <span className="inline-flex items-center gap-1 text-green-700"><Check className="size-3.5" />Split confirmed</span>}
-        </div>
+        {['declined', 'cancelled', 'completed', 'expired'].includes(status) && (
+          <p className="text-xs text-muted-foreground mt-3">{status === 'completed' ? '✓ This ride has been completed.' : `✗ Connection ${status}.`}</p>
+        )}
       </div>
 
       {/* Action buttons */}
-      <div className="px-6 pb-4 flex flex-wrap gap-2">
+      <div className="px-5 pb-5 flex flex-wrap gap-2 empty:hidden">
         {status === 'pending' && (
           <>
-            <button onClick={handleAccept} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
-            <button onClick={handleDecline} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
-            <button onClick={() => onOpenChat(connection)} className="relative inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
-              <MessageCircle className="size-4" />Message
-              {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
-            </button>
-            <button onClick={handleCancel} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-60 transition-colors">Cancel</button>
+            <button onClick={handleAccept} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
+            <button onClick={handleDecline} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-muted px-4 py-2.5 text-sm font-semibold text-muted-foreground hover:text-foreground disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
+            <div className="basis-full flex flex-wrap gap-2">
+              <button onClick={() => onOpenChat(connection)} className={`${GHOST_BTN} relative`}>
+                <MessageCircle className="size-4" />Message
+                {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
+              </button>
+              <button onClick={handleCancel} disabled={busy} className={`${GHOST_BTN} text-muted-foreground`}>Cancel</button>
+            </div>
           </>
         )}
         {status === 'accepted' && (
           <>
-            <button onClick={() => onOpenChat(connection)} className="relative inline-flex items-center gap-1.5 rounded-2xl bg-primary text-primary-foreground px-4 py-2 text-sm font-medium hover:bg-primary/90 transition-colors">
+            <button onClick={() => onOpenChat(connection)} className="relative flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-primary text-primary-foreground px-4 py-2.5 text-sm font-semibold hover:bg-primary/90 transition-colors">
               <MessageCircle className="size-4" />Chat
               {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
             </button>
-            {hasRouteCoords && (
-              <button onClick={() => onViewRoute(connection)} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
-                <Map className="size-4" />Route
-              </button>
-            )}
             {connection.myRole === 'driver' && hasRiderPickupCoords && (
-              <button onClick={() => onStartDriving(connection)} className="inline-flex items-center gap-1.5 rounded-2xl bg-green-600 text-white px-4 py-2 text-sm font-semibold hover:bg-green-700 transition-colors">
+              <button onClick={() => onStartDriving(connection)} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-emerald-700 transition-colors">
                 <Car className="size-4" />Start Driving
               </button>
             )}
-            <button onClick={() => toggleSection('gassplit')} className={`inline-flex items-center gap-1.5 rounded-2xl px-4 py-2 text-sm font-medium transition-colors ${expanded === 'gassplit' ? 'bg-accent/20 text-amber-800' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
-            <button onClick={handleComplete} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-foreground hover:bg-muted disabled:opacity-60 transition-colors"><Check className="size-4" />Complete</button>
-            <button onClick={handleCancel} disabled={busy} className="inline-flex items-center gap-1.5 rounded-2xl border border-border px-4 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-60 transition-colors">Cancel</button>
+            <div className="basis-full flex flex-wrap gap-2">
+              {hasRouteCoords && (
+                <button onClick={() => onViewRoute(connection)} className={GHOST_BTN}><Map className="size-4" />Route</button>
+              )}
+              <button onClick={() => toggleSection('gassplit')} className={`${GHOST_BTN} ${expanded === 'gassplit' ? 'bg-secondary text-secondary-foreground border-primary' : ''}`}><Fuel className="size-4" />Gas Split</button>
+              <button onClick={handleComplete} disabled={busy} className={GHOST_BTN}><Check className="size-4" />Complete</button>
+              <button onClick={handleCancel} disabled={busy} className={`${GHOST_BTN} text-muted-foreground`}>Cancel</button>
+            </div>
           </>
         )}
       </div>
 
       {/* Gas split panel */}
       {expanded === 'gassplit' && status === 'accepted' && (
-        <div className="border-t border-border bg-muted/30 px-6 py-4 space-y-3">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Confirm Gas Split</p>
+        <div className="border-t border-border bg-muted/40 px-5 py-4 space-y-3">
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">⛽ Confirm gas split</p>
           {gasSuggestion ? (
             <>
               <p className="text-sm text-muted-foreground">Suggested: <span style={MONO} className="text-foreground font-medium">${(gasSuggestion.amount_cents / 100).toFixed(2)}</span></p>
               {splitDone ? (
-                <p className="text-sm text-green-700 font-medium flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
+                <p className="text-sm text-emerald-700 dark:text-emerald-400 font-semibold flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
               ) : (
                 <div className="flex gap-2 items-center">
                   <div className="relative flex-1 max-w-[140px]">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                    <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
+                    <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15" />
                   </div>
-                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Confirm</button>
+                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 transition-colors">Confirm split</button>
                 </div>
               )}
               <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
@@ -1535,7 +1587,7 @@ function ConnectionCard({
 
       {/* Block/report panel */}
       {expanded === 'blockreport' && (
-        <div className="border-t border-border bg-muted/30 px-6 py-4 space-y-3">
+        <div className="border-t border-border bg-muted/40 px-5 py-4 space-y-3">
           {!reportMode ? (
             <div className="flex gap-2">
               <button onClick={handleBlock} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><UserX className="size-4" />Block</button>
@@ -1544,7 +1596,7 @@ function ConnectionCard({
           ) : (
             <div className="space-y-2">
               <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Reason</label>
-              <input type="text" value={reportReason} onChange={e => setReportReason(e.target.value)} placeholder="Describe the issue…" className="w-full px-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
+              <input type="text" value={reportReason} onChange={e => setReportReason(e.target.value)} placeholder="Describe the issue…" className="w-full px-3 py-2 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15" />
               <div className="flex gap-2">
                 <button onClick={handleReport} disabled={!reportReason.trim()} className="px-3 py-2 rounded-xl bg-destructive text-white text-sm font-medium disabled:opacity-50">Submit</button>
                 <button onClick={() => setReportMode(false)} className="px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
@@ -1616,13 +1668,13 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
   return (
     <div className="fixed inset-0 z-50 bg-background flex flex-col" role="dialog" aria-modal="true" aria-label={`Chat with ${connection.withUser.name}`}>
       {/* Header */}
-      <div className="shrink-0 flex items-center gap-3 px-4 py-3 border-b border-border">
-        <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-foreground transition-colors">
-          <X className="size-5" />
+      <div className="shrink-0 flex items-center gap-3 px-4 py-3 border-b border-border bg-card">
+        <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-muted-foreground hover:text-foreground transition-colors">
+          <ChevronLeft className="size-5" />
         </button>
         <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
         <div className="min-w-0">
-          <h2 className="text-base font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+          <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
           <p className="text-xs text-muted-foreground truncate">{connection.route} · {status === 'pending' ? 'Pending connection' : 'Accepted'}</p>
         </div>
       </div>
@@ -1635,8 +1687,8 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
             <div key={m.id} className={`flex items-end gap-2 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
               {!isMine && <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />}
               <div className={`max-w-[75%] space-y-0.5 ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
-                {!isMine && <span className="text-[10px] text-muted-foreground pl-1">{connection.withUser.name}</span>}
-                <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-sm' : 'bg-card text-foreground border border-border rounded-bl-sm'}`}>
+                {!isMine && <span className="text-xs font-semibold text-muted-foreground pl-1">{connection.withUser.name}</span>}
+                <div className={`px-3 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-[4px]' : 'bg-card text-foreground border border-border rounded-bl-[4px]'}`}>
                   {m.content}
                 </div>
                 <span className="text-[10px] text-muted-foreground px-1">{new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
@@ -1651,22 +1703,24 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
       </div>
 
       {/* Composer */}
-      <div className="shrink-0 border-t border-border p-4 max-w-2xl w-full mx-auto">
+      <div className="shrink-0 border-t border-border bg-card">
+      <div className="p-4 max-w-2xl w-full mx-auto">
         {status === 'pending' ? (
           <div className="space-y-2">
             <p className="text-xs text-muted-foreground">Quick messages while connection is pending:</p>
             <div className="flex flex-wrap gap-2">
               {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
-                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-muted border border-border text-sm text-foreground hover:bg-muted/70 disabled:opacity-50 transition-colors text-left">{text}</button>
+                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-secondary border border-primary text-xs font-medium text-secondary-foreground hover:bg-primary/15 disabled:opacity-50 transition-colors text-left">{text}</button>
               ))}
             </div>
           </div>
         ) : status === 'accepted' ? (
           <div className="flex gap-2">
-            <input type="text" autoFocus value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-3.5 py-2.5 rounded-2xl bg-muted border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
-            <button onClick={sendFree} disabled={sending || !msgText.trim()} className="px-3.5 py-2.5 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
+            <input type="text" autoFocus value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-4 py-2.5 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors" />
+            <button onClick={sendFree} disabled={sending || !msgText.trim()} aria-label="Send" className="size-10 shrink-0 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
           </div>
         ) : <p className="text-sm text-muted-foreground text-center">Chat unavailable in this state.</p>}
+      </div>
       </div>
     </div>
   )
@@ -1693,20 +1747,20 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
     <div className="space-y-6">
       <div>
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Inbox</h1>
-        <p className="text-muted-foreground mt-1">
+        <p className="text-sm text-muted-foreground mt-1">
           {totalUnread > 0
-            ? <span className="text-primary font-medium">{totalUnread} unread message{totalUnread !== 1 ? 's' : ''}</span>
+            ? <span className="text-primary font-semibold">{totalUnread} unread message{totalUnread !== 1 ? 's' : ''}</span>
             : 'Track pending offers, accepted rides, and chats.'}
         </p>
       </div>
       {connections.length === 0 ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <MessageCircle className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No connections yet</p>
-          <p className="text-sm mt-1">Connect with a driver or rider from the feed.</p>
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <p className="text-5xl mb-4">💬</p>
+          <p className="font-bold text-base text-foreground mb-1">No connections yet</p>
+          <p className="text-sm text-muted-foreground">Connect with a driver or rider from Discover.</p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <div className="flex flex-col gap-4 max-w-2xl">
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
@@ -1743,13 +1797,14 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 }) {
   const [filter, setFilter] = useState<NotifCategory>('all')
 
-  const iconForType = (type: string) => {
-    if (type.includes('connection_received')) return <UserPlus className="size-4 text-primary" />
-    if (type.includes('accepted') || type.includes('chat_unlocked')) return <Check className="size-4 text-green-600" />
-    if (type.includes('chat')) return <MessageCircle className="size-4 text-primary" />
-    if (type.includes('gas_split')) return <Fuel className="size-4 text-amber-600" />
-    if (type.includes('declined') || type.includes('cancelled')) return <X className="size-4 text-red-500" />
-    return <Bell className="size-4 text-muted-foreground" />
+  // Icon + tinted circle per type, as in the Figma Make notification list.
+  const iconForType = (type: string): { icon: React.ReactNode; bg: string } => {
+    if (type.includes('connection_received')) return { icon: <UserPlus className="size-4 text-primary" />, bg: 'bg-secondary' }
+    if (type.includes('accepted') || type.includes('chat_unlocked')) return { icon: <Check className="size-4 text-emerald-600" />, bg: 'bg-emerald-500/15' }
+    if (type.includes('chat')) return { icon: <MessageCircle className="size-4 text-primary" />, bg: 'bg-secondary' }
+    if (type.includes('gas_split')) return { icon: <Fuel className="size-4 text-amber-600" />, bg: 'bg-amber-500/15' }
+    if (type.includes('declined') || type.includes('cancelled')) return { icon: <X className="size-4 text-destructive" />, bg: 'bg-destructive/10' }
+    return { icon: <Bell className="size-4 text-muted-foreground" />, bg: 'bg-muted' }
   }
 
   const unreadCount = notifications.filter(n => !n.read).length
@@ -1760,7 +1815,7 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Notifications</h1>
-          <p className="text-muted-foreground mt-1">Stay up to date on your connections and activity.</p>
+          <p className="text-sm text-muted-foreground mt-1">{unreadCount > 0 ? `${unreadCount} unread` : 'Stay up to date on your connections and activity.'}</p>
         </div>
         {unreadCount > 0 && (
           <button onClick={onMarkAllRead} className="shrink-0 text-sm font-semibold text-primary hover:underline">
@@ -1771,33 +1826,33 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
       <div className="flex flex-wrap gap-2">
         {NOTIF_FILTERS.map(f => (
-          <button key={f.id} onClick={() => setFilter(f.id)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filter === f.id ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+          <button key={f.id} onClick={() => setFilter(f.id)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filter === f.id ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
             {f.label}
           </button>
         ))}
       </div>
 
       {visible.length === 0 ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <Bell className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No notifications</p>
-          <p className="text-sm mt-1">You're all caught up.</p>
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <p className="text-5xl mb-4">🔔</p>
+          <p className="font-bold text-base text-foreground mb-1">All caught up!</p>
+          <p className="text-sm text-muted-foreground">You have no notifications.</p>
         </div>
       ) : (
-        <div className="space-y-2">
+        <div className="flex flex-col gap-3 max-w-2xl">
           {visible.map(n => (
             <motion.div
               key={n.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
               onClick={() => onNavigate(n)}
-              className={`relative flex items-start gap-3 p-4 pl-5 rounded-2xl border cursor-pointer transition-colors ${n.read ? 'bg-card border-border hover:bg-muted/50' : 'bg-primary/10 border-primary/25 hover:bg-primary/15'}`}
+              className={`relative flex items-start gap-3 p-4 rounded-2xl border border-border cursor-pointer transition-colors ${n.read ? 'bg-muted/60 hover:bg-muted' : 'bg-card border-l-[3px] border-l-primary hover:bg-card/80'}`}
             >
-              {!n.read && <span className="absolute top-5 left-1.5 size-1.5 rounded-full bg-primary" aria-hidden />}
-              <div className="mt-0.5 shrink-0">{iconForType(n.type)}</div>
+              {(() => { const { icon, bg } = iconForType(n.type); return <div className={`size-9 rounded-full flex items-center justify-center shrink-0 ${bg}`}>{icon}</div> })()}
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-semibold text-foreground">{n.title}</p>
-                <p className="text-sm text-muted-foreground mt-0.5">{n.body}</p>
+                <p className={`text-sm leading-snug text-foreground ${n.read ? 'font-normal' : 'font-semibold'}`}>{n.title}</p>
+                <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{n.body}</p>
+                <p className="text-xs text-muted-foreground mt-1.5">{relativeTime(n.created_at)}</p>
               </div>
-              <span className="text-xs text-muted-foreground shrink-0">{relativeTime(n.created_at)}</span>
+              {!n.read && <span className="mt-2 size-2 rounded-full bg-primary shrink-0" aria-label="Unread" />}
               <button
                 onClick={e => { e.stopPropagation(); onDismiss(n.id) }}
                 aria-label="Dismiss notification"
@@ -1877,88 +1932,104 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
     finally { setVehicleSaving(false) }
   }
 
-  const inputCls = 'w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors'
+  const inputCls = 'w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors'
+  const cardCls = 'rounded-2xl bg-card border border-border p-5'
+  const labelCls = 'text-sm font-semibold block mb-1.5'
+  const saveMsg = (m: { text: string; ok: boolean } | null) => m && <p className={`text-sm font-medium ${m.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-destructive'}`}>{m.text}</p>
 
   return (
-    <div className="space-y-6">
-      <div className="rounded-[2rem] bg-card border border-border p-8">
-        <div className="flex flex-wrap items-center gap-6">
-          <div className="relative group">
-            {profile.photo_url ? (
-              <img src={profile.photo_url} alt="Profile" className="size-14 rounded-full object-cover ring-2 ring-primary/20" />
+    <div className="max-w-2xl mx-auto space-y-6">
+      <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Profile</h1>
+
+      <div className="flex items-center gap-4">
+        <div className="relative group shrink-0">
+          {profile.photo_url ? (
+            <img src={profile.photo_url} alt="Profile" className="size-20 rounded-full object-cover ring-2 ring-primary/20" />
+          ) : (
+            <div style={MONO} className="size-20 rounded-full bg-primary text-primary-foreground text-2xl font-bold flex items-center justify-center">{toInitials(profile.display_name)}</div>
+          )}
+          <label className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity cursor-pointer" aria-label="Upload profile photo">
+            <Camera className="size-5 text-white" />
+            <input type="file" accept="image/*" className="sr-only" onChange={async (e) => {
+              const file = e.target.files?.[0]; if (!file) return
+              const reader = new FileReader()
+              reader.onload = async (ev) => {
+                const dataUrl = ev.target?.result as string
+                try { const updated = await api.uploadPhoto(dataUrl); onProfileUpdate({ ...currentUser, profile: { ...profile, photo_url: updated.photo_url, photo_verified: true } }) }
+                catch (err) { alert(err instanceof Error ? err.message : 'Upload failed') }
+              }
+              reader.readAsDataURL(file)
+            }} />
+          </label>
+        </div>
+        <div className="min-w-0">
+          <p className="text-lg font-bold text-foreground truncate">{profile.display_name}</p>
+          <p className="text-sm text-muted-foreground truncate">{currentUser.email}</p>
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {currentUser.email_domain && (
+              <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.green}`}><Check className="size-3" />Email verified</span>
+            )}
+            {profile.photo_verified ? (
+              <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.green}`}><Check className="size-3" />Photo verified</span>
             ) : (
-              <Avatar initials={toInitials(profile.display_name)} size="lg" />
+              <span className="text-xs text-muted-foreground">Hover your photo to upload one</span>
             )}
-            <label className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer">
-              <Camera className="size-5 text-white" />
-              <input type="file" accept="image/*" className="sr-only" onChange={async (e) => {
-                const file = e.target.files?.[0]; if (!file) return
-                const reader = new FileReader()
-                reader.onload = async (ev) => {
-                  const dataUrl = ev.target?.result as string
-                  try { const updated = await api.uploadPhoto(dataUrl); onProfileUpdate({ ...currentUser, profile: { ...profile, photo_url: updated.photo_url, photo_verified: true } }) }
-                  catch (err) { alert(err instanceof Error ? err.message : 'Upload failed') }
-                }
-                reader.readAsDataURL(file)
-              }} />
-            </label>
-            {profile.photo_verified && (
-              <span className="absolute -bottom-1 -right-1 size-5 bg-green-500 rounded-full flex items-center justify-center"><Check className="size-3 text-white" /></span>
-            )}
-          </div>
-          <div>
-            <p className="text-sm text-muted-foreground">Your profile{profile.photo_verified ? ' · ✓ Photo verified' : ' · Hover photo to upload'}</p>
-            <h2 className="mt-2 text-2xl font-semibold text-foreground">{profile.display_name}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">{currentUser.email}</p>
           </div>
         </div>
       </div>
 
-      <div className="rounded-3xl bg-card border border-border p-6 space-y-3">
-        <div>
-          <h3 className="text-base font-semibold text-foreground">Riding as</h3>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
-          </p>
+      <div className={cardCls}>
+        <SectionLabel>Riding as</SectionLabel>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="text-2xl">{mode === 'rider' ? '🧍' : '🚗'}</span>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-foreground">{mode === 'rider' ? 'Rider' : 'Driver'}</p>
+              <p className="text-xs text-muted-foreground">
+                You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
+              </p>
+            </div>
+          </div>
+          {!confirmingModeSwitch && (
+            <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="shrink-0 px-3 py-1.5 rounded-xl bg-input-background border border-border text-xs font-semibold text-foreground hover:bg-muted transition-colors">
+              Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
+            </button>
+          )}
         </div>
-        {!confirmingModeSwitch ? (
-          <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="w-full py-2.5 rounded-xl border border-border text-sm font-semibold text-foreground hover:bg-muted transition-colors">
-            Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
-          </button>
-        ) : (
-          <div className="rounded-2xl bg-muted p-4 space-y-3">
+        {confirmingModeSwitch && (
+          <div className="mt-4 rounded-xl bg-muted p-4 space-y-3">
             <p className="text-sm text-foreground">
               Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
             </p>
             <div className="flex gap-2">
-              <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                Confirm switch
-              </button>
-              <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+              <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2.5 rounded-xl bg-card border border-border text-sm font-semibold text-muted-foreground hover:text-foreground transition-colors">
                 Cancel
+              </button>
+              <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                Confirm switch
               </button>
             </div>
           </div>
         )}
       </div>
 
-      <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
-        <h3 className="text-base font-semibold text-foreground">Edit Profile</h3>
-        <div className="space-y-3">
-          <div className="space-y-1.5"><label className="text-sm font-medium">Display name</label><input value={displayName} onChange={e => setDisplayName(e.target.value)} className={inputCls} /></div>
-          <div className="space-y-1.5"><label className="text-sm font-medium">Bio</label><textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tell others a bit about yourself…" className={`${inputCls} resize-none`} /></div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">Nationality <span className="text-muted-foreground font-normal">(optional)</span></label>
+      <div className={cardCls}>
+        <SectionLabel>Edit profile</SectionLabel>
+        <div className="flex flex-col gap-4">
+          <div><label className={labelCls}>Display name</label><input value={displayName} onChange={e => setDisplayName(e.target.value)} className={inputCls} /></div>
+          <div><label className={labelCls}>Bio</label><textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tell others a bit about yourself…" className={`${inputCls} resize-none`} /></div>
+          <div>
+            <label className={labelCls}>Nationality <span className="text-muted-foreground font-normal">(optional)</span></label>
             <input value={nationality} onChange={e => setNationality(e.target.value)} placeholder="e.g. Kenyan" className={inputCls} />
           </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">Interests <span className="text-muted-foreground font-normal">(optional icebreakers, e.g. "Loves Afrobeat")</span></label>
+          <div>
+            <label className={labelCls}>Interests <span className="text-muted-foreground font-normal">(optional icebreakers, e.g. "Loves Afrobeat")</span></label>
             {interests.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mb-1">
+              <div className="flex flex-wrap gap-2 mb-2">
                 {interests.map(tag => (
-                  <span key={tag} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-muted text-muted-foreground font-medium">
+                  <span key={tag} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-secondary text-secondary-foreground border border-primary font-medium">
                     {tag}
-                    <button type="button" onClick={() => removeInterest(tag)} aria-label={`Remove ${tag}`} className="hover:text-foreground"><X className="size-3" /></button>
+                    <button type="button" onClick={() => removeInterest(tag)} aria-label={`Remove ${tag}`} className="hover:opacity-70"><X className="size-3" /></button>
                   </span>
                 ))}
               </div>
@@ -1970,67 +2041,78 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
               placeholder="Type an interest and press Enter…" className={inputCls}
             />
           </div>
-        </div>
-        <div className="flex items-center gap-3">
-          <button onClick={saveProfile} disabled={profileSaving} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{profileSaving ? 'Saving…' : 'Save profile'}</button>
-          {profileMsg && <p className={`text-sm ${profileMsg.ok ? 'text-green-700' : 'text-red-500'}`}>{profileMsg.text}</p>}
+          <div className="flex items-center gap-3">
+            <button onClick={saveProfile} disabled={profileSaving} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{profileSaving ? 'Saving…' : 'Save profile'}</button>
+            {saveMsg(profileMsg)}
+          </div>
         </div>
       </div>
 
       {mode === 'driver' && (
-        <div className="rounded-3xl bg-card border border-border p-6 space-y-4">
-          <div>
-            <h3 className="text-base font-semibold text-foreground">Driver Readiness</h3>
-            <p className="text-sm text-muted-foreground mt-1">Vehicle details and self-declared eligibility.</p>
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            {[['Make', make, setMake], ['Model', model, setModel], ['Color', color, setColor]].map(([label, val, setter]) => (
-              <div key={label as string} className="space-y-1.5">
-                <label className="text-sm font-medium">{label as string}</label>
-                <input value={val as string} onChange={e => (setter as (v: string) => void)(e.target.value)} placeholder={label as string} className={inputCls} />
-              </div>
-            ))}
-            <div className="space-y-1.5"><label className="text-sm font-medium">Seats</label><input type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} className={inputCls} /></div>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">Vehicle type</label>
-            <div className="flex flex-wrap gap-2">
-              {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
-                <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-sm font-medium transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-                  {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
-                </button>
+        <div className={cardCls}>
+          <SectionLabel>Driver Readiness</SectionLabel>
+          <p className="text-sm text-muted-foreground -mt-1 mb-4">Vehicle details and self-declared eligibility.</p>
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {[['Make', make, setMake], ['Model', model, setModel], ['Color', color, setColor]].map(([label, val, setter]) => (
+                <div key={label as string}>
+                  <label className="text-xs font-semibold text-muted-foreground block mb-1">{label as string}</label>
+                  <input value={val as string} onChange={e => (setter as (v: string) => void)(e.target.value)} placeholder={label as string} className={inputCls} />
+                </div>
               ))}
             </div>
-          </div>
-          <div className="space-y-2">
-            {([['has_license', "I have a valid driver's license", hasLicense, setHasLicense], ['has_insurance', 'I have valid car insurance', hasInsurance, setHasInsurance], ['has_record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, boolean, (v: boolean) => void][]).map(([key, label, val, setter]) => (
-              <label key={key} className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-                <input type="checkbox" checked={val} onChange={() => setter(!val)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
-                {label}
-              </label>
-            ))}
-          </div>
-          <div className="flex items-center gap-3">
-            <button onClick={saveVehicle} disabled={vehicleSaving} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{vehicleSaving ? 'Saving…' : 'Save vehicle'}</button>
-            {vehicleMsg && <p className={`text-sm ${vehicleMsg.ok ? 'text-green-700' : 'text-red-500'}`}>{vehicleMsg.text}</p>}
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground block mb-2" id="profile-seats-label">Seats</label>
+              <div className="flex items-center gap-3" role="group" aria-labelledby="profile-seats-label">
+                <button type="button" aria-label="Decrease seats" onClick={() => setVSeats(String(Math.max(1, (parseInt(vSeats, 10) || 1) - 1)))} className="size-9 rounded-xl bg-input-background border border-border font-bold text-foreground hover:bg-muted transition-colors">−</button>
+                <span style={MONO} className="w-6 text-center text-lg font-bold text-foreground">{vSeats || '–'}</span>
+                <button type="button" aria-label="Increase seats" onClick={() => setVSeats(String(Math.min(9, (parseInt(vSeats, 10) || 0) + 1)))} className="size-9 rounded-xl bg-input-background border border-border font-bold text-foreground hover:bg-muted transition-colors">+</button>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-muted-foreground block mb-2">Vehicle type</label>
+              <div className="flex flex-wrap gap-2">
+                {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
+                  <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`}>
+                    {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex flex-col gap-2">
+              {([['has_license', "I have a valid driver's license", hasLicense, setHasLicense], ['has_insurance', 'I have valid car insurance', hasInsurance, setHasInsurance], ['has_record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, boolean, (v: boolean) => void][]).map(([key, label, val, setter]) => (
+                <label key={key} className="flex items-center gap-2.5 text-sm text-foreground cursor-pointer">
+                  <input type="checkbox" checked={val} onChange={() => setter(!val)} className="size-[18px] rounded accent-primary" />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={saveVehicle} disabled={vehicleSaving} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{vehicleSaving ? 'Saving…' : 'Save vehicle'}</button>
+              {saveMsg(vehicleMsg)}
+            </div>
           </div>
         </div>
       )}
 
-      <div className="rounded-3xl bg-muted p-6">
-        <p className="text-sm font-semibold text-foreground">Identity</p>
-        <p className="mt-2 text-sm text-muted-foreground">
-          {currentUser.email_domain ? `Verified domain: ${currentUser.email_domain}` : 'Use a verified email domain to establish trust.'}
-        </p>
+      <div className={cardCls}>
+        <SectionLabel>Identity</SectionLabel>
+        {currentUser.email_domain ? (
+          <span className={`inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-full ${STATUS_CHIP.green}`}>
+            <Check className="size-3.5" />Verified domain: {currentUser.email_domain}
+          </span>
+        ) : (
+          <p className="text-sm text-muted-foreground">Use a verified email domain to establish trust.</p>
+        )}
       </div>
 
       {api.isAdminUser(currentUser) && (
         <button
           type="button" onClick={onOpenAdmin}
-          className="w-full flex items-center justify-between gap-3 rounded-3xl bg-card border border-border p-5 text-left hover:border-primary/30 transition-colors"
+          className="w-full flex items-center justify-between gap-3 rounded-2xl bg-card border border-border p-5 text-left hover:border-primary/40 transition-colors"
         >
           <span className="flex items-center gap-3">
-            <span className="rounded-2xl bg-primary/10 p-2.5 text-primary"><Shield className="size-4" /></span>
+            <span className="rounded-xl bg-secondary p-2.5 text-secondary-foreground"><Shield className="size-4" /></span>
             <span>
               <span className="block text-sm font-semibold text-foreground">Admin Panel</span>
               <span className="block text-xs text-muted-foreground mt-0.5">Analytics, moderation, and audit logs</span>
@@ -2042,7 +2124,7 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
 
       <button
         type="button" onClick={onSignOut}
-        className="w-full flex items-center justify-center gap-2 rounded-3xl border border-border p-4 text-sm font-semibold text-muted-foreground hover:text-destructive hover:border-destructive/30 transition-colors"
+        className="w-full flex items-center justify-center gap-2 rounded-xl bg-input-background border border-border py-3 text-sm font-semibold text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
       >
         <LogOut className="size-4" />Sign out
       </button>
@@ -2108,32 +2190,48 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark }: {
-  setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
-  onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
-}) {
+function BrandMark({ size = 'md' }: { size?: 'sm' | 'md' }) {
   return (
-    <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
-      <div className="max-w-[1240px] mx-auto px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
-        <button onClick={() => setView('feed')} className="text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base">Let's Carpool</button>
+    <span className={`${size === 'sm' ? 'size-7 rounded-lg' : 'size-8 rounded-lg'} bg-primary text-primary-foreground flex items-center justify-center shrink-0`}>
+      <Car className="size-4" />
+    </span>
+  )
+}
+
+function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode }: {
+  setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
+  onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
+}) {
+  const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
+  return (
+    <header className="sticky top-0 z-40 bg-card text-foreground border-b border-border">
+      <div className="px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
+        <button onClick={() => setView('feed')} className="flex items-center gap-2 xl:hidden">
+          <BrandMark size="sm" />
+          <span className="text-sm font-bold text-foreground">Let's Carpool</span>
+        </button>
+        <div className="hidden xl:flex items-center gap-2">
+          <span className="text-sm font-semibold text-muted-foreground">Riding as</span>
+          <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{mode === 'driver' ? '🚗 Driver' : '🧍 Rider'}</span>
+        </div>
         {currentUser ? (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={() => setView('notifications')} className="relative p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Notifications">
-              <Bell className="size-5" />
-              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[10px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
+            <button onClick={() => setView('notifications')} className={`relative ${iconBtn}`} aria-label="Notifications">
+              <Bell className="size-4" />
+              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-sidebar-accent text-sidebar-foreground text-xs font-semibold flex items-center justify-center hover:ring-2 hover:ring-sidebar-primary/40 transition-all" aria-label="Account" style={MONO}>{initials}</button>
-            <button onClick={onSignOut} className="flex items-center gap-1.5 p-2 xl:px-3 xl:py-1.5 rounded-xl text-sm text-sidebar-foreground/70 hover:text-sidebar-foreground hover:bg-sidebar-accent transition-colors" aria-label="Sign out"><LogOut className="size-5 xl:size-4" /><span className="hidden xl:inline">Sign out</span></button>
+            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>{initials}</button>
+            <button onClick={onSignOut} className={iconBtn} aria-label="Sign out"><LogOut className="size-4" /></button>
           </div>
         ) : (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-2xl bg-sidebar-primary text-white text-sm font-semibold hover:opacity-90 transition-colors">Sign in</button>
+            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Sign in</button>
           </div>
         )}
       </div>
@@ -2171,42 +2269,51 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   )
 }
 
-function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) => void; onSignOut: () => void }) {
-  const items: Array<{ id: View; label: string }> = [
-    { id: 'feed', label: 'Discover' }, { id: 'map', label: 'Live Map' }, { id: 'pools', label: 'Pools' },
-    { id: 'post', label: 'Post' }, { id: 'my-listings', label: 'My Rides' },
-    { id: 'connections', label: 'Connections' }, { id: 'notifications', label: 'Notifications' }, { id: 'profile', label: 'Profile' },
+function Sidebar({ view, setView, onSignOut, unreadCount }: { view: View; setView: (v: View) => void; onSignOut: () => void; unreadCount: number }) {
+  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
+    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
+    { id: 'map', label: 'Live Map', icon: <MapPin className="size-5" /> },
+    { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
+    { id: 'post', label: 'Post', icon: <PlusCircle className="size-5" /> },
+    { id: 'my-listings', label: 'My Rides', icon: <Calendar className="size-5" /> },
+    { id: 'connections', label: 'Connections', icon: <MessageCircle className="size-5" /> },
+    { id: 'notifications', label: 'Notifications', icon: <Bell className="size-5" /> },
+    { id: 'profile', label: 'Profile', icon: <User className="size-5" /> },
   ]
   return (
-    <aside className="bg-sidebar border border-sidebar-border rounded-[2rem] p-6 xl:h-fit">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <p className="text-sm text-sidebar-foreground/60">Carpooling app</p>
-          <h1 className="mt-2 text-2xl font-semibold text-sidebar-foreground">Let's Carpool</h1>
-        </div>
-        <div className="rounded-3xl bg-sidebar-primary px-3 py-2 text-white text-xs font-semibold">MVP</div>
+    <aside className="fixed left-0 top-0 bottom-0 w-60 z-30 flex flex-col bg-sidebar text-sidebar-foreground">
+      <div className="flex items-center gap-2.5 px-5 py-5 border-b border-sidebar-border">
+        <BrandMark />
+        <span className="text-sm font-semibold">Let's Carpool</span>
       </div>
-      <div className="mt-8 space-y-1.5">
-        {items.map(item => (
-          <button key={item.id} type="button" onClick={() => setView(item.id)} className={`w-full rounded-3xl px-4 py-3 text-left text-sm font-medium transition-all ${view === item.id ? 'bg-sidebar-primary text-white shadow-lg shadow-sidebar-primary/20' : 'text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
-            {item.label}
-          </button>
-        ))}
-        <button type="button" onClick={onSignOut} className="w-full rounded-3xl px-4 py-3 text-left text-sm font-medium text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground transition-all flex items-center gap-2"><LogOut className="size-4" />Sign out</button>
+      <nav className="flex-1 py-4 px-3 flex flex-col gap-0.5 overflow-y-auto">
+        {items.map(item => {
+          const active = view === item.id
+          return (
+            <button
+              key={item.id} type="button" onClick={() => setView(item.id)}
+              aria-current={active ? 'page' : undefined}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium w-full text-left transition-colors ${active ? 'bg-sidebar-primary text-sidebar-primary-foreground' : 'text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+            >
+              <span className={active ? '' : 'text-sidebar-foreground/50'}>{item.icon}</span>
+              <span>{item.label}</span>
+              {item.id === 'notifications' && unreadCount > 0 && (
+                <span className="ml-auto min-w-5 text-center text-xs font-bold px-1.5 py-0.5 rounded-full bg-destructive text-white">{unreadCount > 9 ? '9+' : unreadCount}</span>
+              )}
+            </button>
+          )
+        })}
+      </nav>
+      <div className="px-3 pb-2">
+        <div className="rounded-xl p-3 text-xs bg-white/5 text-sidebar-foreground/50">
+          New here?{' '}
+          <button type="button" className="text-xs underline text-sidebar-foreground/80" onClick={() => setView('post')}>Post your first listing →</button>
+        </div>
       </div>
-      <div className="mt-8 rounded-[2rem] bg-card p-6 shadow-[0_36px_60px_-40px_rgba(0,0,0,0.18)]">
-        <div className="flex items-center gap-3">
-          <div className="rounded-2xl bg-primary/10 p-3 text-primary"><HomeIcon className="size-5" /></div>
-          <div>
-            <p className="text-sm text-muted-foreground">Quick start</p>
-            <p className="text-sm font-semibold text-foreground">Browse listings, post trips, and manage matches.</p>
-          </div>
-        </div>
-        <div className="mt-6 space-y-3 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2"><Dot className="size-2" />Search and filter rides across the marketplace.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Post one-off ride requests or driver trips.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Track pending connections and confirm gas split.</div>
-        </div>
+      <div className="px-3 pb-4">
+        <button type="button" onClick={onSignOut} className="flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm w-full text-sidebar-foreground/40 hover:bg-sidebar-accent hover:text-sidebar-foreground/70 transition-colors">
+          <LogOut className="size-4" />Sign out
+        </button>
       </div>
     </aside>
   )
@@ -2219,28 +2326,36 @@ function Sidebar({ view, setView, onSignOut }: { view: View; setView: (v: View) 
 
 function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
   const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
-    { mode: 'rider', icon: <Users className="size-7" />, title: 'I need a ride', desc: 'Find drivers heading your way.' },
-    { mode: 'driver', icon: <Car className="size-7" />, title: "I'm offering a ride", desc: 'Publish your route and find riders.' },
+    { mode: 'rider', icon: <Users className="size-8" />, title: 'I need a ride', desc: 'Find drivers heading your way and request a seat.' },
+    { mode: 'driver', icon: <Car className="size-8" />, title: "I'm offering a ride", desc: 'Publish your route, pick up riders, and split costs.' },
   ]
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-8 px-6 py-12 text-center">
-      <div>
-        <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground">How are you riding today?</h1>
-        <p className="mt-2 text-muted-foreground max-w-sm mx-auto">Choose how you'll use Carpool this session — you can switch anytime from Profile.</p>
-      </div>
-      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
-        {options.map(({ mode: m, icon, title, desc }) => (
-          <button
-            key={m}
-            type="button"
-            onClick={() => onChoose(m)}
-            className="flex-1 rounded-3xl border border-border bg-card p-6 text-left hover:border-primary/40 hover:shadow-lg transition-all"
-          >
-            <span className="inline-flex rounded-2xl bg-primary/10 p-3 text-primary">{icon}</span>
-            <h2 className="mt-4 text-lg font-semibold text-foreground">{title}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">{desc}</p>
-          </button>
-        ))}
+    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center px-4 py-10">
+      <div className="w-full max-w-lg">
+        <div className="mb-8">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="size-10 rounded-xl bg-primary text-primary-foreground flex items-center justify-center"><Car className="size-5" /></span>
+            <span className="text-sm font-semibold text-primary">Let's Carpool</span>
+          </div>
+          <h1 style={SERIF} className="text-3xl leading-tight text-foreground">How are you riding today?</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Choose your role for this session — you can switch anytime from your Profile.</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {options.map(({ mode: m, icon, title, desc }) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => onChoose(m)}
+              className="flex flex-col items-start gap-4 rounded-2xl border-2 border-border bg-card p-6 text-left shadow-sm hover:border-primary hover:-translate-y-0.5 hover:shadow-lg hover:shadow-primary/15 transition-all"
+            >
+              <span className="size-14 rounded-xl bg-secondary text-secondary-foreground flex items-center justify-center">{icon}</span>
+              <span>
+                <span className="block text-base font-bold leading-snug text-foreground">{title}</span>
+                <span className="block mt-1 text-sm leading-relaxed text-muted-foreground">{desc}</span>
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -2720,7 +2835,7 @@ export function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col">
+    <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
       <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
@@ -2734,14 +2849,13 @@ export function Home() {
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
       <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
-        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} />
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
-      <div className="flex-1 max-w-[1240px] mx-auto w-full px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
-        <div className="grid gap-6 xl:grid-cols-[280px_minmax(0,1fr)]">
-          <div className="hidden xl:block">
-            <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} />
-          </div>
+      {!isMobile && <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} unreadCount={unreadCount} />}
+
+      <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
+        <div>
           <main className="min-w-0">
             {guardedView === 'feed' && (
               mode === 'driver' ? (
@@ -2759,19 +2873,18 @@ export function Home() {
                   filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen}
                 />
               ) : (
-                <div className="space-y-8">
-                  {/* Its own desktop-styled MatchCard would clash with the new mobile
-                      card design, and isn't part of the mobile redesign's scope. */}
-                  {!isMobile && (
+                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                  // Its own desktop-styled MatchCard would clash with the new mobile
+                  // card design, and isn't part of the mobile redesign's scope.
+                  !isMobile && (
                     <BestMatches
                       listings={allListings}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                       onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
                     />
-                  )}
-                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} />
-                </div>
+                  )
+                } />
               )
             )}
             {guardedView === 'feed' && isMobile && (
@@ -2783,7 +2896,7 @@ export function Home() {
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
-            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} />}
+            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
             {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
