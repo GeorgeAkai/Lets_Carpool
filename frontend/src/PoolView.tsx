@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type CSSProperties } from "react"
-import { MapPin, Calendar, Clock, Users, Plus, ChevronRight, MessageCircle, Send, MoreHorizontal, Flag, UserX } from "lucide-react"
+import { MapPin, Calendar, Clock, Plus, ChevronRight, ArrowRight, MessageCircle, Send, MoreHorizontal, Flag, UserX } from "lucide-react"
 import { motion } from "motion/react"
 import * as api from "./api"
 import type { ApiPool, ApiPoolMembership, ApiPoolMessage } from "./api"
@@ -14,8 +14,18 @@ const TAG_EMOJI: Record<string, string> = {
   church: "⛪", college: "🎓", work: "💼", event: "🎉", family: "👨‍👩‍👧", sports: "⚽",
 }
 
-const inputCls = "w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors"
-const iconInputCls = "pl-9 " + inputCls
+// Category badge colors, from the Figma Make pool cards.
+const TAG_BADGE: Record<string, string> = {
+  church: "bg-violet-500/15 text-violet-700 dark:text-violet-300",
+  college: "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+  work: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+  event: "bg-red-500/15 text-red-700 dark:text-red-300",
+  family: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  sports: "bg-cyan-500/15 text-cyan-700 dark:text-cyan-300",
+}
+
+const inputCls = "w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors"
+const iconInputCls = "pl-10 " + inputCls
 
 function toInitials(name: string): string {
   const parts = name.trim().split(/\s+/)
@@ -68,7 +78,7 @@ function RosterMember({ member, isOrganizer, onReport, onBlock }: {
         <MoreHorizontal className="size-3.5" />
       </button>
       {menuOpen && (
-        <div className="absolute right-0 top-7 z-20 w-48 bg-card border border-border rounded-2xl shadow-lg p-2 space-y-1">
+        <div className="absolute right-0 top-7 z-20 w-48 bg-card border border-border rounded-xl shadow-lg p-2 space-y-1">
           {!reportMode ? (
             <>
               <button onClick={() => { onBlock(member.user_id); setMenuOpen(false) }} className="w-full flex items-center gap-2 px-2.5 py-2 rounded-xl text-sm text-foreground hover:bg-muted transition-colors">
@@ -129,7 +139,7 @@ function PoolChat({ pool, currentUserId, showToast }: {
   }
 
   return (
-    <div className="border-t border-border bg-muted/30 px-5 py-4 space-y-3">
+    <div className="border-t border-border bg-muted/40 px-5 py-4 space-y-3">
       <div className="flex items-center gap-2">
         <MessageCircle className="size-4 text-primary" />
         <span className="text-sm font-semibold text-foreground">Group chat</span>
@@ -151,7 +161,7 @@ function PoolChat({ pool, currentUserId, showToast }: {
                 )}
                 <div className={`max-w-[75%] space-y-0.5 flex flex-col ${isMine ? "items-end" : "items-start"}`}>
                   {!isMine && <span className="text-[10px] text-muted-foreground pl-1">{name}</span>}
-                  <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? "bg-primary text-primary-foreground rounded-br-sm" : "bg-card text-foreground border border-border rounded-bl-sm"}`}>
+                  <div className={`px-3 py-2 rounded-2xl text-sm leading-snug ${isMine ? "bg-primary text-primary-foreground rounded-br-[4px]" : "bg-card text-foreground border border-border rounded-bl-[4px]"}`}>
                     {m.content}
                   </div>
                 </div>
@@ -171,9 +181,9 @@ function PoolChat({ pool, currentUserId, showToast }: {
           type="text" value={text} onChange={e => setText(e.target.value)}
           onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()}
           placeholder="Message the group…"
-          className="flex-1 px-3.5 py-2.5 rounded-2xl bg-card border border-border text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors"
+          className="flex-1 px-4 py-2.5 rounded-xl bg-card border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors"
         />
-        <button onClick={send} disabled={sending || !text.trim()} className="px-3.5 py-2.5 rounded-2xl bg-primary text-primary-foreground disabled:opacity-50 transition-colors">
+        <button onClick={send} disabled={sending || !text.trim()} aria-label="Send" className="size-10 shrink-0 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 disabled:opacity-50 transition-colors">
           <Send className="size-4" />
         </button>
       </div>
@@ -274,13 +284,13 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Community Pools</h1>
-          <p className="text-muted-foreground mt-1">Organize group trips — church outings, college rides, work commutes.</p>
+          <p className="text-sm text-muted-foreground mt-1">Organize group trips — church outings, college rides, work commutes.</p>
         </div>
         <button
           onClick={() => setTab(tab === "create" ? "browse" : "create")}
-          className="shrink-0 flex items-center gap-1.5 px-4 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
+          className="shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
         >
-          <Plus className="size-4" />{tab === "create" ? "Browse" : "Create"}
+          <Plus className="size-4" />{tab === "create" ? "Browse" : "Create Pool"}
         </button>
       </div>
 
@@ -288,9 +298,9 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
         <>
           {/* Tag filter */}
           <div className="flex flex-wrap gap-2">
-            <button onClick={() => setFilterTag("")} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === "" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>All</button>
+            <button onClick={() => setFilterTag("")} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterTag === "" ? "bg-primary text-primary-foreground border-primary" : "bg-card text-muted-foreground border-border hover:text-foreground"}`}>All</button>
             {COMMUNITY_TAGS.map(tag => (
-              <button key={tag} onClick={() => setFilterTag(tag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+              <button key={tag} onClick={() => setFilterTag(tag)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterTag === tag ? "bg-primary text-primary-foreground border-primary" : "bg-card text-muted-foreground border-border hover:text-foreground"}`}>
                 {TAG_EMOJI[tag]} {tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}
@@ -299,10 +309,11 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
           {loading && <p className="text-sm text-muted-foreground animate-pulse">Loading pools…</p>}
 
           {!loading && pools.length === 0 && (
-            <div className="text-center py-24 text-muted-foreground">
-              <p className="text-5xl mb-4">🚐</p>
-              <p className="font-medium">No pools yet</p>
-              <p className="text-sm mt-1">Create the first pool for your group.</p>
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <p className="text-5xl mb-4">👥</p>
+              <p className="font-bold text-base text-foreground mb-1">No pools yet</p>
+              <p className="text-sm text-muted-foreground mb-5">Create the first pool for your group.</p>
+              <button onClick={() => setTab("create")} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Create Pool</button>
             </div>
           )}
 
@@ -318,43 +329,51 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
                   key={pool.id}
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="bg-card border border-border rounded-3xl overflow-hidden"
+                  className="bg-card border border-border rounded-2xl overflow-hidden hover:shadow-lg hover:shadow-foreground/10 transition-shadow"
                 >
-                  <div className="p-5 space-y-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-lg">{TAG_EMOJI[pool.community_tag] ?? "🚗"}</span>
-                          <h3 className="text-base font-semibold text-foreground">{pool.name}</h3>
+                  <div className="p-5 space-y-3">
+                    <div className="flex items-start gap-3">
+                      <span className="text-3xl leading-none">{TAG_EMOJI[pool.community_tag] ?? "🚗"}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h3 className="text-sm font-bold text-foreground">{pool.name}</h3>
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full capitalize ${TAG_BADGE[pool.community_tag] ?? "bg-muted text-muted-foreground"}`}>{pool.community_tag}</span>
                         </div>
-                        {pool.description && <p className="text-sm text-muted-foreground mt-1">{pool.description}</p>}
+                        <p className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
+                          <Calendar className="size-3" />{pool.trip_date}
+                          {pool.departure_time && <><Clock className="size-3 ml-1" />{formatTime(pool.departure_time)}</>}
+                        </p>
                       </div>
-                      <span className={`text-xs font-medium px-2 py-0.5 rounded-full shrink-0 ${pool.status === "full" ? "bg-amber-100 text-amber-800" : "bg-green-100 text-green-800"}`}>
-                        {pool.status === "full" ? "Full" : "Open"}
-                      </span>
+                      {member ? (
+                        <span className="text-xs font-semibold px-2 py-0.5 rounded-full shrink-0 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">✓ Joined</span>
+                      ) : pool.status === "full" ? (
+                        <span className="text-xs font-semibold px-2 py-0.5 rounded-full shrink-0 bg-amber-500/15 text-amber-700 dark:text-amber-300">Full</span>
+                      ) : null}
                     </div>
 
-                    <div className="space-y-1.5 text-sm">
-                      <div className="flex items-center gap-2">
-                        <MapPin className="size-3.5 text-muted-foreground shrink-0" />
-                        <span className="text-muted-foreground">{pool.pickup.label}</span>
-                        <ChevronRight className="size-3 text-muted-foreground" />
-                        <span className="font-medium">{pool.destination.label}</span>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-muted-foreground pl-5">
-                        <span className="flex items-center gap-1"><Calendar className="size-3" />{pool.trip_date}</span>
-                        {pool.departure_time && (
-                          <span className="flex items-center gap-1"><Clock className="size-3" />{formatTime(pool.departure_time)}</span>
-                        )}
-                        <span className="flex items-center gap-1"><Users className="size-3" /><span style={MONO}>{pool.member_count}/{pool.max_participants}</span></span>
+                    {pool.description && <p className="text-sm text-muted-foreground">{pool.description}</p>}
+
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <MapPin className="size-3 shrink-0" />
+                      <span>{pool.pickup.label}</span>
+                      <ArrowRight className="size-3 shrink-0" />
+                      <span className="font-medium text-foreground">{pool.destination.label}</span>
+                    </div>
+
+                    <div>
+                      <div className="flex items-center justify-between text-xs text-muted-foreground mb-1.5">
+                        <span><span style={MONO} className="text-foreground font-medium">{pool.member_count}/{pool.max_participants}</span> members</span>
                         <span>{spotsLeft} spot{spotsLeft !== 1 ? "s" : ""} left</span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                        <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${Math.min(100, (pool.member_count / Math.max(1, pool.max_participants)) * 100)}%` }} />
                       </div>
                     </div>
 
                     {/* Named roster */}
                     {pool.members.length > 0 && (
                       <div className="space-y-1.5">
-                        <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Riding</span>
+                        <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground">Riding</span>
                         <div className="flex flex-col gap-1.5">
                           {organizer && (
                             <RosterMember key={organizer.user_id} member={organizer} isOrganizer onReport={handleReport} onBlock={handleBlock} />
@@ -370,17 +389,17 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
                       <div className="flex gap-2">
                         <button
                           onClick={() => setOpenChatPoolId(chatOpen ? null : pool.id)}
-                          className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl text-sm font-medium transition-colors ${chatOpen ? "bg-primary/10 text-primary" : "bg-green-100 text-green-800 hover:bg-green-200"}`}
+                          className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-semibold transition-colors ${chatOpen ? "bg-secondary text-secondary-foreground" : "bg-primary text-primary-foreground hover:bg-primary/90"}`}
                         >
-                          {chatOpen ? <>Close chat</> : <><MessageCircle className="size-4" />Join Group Chat</>}
+                          {chatOpen ? <>Close chat</> : <><MessageCircle className="size-4" />Open group chat</>}
                         </button>
-                        <button onClick={() => handleLeave(pool)} className="px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Leave</button>
+                        <button onClick={() => handleLeave(pool)} className="px-4 py-2.5 rounded-xl bg-input-background border border-border text-sm font-semibold text-muted-foreground hover:text-destructive transition-colors">Leave</button>
                       </div>
                     ) : (
                       <button
                         onClick={() => handleJoin(pool)}
                         disabled={pool.status === "full"}
-                        className="w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-all flex items-center justify-center gap-1"
+                        className="w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-50 transition-all flex items-center justify-center gap-1"
                       >
                         Join pool <ChevronRight className="size-4" />
                       </button>
@@ -399,15 +418,15 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
         <div className="max-w-lg">
           <form onSubmit={handleCreate} className="space-y-5">
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">Pool name</label>
+              <label className="text-sm font-semibold">Pool name</label>
               <input required value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Grace Church Sunday Trip" className={inputCls} />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">Community type</label>
+              <label className="text-sm font-semibold">Community type</label>
               <div className="flex flex-wrap gap-2">
                 {COMMUNITY_TAGS.map(tag => (
-                  <button key={tag} type="button" onClick={() => setCommunityTag(tag)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${communityTag === tag ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground hover:text-foreground"}`}>
+                  <button key={tag} type="button" onClick={() => setCommunityTag(tag)} className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${communityTag === tag ? "bg-primary text-primary-foreground border-primary" : "bg-input-background text-muted-foreground border-border hover:text-foreground"}`}>
                     {TAG_EMOJI[tag]} {tag.charAt(0).toUpperCase() + tag.slice(1)}
                   </button>
                 ))}
@@ -416,16 +435,16 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
 
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">From</label>
+                <label className="text-sm font-semibold">From</label>
                 <div className="relative">
-                  <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+                  <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
                   <input required value={from} onChange={e => setFrom(e.target.value)} placeholder="Pickup area" className={iconInputCls} />
                 </div>
               </div>
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">To</label>
+                <label className="text-sm font-semibold">To</label>
                 <div className="relative">
-                  <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+                  <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
                   <input required value={to} onChange={e => setTo(e.target.value)} placeholder="Destination" className={iconInputCls} />
                 </div>
               </div>
@@ -433,16 +452,16 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
 
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">Trip date</label>
+                <label className="text-sm font-semibold">Trip date</label>
                 <div className="relative">
-                  <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+                  <Calendar className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
                   <input required type="date" value={tripDate} onChange={e => setTripDate(e.target.value)} className={iconInputCls} />
                 </div>
               </div>
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">Departure time</label>
+                <label className="text-sm font-semibold">Departure time</label>
                 <div className="relative">
-                  <Clock className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+                  <Clock className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
                   <input required type="time" value={departureTime} onChange={e => setDepartureTime(e.target.value)} className={iconInputCls} />
                 </div>
               </div>
@@ -450,21 +469,21 @@ export function PoolView({ userCoords, currentUserId, showToast }: Props) {
 
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">Max participants</label>
+                <label className="text-sm font-semibold">Max participants</label>
                 <input type="number" min="2" max="50" value={maxParticipants} onChange={e => setMaxParticipants(e.target.value)} className={inputCls} />
               </div>
               <div className="space-y-1.5">
-                <label className="text-sm font-medium">Seats per vehicle</label>
+                <label className="text-sm font-semibold">Seats per vehicle</label>
                 <input type="number" min="1" max="15" value={seatsPerVehicle} onChange={e => setSeatsPerVehicle(e.target.value)} className={inputCls} />
               </div>
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-sm font-medium">Description (optional)</label>
+              <label className="text-sm font-semibold">Description (optional)</label>
               <textarea value={description} onChange={e => setDescription(e.target.value)} rows={3} placeholder="Tell the group what this trip is about…" className={`${inputCls} resize-none`} />
             </div>
 
-            <button type="submit" disabled={creating} className="w-full py-3 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">
+            <button type="submit" disabled={creating} className="w-full py-4 rounded-xl bg-primary text-primary-foreground text-sm font-bold shadow-lg shadow-primary/30 hover:bg-primary/90 disabled:opacity-60 disabled:shadow-none transition-all">
               {creating ? "Creating…" : "Create pool"}
             </button>
           </form>

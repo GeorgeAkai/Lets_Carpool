@@ -2,6 +2,8 @@
 
 Living document from product/design grill sessions. Use this in team meetings to align, challenge, or revise decisions before they land in `CONTEXT.md`.
 
+**This is a dated decision log, not the current state.** Rows below record what was decided in the 2026-05-24 session and are left as-is even where later work revisited them (flagged inline where that happened). For what's actually built today, see `CONTEXT.md` (domain model) and `PRD.md` (architecture, feature status, roadmap) — both updated 2026-09-26.
+
 **Scope for MVP:** General user-facing features (auth, listings, connect, gas split basics). Security/trust and AI features are out of scope unless noted.
 
 **Tech stack (agreed):** React Native (mobile + web), FastAPI, PostgreSQL + PostGIS.
@@ -22,8 +24,8 @@ Living document from product/design grill sessions. Use this in team meetings to
 | 8 | Gas money split in MVP | **B — In-app agreement, offline payment** | App calculates/displays a proposed split; both parties can agree in app, but money changes hands outside the app. Product wording should be **confirm split**, not “sign agreement.” Store amount, confirmer, and timestamp. |
 | 8a | Gas split agreement wording | **C — No signing language** | Avoid implying a legal contract; implement lightweight confirmation under the hood. |
 | 9 | Driver verification in MVP | **B — Self-declared** | Driver confirms license/insurance/good driving record in profile; no document upload or review until Security + Trust phase. |
-| 10 | Real-time journey tracking | **A — Not in MVP** | Use static pickup/dropoff/listing locations only; live tracking moves to Security + Trust with journey sharing/SOS. |
-| 11 | Verticals | **B — Tags/filters only** | Support lightweight tags such as `airport` and `student` within the same core carpool flow. **Remove moving help** from MVP scope. |
+| 10 | Real-time journey tracking | **A — Not in MVP** | Use static pickup/dropoff/listing locations only; live tracking moves to Security + Trust with journey sharing/SOS. **Revisited since**: a scoped exception shipped — live GPS tracking during the driver's "Start Driving" pickup leg of an accepted connection, with dynamic ETA. Full-ride tracking, journey sharing, and SOS remain out of scope. See `CONTEXT.md` § Live Location & Navigation. |
+| 11 | Verticals | **B — Tags/filters only** | Support lightweight tags such as `airport` and `student` within the same core carpool flow. **Remove moving help** from MVP scope. **Revisited since**: tag set grew to `airport`, `student`, `church`, `college`, `work`, `event`. Moving help is still out. |
 | 12 | Platforms for MVP | **B — Mobile + web from day one** | Use the shared React Native / React Native Web stack for iOS, Android, and web. |
 | 13 | Auth / identity | **B — OAuth first** | Use Google/Apple OAuth with optional email fallback. Backend verifies provider tokens and creates app sessions/JWTs. |
 | 14 | Profile minimum | **Recommended MVP default** | Store display name, profile photo, short bio, verified email/domain, and driver-only vehicle/self-declaration fields when relevant. |
@@ -39,7 +41,7 @@ Living document from product/design grill sessions. Use this in team meetings to
 | 24 | Notifications | **Recommended MVP default** | Use in-app and email notifications for offers/requests, accept/decline/cancel, chat unlock/messages, and split confirmations. Push notifications can follow later. |
 | 25 | Completion flow | **Recommended MVP default** | After the ride date, accepted connections can be marked completed. Record who confirmed completion; no disputes/refunds in MVP. |
 | 26 | Ratings and reviews | **Recommended MVP default** | Defer ratings/reviews to Security + Trust. Keep completion data so ratings can be added later without remodelling rides. |
-| 27 | Basic safety controls | **Recommended MVP default** | Authenticated-only marketplace with block/report controls. Full moderation workflows, SOS, and journey sharing remain post-MVP. |
+| 27 | Basic safety controls | **Recommended MVP default** | Authenticated-only marketplace with block/report controls. Full moderation workflows, SOS, and journey sharing remain post-MVP. **Revisited since**: a scoped admin/moderation panel shipped (suspend/unsuspend, warnings, report review, audit log) as an explicit exception, not full moderation tooling. ID verification, SOS, and journey sharing are still post-MVP. See `CONTEXT.md` § Admin & Moderation. |
 | 28 | Maps / geocoding provider | **Recommended MVP default** | Use a managed maps/geocoding provider behind a replaceable integration. Persist coordinates and display labels as app data, not provider response blobs as the source of truth. |
 
 ---
@@ -57,6 +59,8 @@ Living document from product/design grill sessions. Use this in team meetings to
 - AI: student matching, dynamic pricing, flight data, luggage/vehicle size ML
 - Connection model may move from symmetric browse (**Q3 A**) to suggestions-only (**Q3 C**) — note for team
 - Out of scope: moving help (not a carpool use case)
+
+**Shipped since this session, never formally decided here:** a `Pool` group-trip model (organizer-created, join/leave, capacity, group chat) launched alongside the two-sided request/trip model this agenda designed — see `CONTEXT.md` § Group Trips (Pools). Whether `Pool` stays separate or unifies with `RideRequest`/`DriverTrip` is an open architecture decision (`PRD.md` roadmap item 5) worth a future grill session.
 
 ---
 
@@ -82,3 +86,4 @@ Living document from product/design grill sessions. Use this in team meetings to
 | 2026-05-24 | Q17 resolved: listing states include automatic expiry. |
 | 2026-05-24 | Q18 resolved: connection states include automatic expiry. |
 | 2026-05-24 | Q19–Q28 added as recommended MVP defaults per user request. |
+| 2026-09-26 | Annotated Q10, Q11, Q27 as revisited by later shipped work (pickup-leg live tracking, expanded tag set, scoped admin/moderation panel); noted the un-agenda'd `Pool` feature in the parking lot. `CONTEXT.md` and `PRD.md` updated to match current state — this file's resolution rows are left as the historical record. |

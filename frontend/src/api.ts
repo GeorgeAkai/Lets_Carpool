@@ -44,6 +44,7 @@ export type ApiDriverTrip = {
   created_at: string;
   luggage_capacity: string;
   car_type: string | null;
+  notes: string | null;
 };
 
 export type ApiRideRequest = {
@@ -61,6 +62,7 @@ export type ApiRideRequest = {
   created_at: string;
   luggage_size: string;
   preferred_car_type: string | null;
+  notes: string | null;
 };
 
 export type ApiConnection = {
@@ -328,6 +330,7 @@ export function createDriverTrip(data: {
   tags: string[];
   luggage_capacity?: string;
   car_type?: string;
+  notes?: string;
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
@@ -360,6 +363,7 @@ export function createRideRequest(data: {
   tags: string[];
   luggage_size?: string;
   preferred_car_type?: string;
+  notes?: string;
 }): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", "/ride-requests", data);
 }

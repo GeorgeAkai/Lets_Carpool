@@ -221,13 +221,14 @@ interface NominatimResult {
 interface Props {
   userCoords: { lat: number; lng: number } | null
   currentUserId: string
+  userMode: "driver" | "rider"
   tripRoute?: TripRoute | null
   onClearRoute?: () => void
   drivingTo?: DrivingTarget | null
   onStopDriving?: () => void
 }
 
-export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
+export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
   const { resolvedTheme } = useTheme()
   const isDark = resolvedTheme === "dark"
   const accentColor = isDark ? ACCENT_DARK : ACCENT_LIGHT
@@ -748,11 +749,11 @@ export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStop
             <button onClick={onClearRoute} className="flex items-center gap-2 px-4 py-2 rounded-2xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
               <X className="size-4" /> Back to Map
             </button>
-          ) : (
+          ) : userMode === "driver" ? (
             <button onClick={toggleSharing} className={`px-4 py-2 rounded-2xl text-sm font-semibold transition-colors ${sharing ? "bg-green-600 text-white" : "bg-primary text-primary-foreground hover:bg-primary/90"}`}>
               {sharing ? "📡 Sharing location" : "Share my location"}
             </button>
-          )}
+          ) : null}
         </div>
 
         {mode === "driving" && drivingTo && (
@@ -925,12 +926,14 @@ export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStop
 
                     {sheetExpanded && (
                       <div className="space-y-2 pt-2">
-                        <button
-                          onClick={toggleSharing}
-                          className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${sharing ? "bg-green-500 text-white" : "bg-white text-slate-900"}`}
-                        >
-                          {sharing ? "📡 Sharing your location" : "Share my location as a driver"}
-                        </button>
+                        {userMode === "driver" && (
+                          <button
+                            onClick={toggleSharing}
+                            className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${sharing ? "bg-green-500 text-white" : "bg-white text-slate-900"}`}
+                          >
+                            {sharing ? "📡 Sharing your location" : "Share my location as a driver"}
+                          </button>
+                        )}
                         {drivers.map(d => (
                           <button key={d.user_id} onClick={() => setSelected(d)} className={`w-full text-left rounded-2xl p-3.5 flex items-center gap-3 transition-colors ${selected?.user_id === d.user_id ? "bg-white/15" : "bg-white/5 hover:bg-white/10"}`}>
                             <span className="text-xl">{CAR_EMOJIS[d.car_type ?? ""] ?? "🚗"}</span>
