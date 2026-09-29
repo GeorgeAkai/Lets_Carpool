@@ -807,7 +807,7 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 
 function DriverHomeView({
   myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
-  searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  searchQuery, setSearchQuery, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen, connectedListingIds,
@@ -817,7 +817,6 @@ function DriverHomeView({
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -883,8 +882,7 @@ function DriverHomeView({
         )}
         <FilterSheet
           open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
-          filterType={filterType} setFilterType={setFilterType}
-          filterTag={filterTag} setFilterTag={setFilterTag}
+                    filterTag={filterTag} setFilterTag={setFilterTag}
           filterCarType={filterCarType} setFilterCarType={setFilterCarType}
           filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
         />
@@ -991,14 +989,13 @@ function DriverHomeView({
 // ─── Feed view ────────────────────────────────────────────────────────────────
 
 function FeedView({
-  searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  searchQuery, setSearchQuery, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
   listings, onConnect, loading, currentUserId, setView, connectedListingIds, bestMatches,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -1014,7 +1011,7 @@ function FeedView({
   const isMobile = useIsMobile()
 
   if (isMobile) {
-    const activeFilterCount = [filterType !== 'all', filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
+    const activeFilterCount = [filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
     return (
       <div className="space-y-4">
         <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
@@ -1042,8 +1039,7 @@ function FeedView({
         )}
         <FilterSheet
           open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
-          filterType={filterType} setFilterType={setFilterType}
-          filterTag={filterTag} setFilterTag={setFilterTag}
+                    filterTag={filterTag} setFilterTag={setFilterTag}
           filterCarType={filterCarType} setFilterCarType={setFilterCarType}
           filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
         />
@@ -1065,14 +1061,6 @@ function FeedView({
           <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
             className="w-full pl-10 pr-4 py-3 rounded-xl bg-card border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary focus:ring-3 focus:ring-primary/15 transition-colors" />
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {(['all', 'driver', 'rider'] as const).map(t => (
-            <button key={t} onClick={() => setFilterType(t)} className={pill(filterType === t)}>
-              {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-            </button>
-          ))}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -2409,7 +2397,6 @@ export function Home() {
 
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
-  const [filterType, setFilterType] = useState<'all' | 'driver' | 'rider'>('all')
   const [filterTag, setFilterTag] = useState<'' | RideTag>('')
   const [filterCarType, setFilterCarType] = useState<'' | CarType>('')
   const [filterLuggage, setFilterLuggage] = useState<'' | LuggageSize>('')
@@ -2623,14 +2610,17 @@ export function Home() {
   const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const [trips, requests] = await Promise.all([api.searchDriverTrips({}), api.searchRideRequests({})])
-      const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
+      // Only fetch the side this mode shows — riders browse drivers' trips,
+      // drivers browse riders' requests.
+      const combined = mode === 'rider'
+        ? (await api.searchDriverTrips({})).map(tripToListing)
+        : (await api.searchRideRequests({})).map(requestToListing)
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
       setAllListings(deduped)
       setFeedError(false)
     } catch { setFeedError(true) } finally { setFeedLoading(false) }
-  }, [])
+  }, [mode])
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
@@ -2652,7 +2642,8 @@ export function Home() {
     const now = new Date()
     const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
     return allListings.filter(listing => {
-      const matchType = filterType === 'all' || listing.type === filterType
+      // Discover is mode-only: riders see drivers' offers, never other riders' requests.
+      const matchType = listing.type === (mode === 'rider' ? 'driver' : 'rider')
       const matchTag = filterTag === '' || listing.tags.includes(filterTag)
       const matchSearch = searchQuery.trim() === '' || listing.to.toLowerCase().includes(searchQuery.toLowerCase()) || listing.from.toLowerCase().includes(searchQuery.toLowerCase())
       const matchCarType = filterCarType === '' || (listing.type === 'driver' && listing.carType === filterCarType)
@@ -2661,7 +2652,7 @@ export function Home() {
       const matchSeats = seatsNeeded == null || listing.type !== 'driver' || ((listing.seats ?? 0) - (listing.seatsUsed ?? 0)) >= seatsNeeded
       return matchType && matchTag && matchSearch && matchCarType && matchLuggage && matchDate && matchSeats
     })
-  }, [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [allListings, mode, filterTag, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Listings the current user has already acted on ──────────────────────────
   // onConnect always creates a fresh ride_request/driver_trip on our side, so
@@ -2886,8 +2877,7 @@ export function Home() {
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
-                  filterType={filterType} setFilterType={setFilterType}
-                  filterTag={filterTag} setFilterTag={setFilterTag}
+                                    filterTag={filterTag} setFilterTag={setFilterTag}
                   filterCarType={filterCarType} setFilterCarType={setFilterCarType}
                   filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
                   quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter}
@@ -2895,7 +2885,7 @@ export function Home() {
                   filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen}
                 />
               ) : (
-                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
                   // Its own desktop-styled MatchCard would clash with the new mobile
                   // card design, and isn't part of the mobile redesign's scope.
                   !isMobile && (

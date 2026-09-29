@@ -67,10 +67,9 @@ export function MobileFilterBar({
 
 export function FilterSheet({
   open, onClose,
-  filterType, setFilterType, filterTag, setFilterTag, filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
+  filterTag, setFilterTag, filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
 }: {
   open: boolean; onClose: () => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -93,17 +92,6 @@ export function FilterSheet({
           <button onClick={onClose} aria-label="Close filters" className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-colors">
             <X className="size-5" />
           </button>
-        </div>
-
-        <div className="space-y-1.5">
-          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Showing</p>
-          <div className="flex flex-wrap gap-2">
-            {(['all', 'driver', 'rider'] as const).map(t => (
-              <button key={t} onClick={() => setFilterType(t)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterType === t ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
-                {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-              </button>
-            ))}
-          </div>
         </div>
 
         <div className="space-y-1.5">

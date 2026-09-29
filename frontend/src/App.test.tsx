@@ -240,22 +240,24 @@ describe("Feed view", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
   });
 
-  it("loads ride requests from the API on mount", async () => {
+  it("shows drivers ride requests in Driver mode", async () => {
+    sessionStorage.setItem("carpool_mode", "driver");
     mockFetch({
       "GET /me": ME_RESPONSE,
-      "GET /driver-trips/search": [],
+      "GET /driver-trips/search": [DRIVER_TRIP_1],
       "GET /ride-requests/search": [RIDE_REQUEST_1],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [],
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
 
-    await waitFor(() =>
-      expect(screen.getByText("Providence, RI")).toBeTruthy()
-    );
+    await waitFor(() => expect(screen.getByText("Providence, RI")).toBeTruthy());
+    // Drivers see riders needing a ride, not other drivers' offers.
+    expect(screen.queryByText("Logan Airport")).toBeNull();
   });
 
-  it("filters by type when filter button is clicked", async () => {
-    const user = userEvent.setup();
+  it("never shows riders other riders' ride requests", async () => {
     mockFetch({
       "GET /me": ME_RESPONSE,
       "GET /driver-trips/search": [DRIVER_TRIP_1],
@@ -265,10 +267,11 @@ describe("Feed view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
-    // Click "Offering rides" filter — only driver trips should show
-    await user.click(screen.getByRole("button", { name: /offering rides/i }));
     expect(screen.queryByText("Providence, RI")).toBeNull();
-    expect(screen.getByText("Logan Airport")).toBeTruthy();
+    // No "Need rides" filter to flip it back on, and it isn't even fetched.
+    expect(screen.queryByRole("button", { name: /need rides/i })).toBeNull();
+    const fetched = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
+    expect(fetched.some(u => u.includes("/ride-requests/search"))).toBe(false);
   });
 
   it("shows connect button and navigates to connections after clicking", async () => {
