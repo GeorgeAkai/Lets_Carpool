@@ -8,11 +8,14 @@ import jwt
 
 from backend.app.domain import DomainError
 
-# Neon Auth (better-auth's JWT plugin) signs session tokens asymmetrically and
-# publishes the public keys at a JWKS endpoint. EdDSA is better-auth's default
-# signing algorithm; RS256/ES256 are accepted too in case a project is configured
-# differently.
-NEON_AUTH_JWT_ALGORITHMS = ["EdDSA", "RS256", "ES256"]
+# Supabase Auth signs access tokens either asymmetrically (ES256/RS256, the
+# default for current projects, with public keys published at a JWKS endpoint)
+# or, on projects still using the legacy shared secret, with HS256. Only the
+# asymmetric algorithms are ever accepted against the JWKS keys, and HS256 only
+# against the configured secret — never a mix, so a token can't pick its own
+# verification path (the classic alg-confusion attack).
+SUPABASE_JWKS_ALGORITHMS = ["ES256", "RS256", "EdDSA"]
+SUPABASE_LEGACY_ALGORITHM = "HS256"
 
 
 @lru_cache(maxsize=8)
@@ -22,40 +25,38 @@ def _jwks_client(jwks_url: str) -> jwt.PyJWKClient:
     return jwt.PyJWKClient(jwks_url, cache_keys=True)
 
 
-def verify_neon_auth_token(
-    token: str, *, jwks_url: str, issuer: str | None, audience: str | None,
+def verify_supabase_token(
+    token: str, *, jwks_url: str, jwt_secret: str | None, issuer: str | None, audience: str | None,
 ) -> dict[str, Any]:
-    """Cryptographically verifies a Neon Auth session JWT against its JWKS endpoint.
+    """Cryptographically verifies a Supabase Auth access token.
 
     Raises DomainError(401) for any invalid, unsigned, expired, or wrong-issuer/
     audience token — this must never fall back to trusting an unverified claim.
     """
+    # PyJWT raises InvalidAudienceError when a token carries `aud` but no
+    # expected audience is passed, so opting out has to be explicit.
+    options: dict[str, Any] = {"require": ["exp", "sub"]}
+    if audience is None:
+        options["verify_aud"] = False
     try:
-        signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token)
-        # PyJWT only *skips* an unset check symmetrically for `issuer` — pass
-        # `audience=None` against a token that actually carries an `aud` claim
-        # (Neon Auth's always do) and it raises InvalidAudienceError instead of
-        # treating "no expected audience configured" as "don't check". Passing
-        # `verify_aud: False` here is PyJWT's documented way to actually opt out,
-        # restoring the "only checked once configured" behavior every sign-in
-        # otherwise fails with regardless of how valid the token is.
-        options: dict[str, Any] = {"require": ["exp", "sub"]}
-        if audience is None:
-            options["verify_aud"] = False
+        alg = jwt.get_unverified_header(token).get("alg")
+        if alg == SUPABASE_LEGACY_ALGORITHM:
+            if not jwt_secret:
+                raise DomainError("Server is not configured with SUPABASE_JWT_SECRET for HS256 tokens", 401)
+            key: Any = jwt_secret
+            algorithms = [SUPABASE_LEGACY_ALGORITHM]
+        else:
+            key = _jwks_client(jwks_url).get_signing_key_from_jwt(token).key
+            algorithms = SUPABASE_JWKS_ALGORITHMS
         payload = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=NEON_AUTH_JWT_ALGORITHMS,
-            issuer=issuer,
-            audience=audience,
-            options=options,
+            token, key, algorithms=algorithms, issuer=issuer, audience=audience, options=options,
         )
     except jwt.PyJWKClientError as exc:
-        raise DomainError("Could not verify Neon Auth token signature", 401) from exc
+        raise DomainError("Could not verify sign-in token signature", 401) from exc
     except jwt.ExpiredSignatureError as exc:
-        raise DomainError("Neon Auth token has expired", 401) from exc
+        raise DomainError("Sign-in token has expired", 401) from exc
     except jwt.InvalidTokenError as exc:
-        raise DomainError("Invalid Neon Auth token", 401) from exc
+        raise DomainError("Invalid sign-in token", 401) from exc
     return payload
 
 

@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from "react"
+import { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import * as maplibregl from "maplibre-gl"
 import "maplibre-gl/dist/maplibre-gl.css"
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url"
-import { useTheme } from "@neondatabase/auth-ui"
+import { useTheme } from "./lib/theme"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
 import {
@@ -28,16 +28,28 @@ export interface TripRoute {
   date: string
 }
 
-// A driver's active "go pick up this rider" navigation target — the rider's
-// pickup point is autodetected from their (now-revealed, post-acceptance)
-// ride request, so the driver never has to type an address in.
+// A driver's active turn-by-turn target for an accepted ride, in two legs:
+// first to the rider's pickup point (autodetected from their now-revealed,
+// post-acceptance ride request, so nobody types an address), then — once
+// they've met — on to the destination.
 export interface DrivingTarget {
   connectionId: string
-  pickupLat: number
-  pickupLng: number
-  pickupLabel: string
+  phase: "pickup" | "dropoff"
+  targetLat: number
+  targetLng: number
+  targetLabel: string
   partnerName: string
+  // Where the "dropoff" leg goes once the rider is picked up.
+  dropoff?: { lat: number; lng: number; label: string }
+  // Rider's view: follow the driver's shared position instead of this
+  // device's GPS, and switch leg when the driver reports the pickup.
+  watchOnly?: boolean
 }
+
+// How often the rider's map polls their driver's position.
+const TRACK_POLL_MS = 4000
+// A driver position older than this is shown as "last seen …" rather than live.
+const TRACK_STALE_MS = 2 * 60 * 1000
 
 interface OsrmResult {
   distanceMeters: number
@@ -226,9 +238,22 @@ interface Props {
   onClearRoute?: () => void
   drivingTo?: DrivingTarget | null
   onStopDriving?: () => void
+  // Pickup leg: rider is in the car — switch navigation to the destination.
+  onPickedUp?: () => void
+  // Dropoff leg: arrived — end navigation and complete the ride.
+  onArrived?: () => void
 }
 
-export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
+export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo: drivingToProp, onStopDriving, onPickedUp, onArrived }: Props) {
+  // Rider tracking their driver: the leg comes from what the driver reports,
+  // so the target flips from the rider's pickup to the destination by itself.
+  const [trackPhase, setTrackPhase] = useState<api.TripPhase | null>(null)
+  const [trackSeenAt, setTrackSeenAt] = useState<number | null>(null)
+  const drivingTo = useMemo<DrivingTarget | null | undefined>(() => {
+    if (!drivingToProp?.watchOnly || trackPhase !== "dropoff" || !drivingToProp.dropoff) return drivingToProp
+    const d = drivingToProp.dropoff
+    return { ...drivingToProp, phase: "dropoff", targetLat: d.lat, targetLng: d.lng, targetLabel: d.label }
+  }, [drivingToProp, trackPhase])
   const { resolvedTheme } = useTheme()
   const isDark = resolvedTheme === "dark"
   const accentColor = isDark ? ACCENT_DARK : ACCENT_LIGHT
@@ -579,14 +604,32 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   // already known from their accepted ride request, so no address entry is
   // needed on either side) and streams it, Uber-nav style.
   useEffect(() => {
-    if (!drivingTo) { setDrivingSample(null); setDrivingGeoError(false); return }
+    if (!drivingTo) { setDrivingSample(null); setDrivingGeoError(false); setTrackPhase(null); setTrackSeenAt(null); return }
+    if (drivingTo.watchOnly) {
+      // Rider: poll the driver's shared position for this ride.
+      let active = true
+      let lastPos: [number, number] | null = null
+      const poll = () => api.getRideDriverLocation(drivingTo.connectionId).then(res => {
+        if (!active) return
+        setTrackPhase(res.trip_phase)
+        if (!res.location) return
+        const next: [number, number] = [res.location.latitude, res.location.longitude]
+        const heading = res.location.heading ?? (lastPos ? bearingDegrees(lastPos, next) : 0)
+        lastPos = next
+        setTrackSeenAt(new Date(res.location.updated_at).getTime())
+        setDrivingSample({ pos: next, heading })
+      }).catch(() => {})
+      poll()
+      const id = setInterval(poll, TRACK_POLL_MS)
+      return () => { active = false; clearInterval(id) }
+    }
     if (!navigator.geolocation) { setDrivingGeoError(true); return }
     let lastPos: [number, number] | null = null
     const id = navigator.geolocation.watchPosition(
       pos => {
         const next: [number, number] = [pos.coords.latitude, pos.coords.longitude]
         const heading = pos.coords.heading
-          ?? (lastPos ? bearingDegrees(lastPos, next) : bearingDegrees(next, [drivingTo.pickupLat, drivingTo.pickupLng]))
+          ?? (lastPos ? bearingDegrees(lastPos, next) : bearingDegrees(next, [drivingTo.targetLat, drivingTo.targetLng]))
         lastPos = next
         setDrivingSample({ pos: next, heading })
         api.updateLocation(next[0], next[1], heading, pos.coords.speed != null ? pos.coords.speed * 3.6 : undefined).catch(() => {})
@@ -620,7 +663,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       markerHeadingsRef.current[DRIVING_SELF_KEY] = heading
       const m = new maplibregl.Marker({ element: makeCarEl(heading, { tracking: true, accent: accentColor }) })
         .setLngLat(toLngLat(pos))
-        .setPopup(new maplibregl.Popup({ closeButton: false }).setText("You"))
+        .setPopup(new maplibregl.Popup({ closeButton: false }).setText(drivingTo?.watchOnly ? drivingTo.partnerName : "You"))
         .addTo(map)
       markersRef.current[DRIVING_SELF_KEY] = m
       map.flyTo({ center: toLngLat(pos), zoom: 16 })
@@ -629,7 +672,17 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     map.panTo(toLngLat(pos), { duration: 800 })
   }, [drivingSample, mode, accentColor, stepMarkerAnimations, mapReady])
 
-  // ── "Start Driving" mode: pickup marker + route to the rider ───────────────
+  // New leg (picked up → heading to the destination): drop the old target pin,
+  // and re-route / re-fit immediately instead of waiting out the throttle.
+  const drivingLegKey = drivingTo ? `${drivingTo.connectionId}:${drivingTo.phase}` : null
+  useEffect(() => {
+    drivingPickupMarkerRef.current?.remove(); drivingPickupMarkerRef.current = null
+    drivingLastRouteFetchRef.current = null
+    drivingFitOnceRef.current = false
+    setDrivingRoute(null)
+  }, [drivingLegKey])
+
+  // ── "Start Driving" mode: target marker + route to it ──────────────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map || !mapReady) return
@@ -643,9 +696,9 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     }
 
     if (!drivingPickupMarkerRef.current) {
-      drivingPickupMarkerRef.current = new maplibregl.Marker({ element: makePickupEl() })
-        .setLngLat(toLngLat([drivingTo.pickupLat, drivingTo.pickupLng]))
-        .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${drivingTo.partnerName}</b><br>${drivingTo.pickupLabel}`))
+      drivingPickupMarkerRef.current = new maplibregl.Marker({ element: drivingTo.phase === "pickup" ? makePickupEl() : makeDestEl() })
+        .setLngLat(toLngLat([drivingTo.targetLat, drivingTo.targetLng]))
+        .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${drivingTo.partnerName}</b><br>${drivingTo.targetLabel}`))
         .addTo(map)
     }
 
@@ -657,13 +710,13 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
     drivingLastRouteFetchRef.current = { pos: drivingSample.pos, time: performance.now() }
     setDrivingLoadingRoute(true)
-    fetchOSRMRoute(drivingSample.pos[0], drivingSample.pos[1], drivingTo.pickupLat, drivingTo.pickupLng).then(result => {
+    fetchOSRMRoute(drivingSample.pos[0], drivingSample.pos[1], drivingTo.targetLat, drivingTo.targetLng).then(result => {
       if (!mapRef.current || mode !== "driving") return
       if (result) {
         setRouteLine(result.geometry, false)
         setDrivingRoute(result)
       } else {
-        setRouteLine({ type: "LineString", coordinates: [toLngLat(drivingSample.pos), toLngLat([drivingTo.pickupLat, drivingTo.pickupLng])] }, true)
+        setRouteLine({ type: "LineString", coordinates: [toLngLat(drivingSample.pos), toLngLat([drivingTo.targetLat, drivingTo.targetLng])] }, true)
         setDrivingRoute(null)
       }
     }).finally(() => setDrivingLoadingRoute(false))
@@ -674,7 +727,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     const map = mapRef.current
     if (!map || mode !== "driving" || !drivingTo || !drivingSample || drivingFitOnceRef.current) return
     drivingFitOnceRef.current = true
-    map.fitBounds(boundsOf([drivingSample.pos, [drivingTo.pickupLat, drivingTo.pickupLng]]), { padding: 80 })
+    map.fitBounds(boundsOf([drivingSample.pos, [drivingTo.targetLat, drivingTo.targetLng]]), { padding: 80 })
   }, [mode, drivingTo, drivingSample])
 
   // Clean up the self marker once driving mode ends.
@@ -728,6 +781,29 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   const nearbyCount = drivers.length
 
+  // Copy + primary action for the current driving leg.
+  const pickupLeg = drivingTo?.phase !== "dropoff"
+  const partnerFirst = drivingTo?.partnerName.split(" ")[0] ?? "rider"
+  const watching = !!drivingTo?.watchOnly
+  const trackStale = trackSeenAt != null && Date.now() - trackSeenAt > TRACK_STALE_MS
+  const drivingTitle = watching
+    ? (trackPhase === "dropoff" ? "On your way" : trackPhase === "pickup" ? "Your driver is on the way" : "Your driver")
+    : pickupLeg ? "Driving to pickup" : "Driving to destination"
+  const drivingSubtitle = watching
+    ? (trackPhase === "dropoff" ? `Heading to ${drivingTo?.targetLabel}` : trackPhase === "pickup" ? `${drivingTo?.partnerName} is heading to your pickup` : `Waiting for ${drivingTo?.partnerName} to set off`)
+    : pickupLeg ? `Picking up ${drivingTo?.partnerName}` : `Taking ${drivingTo?.partnerName} to ${drivingTo?.targetLabel}`
+  const drivingCardLabel = watching ? (pickupLeg ? "YOUR PICKUP" : "DESTINATION") : pickupLeg ? "PICKING UP" : "DROPPING OFF"
+  const drivingStatus = watching && !drivingSample
+    ? `Waiting for ${partnerFirst}'s location…`
+    : watching && trackStale && trackSeenAt != null
+      ? `Last seen ${Math.round((Date.now() - trackSeenAt) / 60000)} min ago`
+      : null
+  const drivingAction = watching
+    ? { label: "Stop tracking", onClick: onStopDriving }
+    : pickupLeg
+      ? { label: `Picked up ${partnerFirst} — start trip`, onClick: onPickedUp ?? onStopDriving }
+      : { label: "Arrived — complete ride", onClick: onArrived ?? onStopDriving }
+
   return (
     <div className="space-y-4">
       {/* ══════════════════════════ Desktop header + mode cards (xl and up) — above the map ══════════════════════════ */}
@@ -735,10 +811,10 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
         <div className="flex items-center justify-between">
           <div>
             <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">
-              {mode === "driving" ? "Driving to pickup" : mode === "trip" ? "Trip Route" : "Live Map"}
+              {mode === "driving" ? drivingTitle : mode === "trip" ? "Trip Route" : "Live Map"}
             </h1>
             <p className="text-muted-foreground mt-1">
-              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? `${tripRoute?.partnerName} · ${tripRoute?.date}` : "See nearby drivers in real time."}
+              {mode === "driving" ? drivingSubtitle : mode === "trip" ? `${tripRoute?.partnerName} · ${tripRoute?.date}` : "See nearby drivers in real time."}
             </p>
           </div>
           {mode === "driving" ? (
@@ -761,11 +837,12 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
             <div className="flex items-center gap-3">
               <div className="size-9 rounded-full bg-primary/10 flex items-center justify-center shrink-0"><Car className="size-4 text-primary" /></div>
               <div className="min-w-0">
-                <p className="text-xs text-muted-foreground font-medium">PICKING UP</p>
-                <p className="text-sm font-semibold text-foreground truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
+                <p className="text-xs text-muted-foreground font-medium">{drivingCardLabel}</p>
+                <p className="text-sm font-semibold text-foreground truncate">{drivingTo.partnerName} · {drivingTo.targetLabel}</p>
               </div>
             </div>
             {drivingGeoError && <p className="text-sm text-destructive text-center">Couldn't access your location. Enable location access to navigate.</p>}
+            {drivingStatus && <p className="text-sm text-muted-foreground text-center">{drivingStatus}</p>}
             {!drivingGeoError && drivingLoadingRoute && !drivingRoute && <p className="text-sm text-muted-foreground animate-pulse text-center">Calculating route…</p>}
             {drivingRoute && (
               <div className="grid grid-cols-2 gap-3">
@@ -778,7 +855,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                 ))}
               </div>
             )}
-            <button onClick={onStopDriving} className="w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">I've arrived</button>
+            <button onClick={drivingAction.onClick} className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${watching ? "border border-border text-foreground hover:bg-muted" : pickupLeg ? "bg-primary text-primary-foreground hover:bg-primary/90" : "bg-emerald-600 text-white hover:bg-emerald-700"}`}>{drivingAction.label}</button>
           </div>
         )}
 
@@ -796,7 +873,13 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
               </div>
             </div>
             {loadingRoute && <p className="text-sm text-muted-foreground animate-pulse text-center">Calculating route…</p>}
-            {osrmResult && (
+            {osrmResult && osrmResult.distanceMeters < 50 ? (
+              // Same point twice (e.g. a destination saved at the pickup) —
+              // say so instead of a confident "0 min · 0 m · $0.00".
+              <p className="rounded-2xl bg-muted p-3 text-sm text-center text-muted-foreground">
+                Couldn't work out this route — the pickup and destination are at the same spot.
+              </p>
+            ) : osrmResult && (
               <div className="grid grid-cols-3 gap-3">
                 {[{ Icon: Clock, label: "Est. time", value: formatDuration(osrmResult.durationSeconds) }, { Icon: Ruler, label: "Distance", value: formatDistance(osrmResult.distanceMeters) }, { Icon: DollarSign, label: "Fare / person", value: fareEstimate != null ? `$${(fareEstimate / 100).toFixed(2)}` : "—" }].map(({ Icon, label, value }) => (
                   <div key={label} className="bg-muted rounded-2xl p-3 text-center">
@@ -847,7 +930,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-slate-900/80 text-white backdrop-blur-md shadow-lg">
             {mode === "driving" ? <Car className="size-4" /> : mode === "trip" ? <Navigation className="size-4" /> : <MapPin className="size-4" />}
             <span className="text-sm font-medium">
-              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? "Trip Route" : "Live Map"}
+              {mode === "driving" ? drivingSubtitle : mode === "trip" ? "Trip Route" : "Live Map"}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -988,8 +1071,9 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
             {mode === "driving" && drivingTo && (
               <div className="space-y-3">
-                <p className="text-sm font-semibold truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
+                <p className="text-sm font-semibold truncate">{drivingTo.partnerName} · {drivingTo.targetLabel}</p>
                 {drivingGeoError && <p className="text-sm text-red-300">Couldn't access your location.</p>}
+                {drivingStatus && <p className="text-sm text-white/60">{drivingStatus}</p>}
                 {!drivingGeoError && drivingLoadingRoute && !drivingRoute && <p className="text-sm text-white/60 animate-pulse">Calculating route…</p>}
                 {drivingRoute && (
                   <div className="grid grid-cols-2 gap-2">
@@ -1001,7 +1085,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                     ))}
                   </div>
                 )}
-                <button onClick={onStopDriving} className="w-full py-2.5 rounded-xl bg-white text-slate-900 text-sm font-semibold">I've arrived</button>
+                <button onClick={drivingAction.onClick} className="w-full py-2.5 rounded-xl bg-white text-slate-900 text-sm font-semibold">{drivingAction.label}</button>
               </div>
             )}
           </div>

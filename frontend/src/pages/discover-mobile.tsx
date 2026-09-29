@@ -4,9 +4,10 @@ import {
   Pencil, Map as MapIcon, Plus, Check,
 } from 'lucide-react'
 import {
-  Avatar, FLEX_LABEL, FLEX_DOT, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
+  FLEX_LABEL, FLEX_DOT, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
 } from './home'
 import type { Listing, RideTag, CarType, LuggageSize } from './home'
+import { ProfileAvatar, useOpenProfile, type ProfileTarget } from './profile-sheet'
 
 // ─── Mobile Discover screen primitives ─────────────────────────────────────────
 // Shared by both mode branches (rider's FeedView and driver's DriverHomeView) so
@@ -67,10 +68,9 @@ export function MobileFilterBar({
 
 export function FilterSheet({
   open, onClose,
-  filterType, setFilterType, filterTag, setFilterTag, filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
+  filterTag, setFilterTag, filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
 }: {
   open: boolean; onClose: () => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -93,17 +93,6 @@ export function FilterSheet({
           <button onClick={onClose} aria-label="Close filters" className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-colors">
             <X className="size-5" />
           </button>
-        </div>
-
-        <div className="space-y-1.5">
-          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Showing</p>
-          <div className="flex flex-wrap gap-2">
-            {(['all', 'driver', 'rider'] as const).map(t => (
-              <button key={t} onClick={() => setFilterType(t)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterType === t ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
-                {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-              </button>
-            ))}
-          </div>
         </div>
 
         <div className="space-y-1.5">
@@ -163,14 +152,19 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
+  const openProfile = useOpenProfile()
+  const profileTarget: ProfileTarget = {
+    userId: listing.ownerId, name: listing.user.name, photoUrl: listing.user.photoUrl, role: isDriver ? 'driver' : 'rider',
+    action: isOwn || alreadyConnected ? undefined : { label: isDriver ? 'Request to join' : 'Offer a ride', onClick: () => onConnect(listing) },
+  }
 
   return (
     <div className="bg-card rounded-2xl border border-border p-4 flex flex-col gap-3">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
+          <ProfileAvatar target={profileTarget} size={40} />
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-foreground truncate">{listing.user.name}</p>
+            <button type="button" onClick={() => openProfile(profileTarget)} className="block text-sm font-semibold text-foreground truncate hover:underline text-left">{listing.user.name}</button>
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <span className={`size-1.5 rounded-full ${FLEX_DOT[listing.flexibility]}`} />{FLEX_LABEL[listing.flexibility]} · {listing.date}
             </p>

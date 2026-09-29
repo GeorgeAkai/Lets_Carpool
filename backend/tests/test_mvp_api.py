@@ -9,9 +9,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jwt as pyjwt
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric import ec
+import psycopg2
 from fastapi.testclient import TestClient
 
+from backend.app.db import run_migrations
 from backend.app.domain import Store
 from backend.app.main import Settings, create_app
 
@@ -19,38 +21,38 @@ TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql://carpool:carpool@localhost:5434/carpool"
 )
 
-# ─── Fake Neon Auth server ──────────────────────────────────────────────────────
-# /auth/login now cryptographically verifies the Neon Auth session JWT against a
-# JWKS endpoint (issue 24) instead of trusting a client-supplied email. To test
-# that for real without hitting the actual Neon Auth service, this spins up a
-# tiny local JWKS server and signs test tokens with a real Ed25519 keypair —
-# exercising the exact same verification code path production traffic will.
+# ─── Fake Supabase Auth ─────────────────────────────────────────────────────────
+# /auth/login cryptographically verifies the Supabase access token against the
+# project's JWKS endpoint instead of trusting a client-supplied email. To test
+# that for real without a Supabase project, this spins up a tiny local server
+# publishing the JWKS at Supabase's path and signs test tokens with a real
+# ES256 keypair — the same verification code path production traffic takes.
 
-_NEON_AUTH_PRIVATE_KEY = Ed25519PrivateKey.generate()
-_NEON_AUTH_KID = "test-key-1"
+_SUPABASE_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
+_SUPABASE_KID = "test-key-1"
+TEST_SUPABASE_JWT_SECRET = "legacy-hs256-secret-for-tests-only-0123456789"
 
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-_NEON_AUTH_JWKS_BODY = json.dumps({
+_pub = _SUPABASE_PRIVATE_KEY.public_key().public_numbers()
+_SUPABASE_JWKS_BODY = json.dumps({
     "keys": [{
-        "kty": "OKP", "crv": "Ed25519", "kid": _NEON_AUTH_KID, "use": "sig", "alg": "EdDSA",
-        "x": _b64url(_NEON_AUTH_PRIVATE_KEY.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw,
-        )),
+        "kty": "EC", "crv": "P-256", "kid": _SUPABASE_KID, "use": "sig", "alg": "ES256",
+        "x": _b64url(_pub.x.to_bytes(32, "big")), "y": _b64url(_pub.y.to_bytes(32, "big")),
     }],
 }).encode()
 
 
 class _JWKSHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path == "/.well-known/jwks.json":
+        if self.path == "/auth/v1/.well-known/jwks.json":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(_NEON_AUTH_JWKS_BODY)
+            self.wfile.write(_SUPABASE_JWKS_BODY)
         else:
             self.send_response(404)
             self.end_headers()
@@ -61,23 +63,38 @@ class _JWKSHandler(BaseHTTPRequestHandler):
 
 _jwks_server = ThreadingHTTPServer(("127.0.0.1", 0), _JWKSHandler)
 threading.Thread(target=_jwks_server.serve_forever, daemon=True).start()
-TEST_NEON_AUTH_URL = f"http://127.0.0.1:{_jwks_server.server_port}"
+TEST_SUPABASE_URL = f"http://127.0.0.1:{_jwks_server.server_port}"
+TEST_SUPABASE_ISSUER = f"{TEST_SUPABASE_URL}/auth/v1"
 
 
-def sign_neon_token(*, email: str, name: str, sub: str | None = None, expired: bool = False) -> str:
-    now = datetime.now(UTC)
-    private_pem = _NEON_AUTH_PRIVATE_KEY.private_bytes(
+def _private_pem() -> bytes:
+    return _SUPABASE_PRIVATE_KEY.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     )
-    payload = {
-        "sub": sub or f"neon_{email}",
-        "email": email,
-        "name": name,
-        "iss": TEST_NEON_AUTH_URL,
+
+
+def supabase_claims(*, email: str | None, name: str, sub: str | None = None, expired: bool = False,
+                    iss: str = TEST_SUPABASE_ISSUER, aud: str = "authenticated") -> dict:
+    now = datetime.now(UTC)
+    claims = {
+        "sub": sub or f"sb_{email}",
+        "user_metadata": {"full_name": name},
+        "role": "authenticated",
+        "iss": iss,
+        "aud": aud,
         "iat": now,
-        "exp": now + (timedelta(minutes=-5) if expired else timedelta(hours=24)),
+        "exp": now + (timedelta(minutes=-5) if expired else timedelta(hours=1)),
     }
-    return pyjwt.encode(payload, private_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID})
+    if email is not None:
+        claims["email"] = email
+    return claims
+
+
+def sign_supabase_token(*, email: str | None, name: str, **kwargs) -> str:
+    return pyjwt.encode(
+        supabase_claims(email=email, name=name, **kwargs), _private_pem(),
+        algorithm="ES256", headers={"kid": _SUPABASE_KID},
+    )
 
 
 TEST_CRON_SECRET = "test-cron-secret"
@@ -86,14 +103,15 @@ CRON_HEADERS = {"Authorization": f"Bearer {TEST_CRON_SECRET}"}
 
 def client() -> TestClient:
     settings = Settings(
-        database_url=TEST_DATABASE_URL, neon_auth_url=TEST_NEON_AUTH_URL, cron_secret=TEST_CRON_SECRET,
+        database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL,
+        supabase_jwt_secret=TEST_SUPABASE_JWT_SECRET, cron_secret=TEST_CRON_SECRET,
     )
     return TestClient(create_app(store=Store(TEST_DATABASE_URL), settings=settings))
 
 
 def auth(client: TestClient, email: str, name: str) -> tuple[dict, dict[str, str]]:
-    token = sign_neon_token(email=email, name=name)
-    response = client.post("/auth/login", json={"neon_token": token})
+    token = sign_supabase_token(email=email, name=name)
+    response = client.post("/auth/login", json={"supabase_token": token})
     assert response.status_code == 200
     body = response.json()
     token = body["access_token"]
@@ -146,12 +164,12 @@ def make_request_and_trip(
     return rider, rider_headers, driver, driver_headers, ride_request, driver_trip
 
 
-def test_healthcheck_reports_neon_backed_database() -> None:
+def test_healthcheck_reports_postgres_backed_database() -> None:
     response = client().get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["database"] == "neon"
+    assert response.json()["database"] == "postgres"
 
 
 def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
@@ -169,45 +187,85 @@ def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
     assert invalid.status_code == 401
 
 
-def test_login_rejects_a_token_not_signed_by_the_neon_auth_key() -> None:
+def test_login_rejects_a_token_not_signed_by_the_supabase_key() -> None:
     api = client()
-    forged_key = Ed25519PrivateKey.generate()
-    now = datetime.now(UTC)
+    forged_key = ec.generate_private_key(ec.SECP256R1())
     forged_pem = forged_key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     )
     forged_token = pyjwt.encode(
-        {"sub": "neon_attacker", "email": "victim@berkeley.edu", "name": "Attacker",
-         "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
-        forged_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
+        supabase_claims(email="victim@berkeley.edu", name="Attacker", sub="sb_attacker"),
+        forged_pem, algorithm="ES256", headers={"kid": _SUPABASE_KID},
     )
 
-    response = api.post("/auth/login", json={"neon_token": forged_token})
+    response = api.post("/auth/login", json={"supabase_token": forged_token})
 
     assert response.status_code == 401
 
 
-def test_login_rejects_an_expired_neon_auth_token() -> None:
+def test_login_rejects_an_expired_supabase_token() -> None:
     api = client()
-    expired_token = sign_neon_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
+    expired_token = sign_supabase_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
 
-    response = api.post("/auth/login", json={"neon_token": expired_token})
+    response = api.post("/auth/login", json={"supabase_token": expired_token})
+
+    assert response.status_code == 401
+
+
+def test_login_rejects_a_token_from_another_supabase_project() -> None:
+    api = client()
+    wrong_issuer = sign_supabase_token(
+        email="ada@berkeley.edu", name="Ada", iss="https://someone-else.supabase.co/auth/v1",
+    )
+
+    response = api.post("/auth/login", json={"supabase_token": wrong_issuer})
+
+    assert response.status_code == 401
+
+
+def test_login_rejects_a_non_user_token_audience() -> None:
+    api = client()
+    service_token = sign_supabase_token(email="ada@berkeley.edu", name="Ada", aud="service_role")
+
+    response = api.post("/auth/login", json={"supabase_token": service_token})
 
     assert response.status_code == 401
 
 
 def test_login_rejects_a_token_with_no_email_claim() -> None:
     api = client()
-    now = datetime.now(UTC)
-    private_pem = _NEON_AUTH_PRIVATE_KEY.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    no_email_token = sign_supabase_token(email=None, name="No Email", sub="sb_no_email")
+
+    response = api.post("/auth/login", json={"supabase_token": no_email_token})
+
+    assert response.status_code == 401
+
+
+def test_login_accepts_legacy_hs256_tokens_signed_with_the_project_secret() -> None:
+    api = client()
+    legacy = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace Hopper"), TEST_SUPABASE_JWT_SECRET, algorithm="HS256",
     )
-    no_email_token = pyjwt.encode(
-        {"sub": "neon_no_email", "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
-        private_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
+    forged = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace Hopper"), "not-the-project-secret-0123456789", algorithm="HS256",
     )
 
-    response = api.post("/auth/login", json={"neon_token": no_email_token})
+    ok = api.post("/auth/login", json={"supabase_token": legacy})
+    bad = api.post("/auth/login", json={"supabase_token": forged})
+
+    assert ok.status_code == 200
+    assert ok.json()["user"]["profile"]["display_name"] == "Grace Hopper"
+    assert bad.status_code == 401
+
+
+def test_login_rejects_hs256_tokens_when_no_legacy_secret_is_configured() -> None:
+    settings = Settings(database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL, cron_secret=TEST_CRON_SECRET)
+    api = TestClient(create_app(store=Store(TEST_DATABASE_URL), settings=settings))
+    token = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace"), "any-secret-at-all-0123456789abcdef", algorithm="HS256",
+    )
+
+    response = api.post("/auth/login", json={"supabase_token": token})
 
     assert response.status_code == 401
 
@@ -215,7 +273,7 @@ def test_login_rejects_a_token_with_no_email_claim() -> None:
 def test_login_rejects_garbage_input() -> None:
     api = client()
 
-    response = api.post("/auth/login", json={"neon_token": "not.a.jwt"})
+    response = api.post("/auth/login", json={"supabase_token": "not.a.jwt"})
 
     assert response.status_code == 401
 
@@ -246,6 +304,77 @@ def test_profile_and_driver_readiness_are_editable_without_document_uploads() ->
     assert profile["display_name"] == "Updated Driver"
     assert vehicle["has_license"] is True
     assert "document" not in vehicle
+
+
+def test_rider_can_track_their_driver_only_on_an_accepted_ride() -> None:
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    _, stranger_headers = auth(api, "stranger@example.com", "Stranger")
+    connection = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    }).json()
+    url = f"/connections/{connection['id']}/driver-location"
+
+    # Not before the driver accepts.
+    assert api.get(url, headers=rider_headers).status_code == 403
+    api.post(f"/connections/{connection['id']}/transition", headers=driver_headers, json={"action": "accept"})
+
+    # Accepted, but the driver hasn't set off yet.
+    assert api.get(url, headers=rider_headers).json() == {"trip_phase": None, "location": None}
+
+    # Driver starts the pickup leg and streams their position.
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "pickup"}).status_code == 200
+    api.put("/me/location", headers=driver_headers, json={"latitude": 37.8700, "longitude": -122.2700, "heading": 90})
+    seen = api.get(url, headers=rider_headers).json()
+    assert seen["trip_phase"] == "pickup"
+    assert round(seen["location"]["latitude"], 4) == 37.8700 and round(seen["location"]["longitude"], 4) == -122.2700
+    assert seen["location"]["updated_at"]
+
+    # Only the driver sets the phase; only the two riders on the ride can look.
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=rider_headers, json={"phase": "dropoff"}).status_code == 403
+    assert api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "teleport"}).status_code == 400
+    assert api.get(url, headers=stranger_headers).status_code == 404
+
+    api.post(f"/connections/{connection['id']}/trip-phase", headers=driver_headers, json={"phase": "dropoff"})
+    assert api.get(url, headers=rider_headers).json()["trip_phase"] == "dropoff"
+    assert api.get("/me/connections", headers=rider_headers).json()[0]["trip_phase"] == "dropoff"
+
+
+def test_public_profile_gives_riders_and_drivers_enough_to_judge_trust() -> None:
+    # Riders check out a driver before requesting; drivers check out a rider
+    # before accepting. Trust signals yes — contact details never.
+    api = client()
+    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    api.patch("/me/profile", headers=driver_headers, json={"display_name": "Dee Driver", "bio": "Campus commuter"})
+    api.put("/me/driver-readiness", headers=driver_headers, json={
+        "make": "Toyota", "model": "Prius", "color": "Blue", "seats": 3, "car_type": "sedan",
+        "has_license": True, "has_insurance": True, "has_good_driving_record": False,
+    })
+    connection = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    }).json()
+    api.post(f"/connections/{connection['id']}/transition", headers=rider_headers, json={"action": "accept"})
+    api.post(f"/connections/{connection['id']}/gas-split/confirm", headers=driver_headers,
+             json={"amount_cents": 1200, "currency": "USD", "assumptions": {"manual": True}})
+    api.post(f"/connections/{connection['id']}/transition", headers=rider_headers, json={"action": "complete"})
+
+    seen_by_rider = api.get(f"/users/{driver['id']}/profile", headers=rider_headers)
+    seen_by_driver = api.get(f"/users/{rider['id']}/profile", headers=driver_headers)
+
+    assert seen_by_rider.status_code == 200
+    body = seen_by_rider.json()
+    assert body["display_name"] == "Dee Driver"
+    assert body["bio"] == "Campus commuter"
+    assert body["email_domain"] == "example.com"
+    assert body["member_since"]
+    assert body["completed_rides"] == {"as_driver": 1, "as_rider": 0}
+    assert body["vehicle"]["make"] == "Toyota" and body["vehicle"]["has_license"] is True
+    assert "email" not in body
+    assert seen_by_driver.json()["completed_rides"] == {"as_driver": 0, "as_rider": 1}
+
+    # Blocking hides the profile both ways.
+    api.post(f"/users/{driver['id']}/block", headers=rider_headers)
+    assert api.get(f"/users/{rider['id']}/profile", headers=driver_headers).status_code == 404
 
 
 def test_profile_stores_optional_interests_and_nationality() -> None:
@@ -385,6 +514,144 @@ def test_driver_trips_and_ride_requests_carry_an_optional_free_text_note() -> No
     assert too_long.status_code == 422
 
 
+def test_the_same_two_people_cannot_open_a_second_live_connection_for_the_same_day() -> None:
+    # Regression test: the rider requested the driver's post, then the driver
+    # offered on the rider's backing request — two connections (and two
+    # chats in the Inbox) for the same ride.
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    first = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"],
+    })
+    assert first.status_code == 200
+
+    # The driver tries the mirror direction with a fresh trip on the same day.
+    offer_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": driver_trip["pickup_location_id"],
+        "destination_location_id": driver_trip["destination_location_id"],
+        "target_date": driver_trip["target_date"], "flexibility": "morning",
+        "seats_available": 1, "tags": [], "for_connection": True,
+    }).json()
+    second = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": offer_trip["id"],
+    })
+    assert second.status_code == 409
+    assert len(api.get("/me/connections", headers=rider_headers).json()) == 1
+
+    # Once the first is cancelled, connecting again is allowed.
+    api.post(f"/connections/{first.json()['id']}/transition", headers=rider_headers, json={"action": "cancel"})
+    third = api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": offer_trip["id"],
+    })
+    assert third.status_code == 200
+
+
+def test_listings_created_to_back_a_connection_stay_out_of_discover() -> None:
+    # Regression test: tapping "Request to join" creates a ride request on the
+    # rider's behalf. It used to be an ordinary public listing, so the driver
+    # saw it in Discover and tapping "Offer to drive" on it created *another*
+    # trip — which then showed up in the rider's Discover as a duplicate of
+    # the driver's real post.
+    api = client()
+    _, driver_headers = auth(api, "deree@example.com", "Deree")
+    _, rider_headers = auth(api, "passenger@example.com", "Passenger")
+    _, other_driver_headers = auth(api, "other-driver@example.com", "Other Driver")
+    chico = location(api, driver_headers, "Chico, California", 39.7285, -121.8375)
+    tahoe = location(api, driver_headers, "Lake Tahoe, California", 39.0968, -120.0324)
+    today = date.today().isoformat()
+    real_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "seats_available": 3, "tags": [],
+        "car_type": "suv", "notes": "Heading to Lake Tahoe. Anyone?",
+    }).json()
+
+    # What onConnect does for "Request to join".
+    backing_request = api.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "passenger_count": 1, "tags": [],
+        "for_connection": True,
+    }).json()
+    conn = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": backing_request["id"], "driver_trip_id": real_trip["id"],
+    })
+    assert conn.status_code == 200
+
+    for headers in (driver_headers, other_driver_headers):
+        requests = api.get("/ride-requests/search", headers=headers).json()
+        assert backing_request["id"] not in {r["id"] for r in requests}
+
+    # And the mirror case — a trip created for "Offer to drive".
+    backing_trip = api.post("/driver-trips", headers=other_driver_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "seats_available": 1, "tags": [],
+        "for_connection": True,
+    }).json()
+    trips = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert {t["id"] for t in trips} == {real_trip["id"]}
+    assert backing_trip["id"] not in {t["id"] for t in trips}
+
+    # Still the owner's, and still reachable through the connection.
+    mine = api.get("/me/ride-requests", headers=rider_headers).json()
+    assert next(r for r in mine if r["id"] == backing_request["id"])["for_connection"] is True
+    conns = api.get("/me/connections", headers=rider_headers).json()
+    assert conns[0]["ride_request"]["id"] == backing_request["id"]
+
+
+def test_migration_repoints_backing_listings_saved_with_the_users_gps_as_destination() -> None:
+    # Regression test: onConnect used to save the other listing's destination
+    # at the connecting user's own GPS position, so the trip route was
+    # 0 m / 0 min / $0. Startup migration re-points it at the real one.
+    api = client()
+    _, _, _, driver_headers, ride_request, _ = make_request_and_trip(api)
+    here = location(api, driver_headers, "924, Chico, California", 39.7285, -121.8375)
+    wrong_destination = location(api, driver_headers, "Lake Tahoe, California", 39.7285, -121.8375)
+    backing_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": here["id"], "destination_location_id": wrong_destination["id"],
+        "target_date": ride_request["target_date"], "flexibility": "morning",
+        "seats_available": 1, "tags": [], "for_connection": True,
+    }).json()
+    assert api.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": backing_trip["id"],
+    }).status_code == 200
+
+    run_migrations(TEST_DATABASE_URL)
+
+    trip = next(t for t in api.get("/me/driver-trips", headers=driver_headers).json() if t["id"] == backing_trip["id"])
+    assert trip["destination_location_id"] == ride_request["destination_location_id"]
+    assert trip["pickup_location_id"] == here["id"]  # the driver's own start is kept
+
+
+def test_migration_backfills_connection_backing_listings_created_before_the_flag() -> None:
+    api = client()
+    rider, rider_headers, driver, _, real_request, real_trip = make_request_and_trip(api)
+    backing = api.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": real_request["pickup_location_id"],
+        "destination_location_id": real_request["destination_location_id"],
+        "target_date": date.today().isoformat(), "flexibility": "morning", "passenger_count": 1, "tags": [],
+    }).json()
+    assert api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": backing["id"], "driver_trip_id": real_trip["id"],
+    }).status_code == 200
+
+    # Simulate a database from before the flag existed, then migrate.
+    conn = psycopg2.connect(TEST_DATABASE_URL)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE ride_requests DROP COLUMN for_connection")
+        cur.execute("ALTER TABLE driver_trips DROP COLUMN for_connection")
+    run_migrations(TEST_DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, for_connection FROM ride_requests")
+        flags = dict(cur.fetchall())
+        cur.execute("SELECT for_connection FROM driver_trips WHERE id = %s", (real_trip["id"],))
+        trip_flag = cur.fetchone()[0]
+    conn.close()
+
+    assert flags[backing["id"]] is True          # the initiator's backing request
+    assert flags[real_request["id"]] is False    # a real post, never connected by its owner
+    assert trip_flag is False                    # the driver's real post (not the initiator)
+
+
 def test_search_excludes_the_searching_users_own_listings() -> None:
     # Discover is meant to surface *other* people's rides. Without an
     # explicit self-exclusion clause, a driver's own trip (or a rider's own
@@ -441,6 +708,40 @@ def test_search_excludes_listings_with_a_past_target_date() -> None:
     my_requests = api.get("/me/ride-requests", headers=rider_headers).json()
     assert next(t for t in my_trips if t["id"] == past_trip["id"])["status"] == "expired"
     assert next(r for r in my_requests if r["id"] == past_request["id"])["status"] == "expired"
+
+
+def test_search_archives_stale_listings_at_most_once_per_interval() -> None:
+    # Discover polls search continuously; archiving on every request kept the
+    # database busy around the clock. Stale rows must still be hidden from
+    # results immediately, but the archiving UPDATE is throttled.
+    store = Store(TEST_DATABASE_URL)
+    settings = Settings(database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL, cron_secret=TEST_CRON_SECRET)
+    api = TestClient(create_app(store=store, settings=settings))
+    _, rider_headers = auth(api, "throttle-rider@example.edu", "Throttle Rider")
+    _, driver_headers = auth(api, "throttle-driver@example.com", "Throttle Driver")
+    api.get("/driver-trips/search", headers=rider_headers)  # runs the first sweep
+
+    pickup = location(api, driver_headers, "Cambridge", 42.3736, -71.1097)
+    destination = location(api, driver_headers, "Providence, RI", 41.8240, -71.4128)
+    stale = api.post(
+        "/driver-trips", headers=driver_headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": (date.today() - timedelta(days=3)).isoformat(),
+            "flexibility": "morning", "seats_available": 2, "tags": [],
+        },
+    ).json()
+
+    def status() -> str:
+        return next(t for t in api.get("/me/driver-trips", headers=driver_headers).json() if t["id"] == stale["id"])["status"]
+
+    results = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert stale["id"] not in {t["id"] for t in results}
+    assert status() == "open"  # hidden, but not re-swept within the interval
+
+    store._last_search_expiry -= Store.SEARCH_EXPIRY_INTERVAL
+    api.get("/driver-trips/search", headers=rider_headers)
+    assert status() == "expired"
 
 
 def test_search_keeps_yesterdays_listings_visible_as_a_timezone_safety_buffer() -> None:

@@ -4,10 +4,10 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "./App";
 import { login, BASE } from "./api";
-import { setMockNeonSession } from "./test-support/neonAuthMock";
-import { fetchNeonJWT } from "./lib/auth";
+import { setMockAuthUser } from "./test-support/authMock";
+import { getAccessToken } from "./lib/auth";
 
-// Simulates a user who already has a live Neon session — required for NeonAuthSync
+// Simulates a user who already has a live Supabase session — required for AuthSync
 // to not treat the app as signed-out and clear the pre-seeded backend token below.
 // Also pre-seeds the mode-choice gate's sessionStorage flag as already-answered
 // (Passenger), so tests that aren't specifically about the gate itself land
@@ -16,7 +16,7 @@ import { fetchNeonJWT } from "./lib/auth";
 // gate first.
 function signInWithExistingToken() {
   localStorage.setItem("carpool_token", LOGIN_RESPONSE.access_token);
-  setMockNeonSession({ user: { id: "usr_test", email: ME_RESPONSE.email, name: ME_RESPONSE.profile.display_name } });
+  setMockAuthUser({ id: "usr_test", email: ME_RESPONSE.email });
   sessionStorage.setItem("carpool_mode", "rider");
 }
 
@@ -93,7 +93,7 @@ describe("API configuration", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await login("mock.neon.jwt");
+    await login("mock.supabase.jwt");
 
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.any(Object));
   });
@@ -106,7 +106,7 @@ describe("Auth gate", () => {
     // mock into every later test if it ever fails before reaching its own
     // cleanup line — vi.restoreAllMocks() doesn't reset plain vi.fn() mocks
     // created inside vi.mock(), only ones made with vi.spyOn().
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   });
 
   afterEach(() => {
@@ -116,7 +116,7 @@ describe("Auth gate", () => {
   it("shows sign-in screen when no token is stored", () => {
     mockFetch({});
     render(<MemoryRouter><App /></MemoryRouter>);
-    expect(screen.getByRole("button", { name: /sign in \/ sign up/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^sign in$/i })).toBeTruthy();
   });
 
   it("calls POST /auth/login and stores token on sign-in", async () => {
@@ -129,16 +129,42 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/enter your password/i), "correct-horse");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() =>
       expect(localStorage.getItem("carpool_token")).toBe(LOGIN_RESPONSE.access_token)
     );
   });
 
-  it("shows main app after successful sign-in", async () => {
+  it("doesn't reuse a stored backend token that belongs to a different account", async () => {
+    // Regression test: two accounts used in the same browser shared one
+    // carpool_token, so the newly signed-in account silently acted as the
+    // previous one (e.g. its own posts hidden from its own Discover feed).
+    localStorage.setItem("carpool_token", "stale.token.for-someone-else");
+    setMockAuthUser({ id: "usr_test", email: ME_RESPONSE.email });
+    sessionStorage.setItem("carpool_mode", "rider");
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      const path = String(url).replace(BASE, "").split("?")[0];
+      if (method === "GET" && path === "/me") {
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+        const body = auth.includes("stale.token") ? { ...ME_RESPONSE, email: "someone.else@example.com" } : ME_RESPONSE;
+        return { ok: true, status: 200, json: async () => body };
+      }
+      if (method === "POST" && path === "/auth/login") return { ok: true, status: 200, json: async () => LOGIN_RESPONSE };
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+
+    await waitFor(() => expect(localStorage.getItem("carpool_token")).toBe(LOGIN_RESPONSE.access_token));
+    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.objectContaining({ method: "POST" }));
+  });
+
+  it("shows the mode choice right after sign-in, then the main app", async () => {
     const user = userEvent.setup();
     mockFetch({
       "POST /auth/login": LOGIN_RESPONSE,
@@ -148,17 +174,21 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/enter your password/i), "correct-horse");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
+    // A fresh session has to answer the mode gate first — even though Home
+    // briefly mounted (and redirected) before sign-in.
+    await waitFor(() => screen.getByText(/how are you riding today/i));
+    await user.click(screen.getByRole("button", { name: /i need a ride/i }));
     await waitFor(() => screen.getByText(/find your ride/i));
   });
 
-  it("shows a retryable error instead of hanging forever when the Neon Auth token can't be fetched", async () => {
-    // Regression test: fetchNeonJWT() rejecting or resolving null used to
+  it("shows a retryable error instead of hanging forever when the Supabase access token can't be fetched", async () => {
+    // Regression test: getAccessToken() rejecting or resolving null used to
     // leave the app stuck on "Loading…" forever with no way forward.
-    vi.mocked(fetchNeonJWT).mockRejectedValue(new Error("network down"));
+    vi.mocked(getAccessToken).mockRejectedValue(new Error("network down"));
     mockFetch({});
     signInWithExistingToken();
 
@@ -171,7 +201,7 @@ describe("Auth gate", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /sign out/i })).toBeTruthy();
 
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   }, 10000);
 });
 
@@ -199,22 +229,35 @@ describe("Feed view", () => {
     );
   });
 
-  it("loads ride requests from the API on mount", async () => {
+  it("says so when listings fail to load instead of showing an empty feed", async () => {
+    // Regression test: a failed search used to be swallowed silently, which
+    // looked exactly like "nobody has posted anything".
+    mockFetch({ "GET /me": ME_RESPONSE });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/couldn't load listings/i));
+    expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
+  });
+
+  it("shows drivers ride requests in Driver mode", async () => {
+    sessionStorage.setItem("carpool_mode", "driver");
     mockFetch({
       "GET /me": ME_RESPONSE,
-      "GET /driver-trips/search": [],
+      "GET /driver-trips/search": [DRIVER_TRIP_1],
       "GET /ride-requests/search": [RIDE_REQUEST_1],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [],
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
 
-    await waitFor(() =>
-      expect(screen.getByText("Providence, RI")).toBeTruthy()
-    );
+    await waitFor(() => expect(screen.getByText("Providence, RI")).toBeTruthy());
+    // Drivers see riders needing a ride, not other drivers' offers.
+    expect(screen.queryByText("Logan Airport")).toBeNull();
   });
 
-  it("filters by type when filter button is clicked", async () => {
-    const user = userEvent.setup();
+  it("never shows riders other riders' ride requests", async () => {
     mockFetch({
       "GET /me": ME_RESPONSE,
       "GET /driver-trips/search": [DRIVER_TRIP_1],
@@ -224,10 +267,11 @@ describe("Feed view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText("Logan Airport"));
 
-    // Click "Offering rides" filter — only driver trips should show
-    await user.click(screen.getByRole("button", { name: /offering rides/i }));
     expect(screen.queryByText("Providence, RI")).toBeNull();
-    expect(screen.getByText("Logan Airport")).toBeTruthy();
+    // No "Need rides" filter to flip it back on, and it isn't even fetched.
+    expect(screen.queryByRole("button", { name: /need rides/i })).toBeNull();
+    const fetched = vi.mocked(fetch).mock.calls.map(([url]) => String(url));
+    expect(fetched.some(u => u.includes("/ride-requests/search"))).toBe(false);
   });
 
   it("shows connect button and navigates to connections after clicking", async () => {
@@ -258,6 +302,18 @@ describe("Feed view", () => {
     await user.click(connectBtn);
 
     await waitFor(() => screen.getByText(/track pending offers/i));
+
+    // The request created on the rider's behalf is flagged so it never
+    // shows up in anyone's Discover as if it were a real post.
+    const createCall = vi.mocked(fetch).mock.calls.find(([url, init]) =>
+      String(url).endsWith("/ride-requests") && (init as RequestInit | undefined)?.method === "POST");
+    const body = JSON.parse(String((createCall![1] as RequestInit).body));
+    expect(body.for_connection).toBe(true);
+    // Heads to the driver's actual destination — not a copy saved at the
+    // rider's own position (which made the trip route 0 m / $0) — and with
+    // no location permission, starts at the driver's pickup, never 0,0.
+    expect(body.destination_location_id).toBe(DRIVER_TRIP_1.destination.id);
+    expect(body.pickup_location_id).toBe(DRIVER_TRIP_1.pickup.id);
   });
 });
 
@@ -656,5 +712,26 @@ describe("Profile view", () => {
     // Passenger mode (pre-seeded) — only the Ride Requests tab, never Driver Trips.
     expect(screen.getByRole("button", { name: /ride requests/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /driver trips/i })).toBeNull();
+  });
+
+  it("My Rides leaves out requests that only exist to back a connection", async () => {
+    const user = userEvent.setup();
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [
+        { ...RIDE_REQUEST_1, id: "rrq_real", rider_id: ME_RESPONSE.id, destination: { id: "d1", label: "Real Post Destination", exact: true } },
+        { ...RIDE_REQUEST_1, id: "rrq_backing", rider_id: ME_RESPONSE.id, destination: { id: "d2", label: "Backing Request Destination", exact: true }, for_connection: true },
+      ],
+    });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/find your ride/i));
+    await user.click(screen.getAllByRole("button", { name: /^my rides$/i })[0]);
+
+    await waitFor(() => screen.getByText("Real Post Destination"));
+    expect(screen.queryByText("Backing Request Destination")).toBeNull();
   });
 });

@@ -19,8 +19,8 @@ This document describes the system as it actually exists, then lists the improve
 - **Backend**: FastAPI (Python), `backend/app/main.py`. Deployed as a Vercel Python serverless function via `api/index.py`, routed by the root `vercel.json`. Not a long-running server.
 - **Database**: Postgres on Neon, accessed with raw `psycopg2` — no ORM. Schema is created idempotently in code (`backend/app/db.py: run_migrations()`); the checked-in SQL files under `backend/migrations/` are stale/incomplete and are not the real source of truth.
 - **Auth**: Two layers, now cryptographically bridged.
-  - Neon Auth (`@neondatabase/neon-js`, `@neondatabase/auth-ui`) provides the real sign-in UI/session in the browser.
-  - The FastAPI backend's `/auth/login` verifies the Neon Auth token server-side against Neon's JWKS (`verify_neon_auth_token`, checking issuer + audience) before minting its own self-issued HS256 session JWT — it no longer trusts a client-supplied email. A failed/forged token, or a suspended account, is rejected and logged to the audit log.
+  - Supabase Auth (`@supabase/supabase-js`) provides the session in the browser, behind the app's own sign-in / sign-up / password-reset screens (`frontend/src/pages/auth.tsx`).
+  - The FastAPI backend's `/auth/login` verifies the Supabase access token server-side against the project's JWKS (`verify_supabase_token`, checking issuer + `authenticated` audience; legacy HS256 projects via `SUPABASE_JWT_SECRET`) before minting its own self-issued HS256 session JWT — it no longer trusts a client-supplied email. A failed/forged token, or a suspended account, is rejected and logged to the audit log.
 - **Real-time**: A WebSocket implementation exists (`ConnectionManager` in `main.py`, `/ws/{user_id}`) for chat messages, connection updates, and nearby-driver broadcasts — but the frontend still explicitly disables it whenever the API is not on `localhost` (`frontend/src/api.ts`). So **real-time is still dev-only**; production silently falls back to no live updates. This part has not changed (see roadmap item 8).
 - **Maps / location**: MapLibre GL (vector basemap via CARTO) for rendering, OSRM's public demo server for road routing, Nominatim (OSM) for geocoding/address search — all free, keyless, third-party services with no rate-limit handling or fallback provider.
 - **PostGIS**: actually in use now. `driver_locations.geog` and the `ride_requests`/`driver_trips` pickup/destination location joins are queried with `ST_DWithin`/`ST_Distance` (see `search_ride_requests`, `search_driver_trips`, `get_nearby_drivers` in `backend/app/domain.py`). Python `haversine_meters` remains, but only for display-value distance/fare estimates, not for radius filtering.
@@ -46,7 +46,7 @@ Both the original two-sided listing model and a newer community-pool model exist
 
 | Area | Status |
 |---|---|
-| Sign in / profile | Working via Neon Auth UI, now server-side verified against Neon's JWKS before a session JWT is issued |
+| Sign in / profile | Working via Supabase Auth, server-side verified against the project's JWKS before a session JWT is issued |
 | Ride requests / driver trips (create, search, filter by radius/date/tag/luggage/car type) | Fully built, Postgres-persisted, radius filtering via PostGIS `ST_DWithin` |
 | Community pools | Fully built — organizer create, join/leave, capacity auto-fill, named roster + departure time + group chat all present in the pool card UI |
 | Connections (request/offer, accept/decline, seat reservation) | Fully built, matches the original state machine |

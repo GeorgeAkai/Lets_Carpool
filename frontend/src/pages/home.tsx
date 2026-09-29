@@ -1,5 +1,5 @@
 import React, {
-  useState, useMemo, useEffect, useCallback, useRef, useContext, type CSSProperties,
+  useState, useMemo, useEffect, useCallback, useRef, type CSSProperties,
   useId,
 } from 'react'
 import {
@@ -10,20 +10,20 @@ import {
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
-import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
-import { useTheme } from '@neondatabase/auth-ui'
+import { useTheme } from '../lib/theme'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
-import { authClient, fetchNeonJWT } from '../lib/auth'
+import { getAccessToken, signOut, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
   ViewToggleFab, OfferRideFab,
 } from './discover-mobile'
 import { AdminView } from './admin'
+import { ProfileAvatar, ProfileSheetProvider, useOpenProfile, type ProfileTarget } from './profile-sheet'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -39,6 +39,9 @@ export interface Listing {
   id: string; type: ListingType; apiId: string; ownerId: string
   user: { name: string; initials: string; verified: boolean; photoUrl?: string | null }
   from: string; to: string; date: string; flexibility: Flexibility
+  // Location record ids — coordinates stay private until connected, but the
+  // ids let a connection's backing listing share this listing's endpoints.
+  fromLocationId: string; toLocationId: string
   seats?: number; seatsUsed?: number; passengers?: number; estimatedGas?: number
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
@@ -66,6 +69,8 @@ interface Connection {
   pickupLat?: number; pickupLng?: number; pickupLabel?: string
   destLat?: number; destLng?: number; destLabel?: string
   riderPickupLat?: number; riderPickupLng?: number; riderPickupLabel?: string
+  // Driver's reported leg of an accepted ride (for the rider's "on the way").
+  tripPhase?: 'pickup' | 'dropoff' | null
 }
 
 interface LocationValue {
@@ -294,6 +299,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: trip.driver_photo_url },
     from: trip.pickup.label, to: trip.destination.label,
+    fromLocationId: trip.pickup.id, toLocationId: trip.destination.id,
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
     tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -310,6 +316,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
     id: req.id, type: 'rider', apiId: req.id, ownerId: req.rider_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: req.rider_photo_url },
     from: req.pickup.label, to: req.destination.label,
+    fromLocationId: req.pickup.id, toLocationId: req.destination.id,
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -366,6 +373,7 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
     riderPickupLat: conn.ride_request.pickup.latitude,
     riderPickupLng: conn.ride_request.pickup.longitude,
     riderPickupLabel: conn.ride_request.pickup.label,
+    tripPhase: conn.trip_phase ?? null,
   }
 }
 
@@ -486,16 +494,21 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
   const luggage = isDriver ? listing.luggageCapacity : listing.luggageSize
+  const openProfile = useOpenProfile()
+  const profileTarget: ProfileTarget = {
+    userId: listing.ownerId, name: listing.user.name, photoUrl: listing.user.photoUrl, role: isDriver ? 'driver' : 'rider',
+    action: isOwn || alreadyConnected ? undefined : { label: isDriver ? 'Request to join' : 'Offer a ride', onClick: () => onConnect(listing) },
+  }
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}
       className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
       <div className="flex items-start gap-3">
-        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
+        <ProfileAvatar target={profileTarget} size={40} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-sm font-semibold">{listing.user.name}</span>
+            <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold hover:underline">{listing.user.name}</button>
             {listing.user.verified && (
               <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0" title="Verified">
                 <Check className="size-2.5 text-primary" />
@@ -690,13 +703,18 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   const [expanded, setExpanded] = useState(false)
   const [requesting, setRequesting] = useState(false)
   const name = profile?.display_name ?? listing.user.name
-  const initials = toInitials(name)
+  const openProfile = useOpenProfile()
 
   const handleRequest = async () => {
     setRequesting(true)
     try { await onConnect(listing); showToast('Match requested!', 'success') }
     catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
     finally { setRequesting(false) }
+  }
+  const profileTarget: ProfileTarget = {
+    userId: listing.ownerId, name, photoUrl: profile?.photo_url ?? listing.user.photoUrl,
+    role: isDriverListing ? 'driver' : 'rider',
+    action: alreadyConnected ? undefined : { label: 'Instant Request Match', onClick: handleRequest },
   }
 
   return (
@@ -708,14 +726,10 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
         {rank === 0 ? '✨ Top match' : '✨ Best match'}
       </span>
       <div className="flex items-start gap-3 mt-1">
-        {profile?.photo_url ? (
-          <img src={profile.photo_url} alt="" className="size-10 rounded-full object-cover ring-1 ring-border shrink-0" />
-        ) : (
-          <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{initials}</div>
-        )}
+        <ProfileAvatar target={profileTarget} size={40} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
-            <span className="text-sm font-semibold truncate">{name}</span>
+            <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold truncate hover:underline">{name}</button>
             {profile?.photo_verified && (
               <span className="size-4 rounded-full bg-emerald-600 flex items-center justify-center shrink-0" title="Photo verified"><Check className="size-2.5 text-white" /></span>
             )}
@@ -808,7 +822,7 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 
 function DriverHomeView({
   myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
-  searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  searchQuery, setSearchQuery, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen, connectedListingIds,
@@ -818,7 +832,6 @@ function DriverHomeView({
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -830,6 +843,7 @@ function DriverHomeView({
   const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
   const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
   const isMobile = useIsMobile()
+  const openProfile = useOpenProfile()
 
   // Mobile-only: candidates are always ride requests (type 'rider'), so the
   // vehicle-size filter and rider-facing "seats needed" pill never apply here
@@ -884,8 +898,7 @@ function DriverHomeView({
         )}
         <FilterSheet
           open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
-          filterType={filterType} setFilterType={setFilterType}
-          filterTag={filterTag} setFilterTag={setFilterTag}
+                    filterTag={filterTag} setFilterTag={setFilterTag}
           filterCarType={filterCarType} setFilterCarType={setFilterCarType}
           filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
         />
@@ -942,17 +955,18 @@ function DriverHomeView({
             {matches.map(m => {
               const name = m.profile?.display_name ?? m.listing.user.name
               const l = m.listing
+              const offer = () => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))
+              const profileTarget: ProfileTarget = {
+                userId: l.ownerId, name, photoUrl: m.profile?.photo_url ?? l.user.photoUrl, role: 'rider',
+                action: connectedListingIds.has(l.apiId) ? undefined : { label: 'Offer to drive', onClick: offer },
+              }
               return (
                 <div key={l.id} className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all">
                   <div className="flex items-start gap-3">
-                    {m.profile?.photo_url ? (
-                      <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
-                    ) : (
-                      <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
-                    )}
+                    <ProfileAvatar target={profileTarget} size={40} />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-sm font-semibold">{name}</span>
+                        <button type="button" onClick={() => openProfile(profileTarget)} className="text-sm font-semibold hover:underline">{name}</button>
                         <span className="text-xs text-muted-foreground">🧍 {l.passengers} passenger{(l.passengers ?? 0) > 1 ? 's' : ''}</span>
                       </div>
                       <RouteLine from={l.from} to={l.to} flexibility={l.flexibility} />
@@ -974,7 +988,7 @@ function DriverHomeView({
                     {connectedListingIds.has(l.apiId) ? (
                       <span className="px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center gap-1.5"><Check className="size-4" />Offered</span>
                     ) : (
-                      <button onClick={() => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
+                      <button onClick={offer} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
                         Offer to drive
                       </button>
                     )}
@@ -992,14 +1006,13 @@ function DriverHomeView({
 // ─── Feed view ────────────────────────────────────────────────────────────────
 
 function FeedView({
-  searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
+  searchQuery, setSearchQuery, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
   listings, onConnect, loading, currentUserId, setView, connectedListingIds, bestMatches,
 }: {
   searchQuery: string; setSearchQuery: (v: string) => void
-  filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
@@ -1015,7 +1028,7 @@ function FeedView({
   const isMobile = useIsMobile()
 
   if (isMobile) {
-    const activeFilterCount = [filterType !== 'all', filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
+    const activeFilterCount = [filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
     return (
       <div className="space-y-4">
         <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
@@ -1043,8 +1056,7 @@ function FeedView({
         )}
         <FilterSheet
           open={filterSheetOpen} onClose={() => setFilterSheetOpen(false)}
-          filterType={filterType} setFilterType={setFilterType}
-          filterTag={filterTag} setFilterTag={setFilterTag}
+                    filterTag={filterTag} setFilterTag={setFilterTag}
           filterCarType={filterCarType} setFilterCarType={setFilterCarType}
           filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
         />
@@ -1066,14 +1078,6 @@ function FeedView({
           <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
             className="w-full pl-10 pr-4 py-3 rounded-xl bg-card border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary focus:ring-3 focus:ring-primary/15 transition-colors" />
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          {(['all', 'driver', 'rider'] as const).map(t => (
-            <button key={t} onClick={() => setFilterType(t)} className={pill(filterType === t)}>
-              {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-            </button>
-          ))}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -1424,7 +1428,7 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
 // ─── Connection card ──────────────────────────────────────────────────────────
 
 function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat,
+  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onTrackDriver, onOpenChat,
   autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
@@ -1433,12 +1437,20 @@ function ConnectionCard({
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
+  onTrackDriver: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
   autoOpen?: 'gassplit' | null
   isActive: boolean
   onActivate: () => void
 }) {
   const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | null>(null)
+  const openProfile = useOpenProfile()
+  // The other person on this connection — so a driver can size up a rider
+  // before accepting, and vice versa.
+  const partnerProfile: ProfileTarget = {
+    userId: connection.withUserId, name: connection.withUser.name, photoUrl: connection.withUser.photoUrl,
+    role: connection.myRole === 'driver' ? 'rider' : 'driver',
+  }
 
   // Another card became the active one — collapse this one so only a single
   // panel is ever open across the inbox at a time.
@@ -1502,14 +1514,16 @@ function ConnectionCard({
       <div className="px-5 pt-5 pb-3">
         <div className="flex items-start gap-3">
           <div className="relative shrink-0">
-            <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="card" />
+            <ProfileAvatar target={partnerProfile} size={40} />
             {connection.unreadMessages > 0 && (
-              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
+              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold pointer-events-none">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
             )}
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+              <h2 className="text-sm font-semibold text-foreground truncate">
+                <button type="button" onClick={() => openProfile(partnerProfile)} className="hover:underline">{connection.withUser.name}</button>
+              </h2>
               <ConnStatusBadge status={status} />
               <span className={CHIP}>{connection.myRole === 'driver' ? "You're driving" : "You're riding"}</span>
             </div>
@@ -1530,6 +1544,9 @@ function ConnectionCard({
             <button onClick={handleAccept} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
             <button onClick={handleDecline} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-muted px-4 py-2.5 text-sm font-semibold text-muted-foreground hover:text-foreground disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
             <div className="basis-full flex flex-wrap gap-2">
+              <button onClick={() => openProfile(partnerProfile)} className={GHOST_BTN}>
+                <User className="size-4" />View profile
+              </button>
               <button onClick={() => onOpenChat(connection)} className={`${GHOST_BTN} relative`}>
                 <MessageCircle className="size-4" />Message
                 {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
@@ -1546,7 +1563,13 @@ function ConnectionCard({
             </button>
             {connection.myRole === 'driver' && hasRiderPickupCoords && (
               <button onClick={() => onStartDriving(connection)} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-emerald-700 transition-colors">
-                <Car className="size-4" />Start Driving
+                <Car className="size-4" />Go pick up {connection.withUser.name.split(' ')[0]}
+              </button>
+            )}
+            {connection.myRole === 'rider' && hasRiderPickupCoords && (
+              <button onClick={() => onTrackDriver(connection)} className={`flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors ${connection.tripPhase ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-card border border-border text-foreground hover:bg-muted'}`}>
+                <MapPin className="size-4" />
+                {connection.tripPhase === 'pickup' ? 'Driver on the way — track' : connection.tripPhase === 'dropoff' ? 'On your way — track' : 'Track driver'}
               </button>
             )}
             <div className="basis-full flex flex-wrap gap-2">
@@ -1626,6 +1649,11 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
   const [sending, setSending] = useState(false)
   const msgEndRef = useRef<HTMLDivElement>(null)
   const { status } = connection
+  const openProfile = useOpenProfile()
+  const partnerProfile: ProfileTarget = {
+    userId: connection.withUserId, name: connection.withUser.name, photoUrl: connection.withUser.photoUrl,
+    role: connection.myRole === 'driver' ? 'rider' : 'driver',
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -1672,11 +1700,11 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
         <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-muted-foreground hover:text-foreground transition-colors">
           <ChevronLeft className="size-5" />
         </button>
-        <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+        <ProfileAvatar target={partnerProfile} size={36} />
+        <button type="button" onClick={() => openProfile(partnerProfile)} className="min-w-0 text-left">
+          <h2 className="text-sm font-semibold text-foreground truncate hover:underline">{connection.withUser.name}</h2>
           <p className="text-xs text-muted-foreground truncate">{connection.route} · {status === 'pending' ? 'Pending connection' : 'Accepted'}</p>
-        </div>
+        </button>
       </div>
 
       {/* Messages */}
@@ -1728,13 +1756,14 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, deepLink }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onTrackDriver, onOpenChat, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
+  onTrackDriver: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
   deepLink?: { connectionId: string; section: 'gassplit' } | null
 }) {
@@ -1764,7 +1793,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
           {connections.map(c => (
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat}
+              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onTrackDriver={onTrackDriver} onOpenChat={onOpenChat}
               autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
               isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
@@ -2132,47 +2161,47 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   )
 }
 
-// ─── Neon ↔ Backend session sync ─────────────────────────────────────────────
+// ─── Supabase ↔ Backend session sync ──────────────────────────────────────────
 
 const AUTH_TOKEN_RETRY_LIMIT = 3
 
-function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
-  onAuthenticated: (neonToken: string) => Promise<void>
+function AuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
+  onAuthenticated: (accessToken: string, email: string) => Promise<void>
   onUnauthenticated: () => void
   onAuthError: (message: string) => void
 }) {
-  const ctx = useContext(AuthUIContext)
-  const { data: session, isPending } = ctx.hooks.useSession()
+  const { user, isPending } = useAuthSession()
   const lastSyncedId = useRef<string | null | undefined>(undefined)
 
   useEffect(() => {
     if (isPending) return
-    if (!session?.user) {
+    if (!user) {
       if (lastSyncedId.current !== null) {
         lastSyncedId.current = null
         onUnauthenticated()
       }
       return
     }
-    const uid = session.user.id
+    const uid = user.id
     if (lastSyncedId.current === uid) return
 
     // The backend verifies this token's signature itself — it never trusts a
     // client-supplied email/name (that would let anyone authenticate as anyone).
-    // fetchNeonJWT can reject or resolve null (e.g. the Neon Auth server is
-    // briefly unreachable) — retry a few times with backoff, and surface an
-    // error instead of hanging on "Loading…" forever if it never recovers.
+    // getAccessToken or the backend exchange can fail (e.g. a brief network
+    // blip) — retry a few times with backoff, and surface an error instead of
+    // hanging on "Loading…" forever if it never recovers.
     let cancelled = false
 
     const attempt = async (attemptNumber: number): Promise<void> => {
       try {
-        const token = await fetchNeonJWT()
+        const token = await getAccessToken()
         if (cancelled) return
-        if (!token) throw new Error('Neon Auth returned no token')
+        if (!token) throw new Error('Supabase returned no access token')
         lastSyncedId.current = uid
-        await onAuthenticated(token)
+        await onAuthenticated(token, user.email)
       } catch {
         if (cancelled) return
+        lastSyncedId.current = undefined
         if (attemptNumber < AUTH_TOKEN_RETRY_LIMIT) {
           setTimeout(() => { if (!cancelled) attempt(attemptNumber + 1) }, 1000 * attemptNumber)
         } else {
@@ -2183,7 +2212,7 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
     attempt(1)
 
     return () => { cancelled = true }
-  }, [session?.user?.id, isPending, onAuthenticated, onUnauthenticated, onAuthError])
+  }, [user?.id, isPending, onAuthenticated, onUnauthenticated, onAuthError]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return null
 }
@@ -2223,7 +2252,9 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
               <Bell className="size-4" />
               {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>{initials}</button>
+            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center overflow-hidden hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>
+              {currentUser.profile.photo_url ? <img src={currentUser.profile.photo_url} alt="" className="size-full object-cover" /> : initials}
+            </button>
             <button onClick={onSignOut} className={iconBtn} aria-label="Sign out"><LogOut className="size-4" /></button>
           </div>
         ) : (
@@ -2374,11 +2405,8 @@ export function Home() {
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
-  // Driven by next-themes (via NeonAuthUIProvider in App.tsx), not a separate
-  // mechanism of our own — it already owns the `class` on <html>, persists to
-  // localStorage, and is active on every route (Home never having mounted was
-  // exactly why the old carpool_dark-based toggle didn't survive across pages:
-  // NeonAuthUIProvider wraps every route and would silently overwrite it).
+  // Owned by ThemeProvider (lib/theme.tsx, wrapping every route in App.tsx) so
+  // the choice applies on the sign-in screens too and survives navigation.
   const { resolvedTheme, setTheme } = useTheme()
   const darkMode = resolvedTheme === 'dark'
 
@@ -2398,7 +2426,6 @@ export function Home() {
 
   // ── Passenger/Driver mode ── persists per session; switches primary actions/views
   const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
-  useEffect(() => { sessionStorage.setItem('carpool_mode', mode) }, [mode])
 
   // Gate Discover behind an explicit one-time choice instead of defaulting
   // silently to Passenger — sessionStorage having no value yet means this is
@@ -2406,10 +2433,14 @@ export function Home() {
   // the rest of the session; switching later is a deliberate action in
   // Profile, not this gate reappearing.
   const [modeGateOpen, setModeGateOpen] = useState(() => sessionStorage.getItem('carpool_mode') === null)
+  // Persist only once the gate has actually been answered — persisting the
+  // default 'rider' on first mount (e.g. the brief Home render before a
+  // signed-out visitor is redirected to sign-in) made the gate look already
+  // answered, so it was skipped right after signing in.
+  useEffect(() => { if (!modeGateOpen) sessionStorage.setItem('carpool_mode', mode) }, [mode, modeGateOpen])
 
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
-  const [filterType, setFilterType] = useState<'all' | 'driver' | 'rider'>('all')
   const [filterTag, setFilterTag] = useState<'' | RideTag>('')
   const [filterCarType, setFilterCarType] = useState<'' | CarType>('')
   const [filterLuggage, setFilterLuggage] = useState<'' | LuggageSize>('')
@@ -2521,15 +2552,21 @@ export function Home() {
     return () => { ws?.close(); wsRef.current = null }
   }, [currentUser])
 
-  // ── Neon session → backend sync ──
-  const handleAuthenticated = useCallback(async (neonToken: string) => {
+  // ── Supabase session → backend sync ──
+  const handleAuthenticated = useCallback(async (accessToken: string, email: string) => {
     try {
+      // Reuse the stored backend token only if it belongs to the account that's
+      // signed in now — a token left over from a different account in this
+      // browser would otherwise silently act as that other user.
       const existingToken = localStorage.getItem('carpool_token')
       if (existingToken) {
-        try { const user = await api.getMe(); setCurrentUser(user); requestLocation(); return }
-        catch { localStorage.removeItem('carpool_token') }
+        try {
+          const user = await api.getMe()
+          if (user.email.toLowerCase() === email.toLowerCase()) { setCurrentUser(user); requestLocation(); return }
+        } catch { /* expired or invalid — fall through to a fresh login */ }
+        localStorage.removeItem('carpool_token')
       }
-      const user = await api.login(neonToken)
+      const user = await api.login(accessToken)
       setCurrentUser(user); requestLocation()
       setAuthError(null)
     } finally { setAuthLoading(false) }
@@ -2539,8 +2576,8 @@ export function Home() {
     api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
   }, [])
 
-  // Fires only after NeonAuthSync exhausts its retries — e.g. the Neon Auth
-  // server is unreachable — so the UI never hangs on "Loading…" forever.
+  // Fires only after AuthSync exhausts its retries — e.g. Supabase or the
+  // backend is unreachable — so the UI never hangs on "Loading…" forever.
   const handleAuthError = useCallback((message: string) => {
     setAuthError(message); setAuthLoading(false)
   }, [])
@@ -2589,13 +2626,25 @@ export function Home() {
 
   useEffect(() => { if (currentUser) loadConnections(currentUser.id) }, [currentUser, loadConnections])
 
+  // Websocket pushes don't survive serverless hosting, so refresh the Inbox
+  // whenever it's opened and every 30s while it's open and visible — that's
+  // how a rider sees "accepted" or "driver on the way" without reloading.
+  useEffect(() => {
+    if (!currentUser || view !== 'connections') return
+    loadConnections(currentUser.id)
+    const id = setInterval(() => { if (document.visibilityState === 'visible') loadConnections(currentUser.id) }, 30000)
+    return () => clearInterval(id)
+  }, [currentUser, view, loadConnections])
+
   // ── My Listings ──
   const loadMyListings = useCallback(async () => {
     try {
       const [trips, requests] = await Promise.all([api.getMyDriverTrips(), api.getMyRideRequests()])
+      // Listings created only to back a connection aren't posts of yours —
+      // they're represented by the connection in the Inbox instead.
       const combined: MyListing[] = [
-        ...trips.map(tripToMyListing),
-        ...requests.map(requestToMyListing),
+        ...trips.filter(t => !t.for_connection).map(tripToMyListing),
+        ...requests.filter(r => !r.for_connection).map(requestToMyListing),
       ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       setMyListings(combined)
     } catch { }
@@ -2609,26 +2658,37 @@ export function Home() {
   // already enforced server-side) so the destination search bar and filter
   // sheet are what narrow the list, not a silent, invisible GPS distance
   // cutoff a listing could fall just outside of with no indication why.
+  // A failed load used to be swallowed, leaving an empty feed that looked
+  // exactly like "no listings" — keep the last good list, but say so.
+  const [feedError, setFeedError] = useState(false)
   const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const [trips, requests] = await Promise.all([api.searchDriverTrips({}), api.searchRideRequests({})])
-      const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
+      // Only fetch the side this mode shows — riders browse drivers' trips,
+      // drivers browse riders' requests.
+      const combined = mode === 'rider'
+        ? (await api.searchDriverTrips({})).map(tripToListing)
+        : (await api.searchRideRequests({})).map(requestToListing)
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
       setAllListings(deduped)
-    } catch { } finally { setFeedLoading(false) }
-  }, [])
+      setFeedError(false)
+    } catch { setFeedError(true) } finally { setFeedLoading(false) }
+  }, [mode])
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
   // mount), and keep polling while it stays active so a listing posted while
-  // you're already browsing shows up without a manual reload.
+  // you're already browsing shows up without a manual reload. Polling pauses
+  // while the tab is hidden (a background tab polling forever kept the
+  // database busy around the clock) and catches up as soon as it's visible.
   useEffect(() => {
     if (!currentUser || view !== 'feed') return
     loadListings()
-    const id = setInterval(loadListings, 20000)
-    return () => clearInterval(id)
+    const id = setInterval(() => { if (document.visibilityState === 'visible') loadListings() }, 60000)
+    const onVisible = () => { if (document.visibilityState === 'visible') loadListings() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
@@ -2636,7 +2696,8 @@ export function Home() {
     const now = new Date()
     const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
     return allListings.filter(listing => {
-      const matchType = filterType === 'all' || listing.type === filterType
+      // Discover is mode-only: riders see drivers' offers, never other riders' requests.
+      const matchType = listing.type === (mode === 'rider' ? 'driver' : 'rider')
       const matchTag = filterTag === '' || listing.tags.includes(filterTag)
       const matchSearch = searchQuery.trim() === '' || listing.to.toLowerCase().includes(searchQuery.toLowerCase()) || listing.from.toLowerCase().includes(searchQuery.toLowerCase())
       const matchCarType = filterCarType === '' || (listing.type === 'driver' && listing.carType === filterCarType)
@@ -2645,7 +2706,7 @@ export function Home() {
       const matchSeats = seatsNeeded == null || listing.type !== 'driver' || ((listing.seats ?? 0) - (listing.seatsUsed ?? 0)) >= seatsNeeded
       return matchType && matchTag && matchSearch && matchCarType && matchLuggage && matchDate && matchSeats
     })
-  }, [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [allListings, mode, filterTag, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Listings the current user has already acted on ──────────────────────────
   // onConnect always creates a fresh ride_request/driver_trip on our side, so
@@ -2667,17 +2728,27 @@ export function Home() {
   // ── Handlers ──
   const onConnect = useCallback(async (listing: Listing) => {
     try {
-      const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
-      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      // The backing listing heads to the same place as the listing you're
+      // connecting to, so reuse its destination location as-is — creating a
+      // new one from your GPS saved the destination at your own position,
+      // which made the trip route 0 m / 0 min / $0. Your pickup is where you
+      // are now, or the other listing's pickup if location isn't available
+      // (never 0,0).
+      const pickupId = userCoords
+        ? (await api.createLocation(await reverseGeocode(userCoords.lat, userCoords.lng), userCoords.lat, userCoords.lng)).id
+        : listing.fromLocationId
+      const destinationId = listing.toLocationId
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
-        conn = await api.createConnection(rr.id, listing.apiId)
+        const rr = await api.createRideRequest({ pickup_location_id: pickupId, destination_location_id: destinationId, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [], for_connection: true })
+        // If the connection is refused (e.g. you're already connected with this
+        // person that day), don't leave the backing request behind.
+        try { conn = await api.createConnection(rr.id, listing.apiId) }
+        catch (e) { api.cancelRideRequest(rr.id).catch(() => {}); throw e }
       } else {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
-        conn = await api.createConnection(listing.apiId, trip.id)
+        const trip = await api.createDriverTrip({ pickup_location_id: pickupId, destination_location_id: destinationId, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [], for_connection: true })
+        try { conn = await api.createConnection(listing.apiId, trip.id) }
+        catch (e) { api.cancelDriverTrip(trip.id).catch(() => {}); throw e }
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
       setConnections(prev => [newConn, ...prev]); showToast('Connection created!', 'success'); setView('connections')
@@ -2727,20 +2798,65 @@ export function Home() {
     setView('map')
   }, [])
 
+  // Driver's trip, in two legs: navigate to the rider's pickup first; once
+  // they've met, "Picked up" switches navigation to the destination; arriving
+  // there completes the ride.
   const onStartDriving = useCallback((conn: Connection) => {
     if (!conn.riderPickupLat || !conn.riderPickupLng) return
     setTripRoute(null)
     setDrivingTo({
-      connectionId: conn.id, pickupLat: conn.riderPickupLat, pickupLng: conn.riderPickupLng,
-      pickupLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+      connectionId: conn.id, phase: 'pickup',
+      targetLat: conn.riderPickupLat, targetLng: conn.riderPickupLng,
+      targetLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+      dropoff: conn.destLat && conn.destLng ? { lat: conn.destLat, lng: conn.destLng, label: conn.destLabel ?? 'Destination' } : undefined,
+    })
+    setView('map')
+    // Let the rider know to get ready (shows up in their chat + notifications),
+    // and that their map can follow the car.
+    api.setTripPhase(conn.id, 'pickup').catch(() => {})
+    api.sendMessage(conn.id, "🚗 I'm on my way to pick you up — tap Track driver in your Inbox to follow me.").catch(() => {})
+  }, [])
+
+  // Rider: follow the driver's car on the map — to your pickup, then (once
+  // the driver reports you're on board) to the destination.
+  const onTrackDriver = useCallback((conn: Connection) => {
+    if (!conn.riderPickupLat || !conn.riderPickupLng) return
+    setTripRoute(null)
+    setDrivingTo({
+      connectionId: conn.id, phase: 'pickup', watchOnly: true,
+      targetLat: conn.riderPickupLat, targetLng: conn.riderPickupLng,
+      targetLabel: conn.riderPickupLabel ?? 'Your pickup', partnerName: conn.withUser.name,
+      dropoff: conn.destLat && conn.destLng ? { lat: conn.destLat, lng: conn.destLng, label: conn.destLabel ?? 'Destination' } : undefined,
     })
     setView('map')
   }, [])
 
+  const onPickedUp = useCallback(() => {
+    if (drivingTo) api.setTripPhase(drivingTo.connectionId, 'dropoff').catch(() => {})
+    setDrivingTo(prev => {
+      if (!prev) return null
+      if (!prev.dropoff) { showToast('Picked up — no destination on file to navigate to', 'error'); return null }
+      return { ...prev, phase: 'dropoff', targetLat: prev.dropoff.lat, targetLng: prev.dropoff.lng, targetLabel: prev.dropoff.label }
+    })
+  }, [drivingTo, showToast])
+
   const onStopDriving = useCallback(() => {
+    // Only the driver's own navigation reports a phase; a rider closing the
+    // tracking view changes nothing for anyone else.
+    if (drivingTo && !drivingTo.watchOnly) api.setTripPhase(drivingTo.connectionId, null).catch(() => {})
     setDrivingTo(null)
-    showToast('Trip navigation ended', 'success')
-  }, [showToast])
+    showToast(drivingTo?.watchOnly ? 'Stopped tracking' : 'Trip navigation ended', 'success')
+  }, [drivingTo, showToast])
+
+  const onArrived = useCallback(async () => {
+    const connectionId = drivingTo?.connectionId
+    setDrivingTo(null)
+    if (!connectionId) return
+    api.setTripPhase(connectionId, null).catch(() => {})
+    try { await onComplete(connectionId); showToast('Ride completed — thanks for driving!', 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Could not complete the ride', 'error') }
+    setView('connections')
+  }, [drivingTo?.connectionId, onComplete, showToast])
 
   const onMarkAllReadNotifs = useCallback(() => {
     setNotifications(prev => prev.map(n => ({ ...n, read: true })))
@@ -2777,7 +2893,7 @@ export function Home() {
   const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
-    authClient.signOut().catch(() => {})
+    signOut().catch(() => {})
     api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null); setOpenChatConnectionId(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
@@ -2816,7 +2932,7 @@ export function Home() {
   if (authLoading) {
     return (
       <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
       </div>
     )
@@ -2824,7 +2940,7 @@ export function Home() {
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
@@ -2835,8 +2951,9 @@ export function Home() {
   }
 
   return (
+    <ProfileSheetProvider myInterests={currentUser.profile.interests ?? []}>
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
-      <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
       {(() => {
@@ -2857,6 +2974,12 @@ export function Home() {
       <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
         <div>
           <main className="min-w-0">
+            {guardedView === 'feed' && feedError && (
+              <div role="alert" className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                <span>Couldn't load listings. Check your connection — what's shown may be out of date.</span>
+                <button onClick={loadListings} className="shrink-0 rounded-lg bg-card px-3 py-1.5 text-xs font-semibold text-foreground border border-border hover:bg-muted transition-colors">Retry</button>
+              </div>
+            )}
             {guardedView === 'feed' && (
               mode === 'driver' ? (
                 <DriverHomeView
@@ -2864,8 +2987,7 @@ export function Home() {
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
-                  filterType={filterType} setFilterType={setFilterType}
-                  filterTag={filterTag} setFilterTag={setFilterTag}
+                                    filterTag={filterTag} setFilterTag={setFilterTag}
                   filterCarType={filterCarType} setFilterCarType={setFilterCarType}
                   filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage}
                   quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter}
@@ -2873,7 +2995,7 @@ export function Home() {
                   filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen}
                 />
               ) : (
-                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
                   // Its own desktop-styled MatchCard would clash with the new mobile
                   // card design, and isn't part of the mobile redesign's scope.
                   !isMobile && (
@@ -2893,11 +3015,11 @@ export function Home() {
                 <OfferRideFab mode={mode} onClick={() => setView('post')} />
               </>
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} onPickedUp={onPickedUp} onArrived={onArrived} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onTrackDriver={onTrackDriver} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}
@@ -2907,5 +3029,6 @@ export function Home() {
 
       <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} />
     </div>
+    </ProfileSheetProvider>
   )
 }

@@ -45,6 +45,7 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
+  for_connection?: boolean;
 };
 
 export type ApiRideRequest = {
@@ -63,6 +64,7 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
+  for_connection?: boolean;
 };
 
 export type ApiConnection = {
@@ -76,6 +78,8 @@ export type ApiConnection = {
   ride_request: ApiRideRequest;
   driver_trip: ApiDriverTrip;
   completed_confirmed_by?: string[];
+  // "pickup" = driver heading to the rider, "dropoff" = rider on board.
+  trip_phase?: "pickup" | "dropoff" | null;
   rider_profile?: ApiProfile | null;
   driver_profile?: ApiProfile | null;
 };
@@ -235,8 +239,9 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(neonToken: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
+// Exchanges a Supabase Auth access token for this API's own session token.
+export async function login(supabaseAccessToken: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { supabase_token: supabaseAccessToken });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }
@@ -331,6 +336,9 @@ export function createDriverTrip(data: {
   luggage_capacity?: string;
   car_type?: string;
   notes?: string;
+  // True when created only to back an "Offer to drive" connection — the
+  // backend keeps these out of Discover.
+  for_connection?: boolean;
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
@@ -364,6 +372,9 @@ export function createRideRequest(data: {
   luggage_size?: string;
   preferred_car_type?: string;
   notes?: string;
+  // True when created only to back a "Request to join" connection — the
+  // backend keeps these out of Discover.
+  for_connection?: boolean;
 }): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", "/ride-requests", data);
 }
@@ -403,6 +414,25 @@ export type ApiMessage = {
   kind: "canned" | "free_text";
   created_at: string;
 };
+
+// ─── Live ride tracking ───────────────────────────────────────────────────────
+
+export type TripPhase = "pickup" | "dropoff";
+
+export type RideDriverLocation = {
+  trip_phase: TripPhase | null;
+  location: { latitude: number; longitude: number; heading: number | null; speed_kmh: number | null; updated_at: string } | null;
+};
+
+// Driver only: tells the rider's map which leg the driver is on.
+export function setTripPhase(connectionId: string, phase: TripPhase | null): Promise<unknown> {
+  return request("POST", `/connections/${connectionId}/trip-phase`, { phase });
+}
+
+// Rider (or driver) of an accepted ride: the driver's latest position.
+export function getRideDriverLocation(connectionId: string): Promise<RideDriverLocation> {
+  return request<RideDriverLocation>("GET", `/connections/${connectionId}/driver-location`);
+}
 
 export function getMessages(connectionId: string): Promise<ApiMessage[]> {
   return request<ApiMessage[]>("GET", `/connections/${connectionId}/messages`);
@@ -490,8 +520,18 @@ export type ApiPublicProfile = {
   display_name: string;
   photo_url: string | null;
   photo_verified: boolean;
+  bio?: string | null;
   interests: string[];
   nationality: string | null;
+  // Trust signals (optional so older backends still type-check).
+  email_domain?: string;
+  member_since?: string;
+  completed_rides?: { as_driver: number; as_rider: number };
+  vehicle?: {
+    make: string | null; model: string | null; color: string | null;
+    seats: number | null; car_type: string | null;
+    has_license: boolean; has_insurance: boolean; has_good_driving_record: boolean;
+  } | null;
 };
 
 export function getUserProfile(targetUserId: string): Promise<ApiPublicProfile> {

@@ -141,6 +141,7 @@ class RideRequest:
     luggage_size: str = "none"
     preferred_car_type: str | None = None
     notes: str | None = None
+    for_connection: bool = False
 
 
 @dataclass
@@ -159,6 +160,7 @@ class DriverTrip:
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = None
+    for_connection: bool = False
 
 
 @dataclass
@@ -171,6 +173,9 @@ class Connection:
     created_at: datetime
     updated_at: datetime
     completed_confirmed_by: list[str] = field(default_factory=list)
+    # Where the driver is in the ride, set from their navigation: "pickup"
+    # (on the way to the rider), "dropoff" (rider on board), or None.
+    trip_phase: str | None = None
 
 
 @dataclass
@@ -337,6 +342,7 @@ def _row_to_ride_request(r: dict) -> RideRequest:
         luggage_size=r["luggage_size"] or "none",
         preferred_car_type=r["preferred_car_type"],
         notes=r["notes"],
+        for_connection=bool(r.get("for_connection")),
     )
 
 def _row_to_driver_trip(r: dict) -> DriverTrip:
@@ -351,6 +357,7 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         luggage_capacity=r["luggage_capacity"] or "medium",
         car_type=r["car_type"],
         notes=r["notes"],
+        for_connection=bool(r.get("for_connection")),
     )
 
 def _row_to_connection(r: dict) -> Connection:
@@ -361,6 +368,7 @@ def _row_to_connection(r: dict) -> Connection:
         status=r["status"], created_at=r["created_at"],
         updated_at=r["updated_at"],
         completed_confirmed_by=list(r["completed_confirmed_by"] or []),
+        trip_phase=r.get("trip_phase"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -423,6 +431,22 @@ class Store:
         # leaks the old pool's connections instead of releasing them.
         close_pool()
         init_pool(database_url)
+        self._last_search_expiry: datetime | None = None
+
+    # Search archives stale listings itself (see search_driver_trips), but
+    # Discover polls it continuously — running that UPDATE on every request
+    # kept the database busy around the clock. Once per interval per server
+    # instance is plenty; the cron and admin expire endpoints still call
+    # expire_listings() directly, and search's own date filter hides stale
+    # rows regardless.
+    SEARCH_EXPIRY_INTERVAL = timedelta(minutes=10)
+
+    def _expire_listings_if_due(self) -> None:
+        now = now_utc()
+        if self._last_search_expiry and now - self._last_search_expiry < self.SEARCH_EXPIRY_INTERVAL:
+            return
+        self.expire_listings(now.date())
+        self._last_search_expiry = now
 
     def _cur(self, conn):
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -609,7 +633,7 @@ class Store:
             passenger_count=passenger_count, tags=tags,
             status="open", created_at=now_utc(),
             luggage_size=luggage_size, preferred_car_type=preferred_car_type,
-            notes=notes,
+            notes=notes, for_connection=bool(data.get("for_connection")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -617,12 +641,12 @@ class Store:
                 """INSERT INTO ride_requests (id, rider_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        passenger_count, tags, status, created_at, luggage_size,
-                       preferred_car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       preferred_car_type, notes, for_connection)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (rr.id, rr.rider_id, rr.pickup_location_id,
                  rr.destination_location_id, rr.target_date, rr.flexibility,
                  rr.passenger_count, rr.tags, rr.status, rr.created_at,
-                 rr.luggage_size, rr.preferred_car_type, rr.notes),
+                 rr.luggage_size, rr.preferred_car_type, rr.notes, rr.for_connection),
             )
         return rr
 
@@ -682,7 +706,7 @@ class Store:
             seats_available=seats_available, seats_reserved=0,
             tags=tags, status="open", created_at=now_utc(),
             luggage_capacity=luggage_capacity, car_type=car_type,
-            notes=notes,
+            notes=notes, for_connection=bool(data.get("for_connection")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -690,13 +714,13 @@ class Store:
                 """INSERT INTO driver_trips (id, driver_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        seats_available, seats_reserved, tags, status, created_at,
-                       luggage_capacity, car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       luggage_capacity, car_type, notes, for_connection)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
                  trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
-                 trip.notes),
+                 trip.notes, trip.for_connection),
             )
         return trip
 
@@ -759,9 +783,8 @@ class Store:
         # Actually archive stale listings here too, not just filter them out of
         # this result set — search is the one path guaranteed to run on every
         # page load, so it doesn't depend on the cron sweep (GET /cron/expire)
-        # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
-        # once a listing has already been archived once.
-        self.expire_listings(now_utc().date())
+        # actually being scheduled yet. Throttled — see _expire_listings_if_due.
+        self._expire_listings_if_due()
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "dt.destination_location_id", "dt.pickup_location_id",
         )
@@ -773,6 +796,7 @@ class Store:
                    WHERE dt.status IN ('open', 'matched')
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND dt.driver_id != %s
+                   AND NOT dt.for_connection
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
@@ -788,7 +812,7 @@ class Store:
         return [t for t in trips if self._listing_matches_query(t, query)]
 
     def search_ride_requests(self, user_id: str, query: dict[str, Any]) -> list[RideRequest]:
-        self.expire_listings(now_utc().date())
+        self._expire_listings_if_due()
         joins, geo_conditions, geo_params = self._geo_search_clauses(
             query, "rr.destination_location_id", "rr.pickup_location_id",
         )
@@ -800,6 +824,7 @@ class Store:
                    WHERE rr.status IN ('open', 'matched')
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND rr.rider_id != %s
+                   AND NOT rr.for_connection
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
@@ -854,6 +879,24 @@ class Store:
             raise DomainError("Only the rider or driver can initiate this connection", 403)
         if self.is_blocked(rr.rider_id, trip.driver_id):
             raise DomainError("Blocked users cannot connect", 403)
+        # One live connection per pair of people per day — whichever of them
+        # is the rider. Without this, a driver offering on the request the
+        # rider's own "Request to join" had created left the two of them with
+        # two connections (and two chats) for the same ride.
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT 1 FROM connections c
+                   JOIN ride_requests r ON r.id = c.ride_request_id
+                   JOIN driver_trips t ON t.id = c.driver_trip_id
+                   WHERE c.status IN ('pending', 'accepted')
+                     AND t.target_date = %s
+                     AND ((r.rider_id = %s AND t.driver_id = %s) OR (r.rider_id = %s AND t.driver_id = %s))
+                   LIMIT 1""",
+                (trip.target_date, rr.rider_id, trip.driver_id, trip.driver_id, rr.rider_id),
+            )
+            if cur.fetchone():
+                raise DomainError("You already have an active connection with this person for that day — check your Inbox.", 409)
 
         conn_obj = Connection(
             id=new_id("con"), ride_request_id=rr.id,
@@ -1295,6 +1338,59 @@ class Store:
             )
         return loc
 
+    # ─── Live ride tracking ───────────────────────────────────────────────────
+    # Only the two people on an accepted connection can see where its driver
+    # is — never anyone else, and never before the rider has been accepted.
+
+    TRIP_PHASES = {"pickup", "dropoff"}
+
+    def _accepted_connection_parties(self, connection_id: str) -> tuple[Connection, str, str]:
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        return connection, rr.rider_id, trip.driver_id
+
+    def set_trip_phase(self, user_id: str, connection_id: str, phase: str | None) -> Connection:
+        connection, _, driver_id = self._accepted_connection_parties(connection_id)
+        if user_id != driver_id:
+            raise DomainError("Only the driver can update the trip", 403)
+        if connection.status != "accepted":
+            raise DomainError("Only accepted rides can be tracked")
+        if phase is not None and phase not in self.TRIP_PHASES:
+            raise DomainError(f"Invalid trip phase: {phase}")
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE connections SET trip_phase = %s, updated_at = %s WHERE id = %s",
+                (phase, now_utc(), connection_id),
+            )
+        connection.trip_phase = phase
+        return connection
+
+    def get_ride_driver_location(self, user_id: str, connection_id: str) -> dict[str, Any] | None:
+        connection, rider_id, driver_id = self._accepted_connection_parties(connection_id)
+        if user_id not in {rider_id, driver_id}:
+            raise DomainError("Connection not found", 404)
+        if connection.status != "accepted":
+            raise DomainError("Live location is only shared for accepted rides", 403)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT ST_Y(geog::geometry) AS latitude, ST_X(geog::geometry) AS longitude,
+                          heading, speed_kmh, updated_at
+                   FROM driver_locations WHERE user_id = %s""",
+                (driver_id,),
+            )
+            row = cur.fetchone()
+        return {
+            "trip_phase": connection.trip_phase,
+            "location": None if not row else {
+                "latitude": row["latitude"], "longitude": row["longitude"],
+                "heading": row["heading"], "speed_kmh": row["speed_kmh"],
+                "updated_at": row["updated_at"].isoformat(),
+            },
+        }
+
     def get_nearby_drivers(self, lat: float, lng: float, radius_meters: float = 10000) -> list[dict[str, Any]]:
         stale_before = now_utc() - timedelta(minutes=self.DRIVER_LOCATION_TTL_MINUTES)
         with get_conn() as conn:
@@ -1430,6 +1526,24 @@ class Store:
                 (user_a, user_b, user_b, user_a),
             )
             return cur.fetchone() is not None
+
+    def completed_ride_counts(self, user_id: str) -> dict[str, int]:
+        """Completed rides this user took part in, split by role — a trust
+        signal shown on their public profile."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT
+                       COUNT(*) FILTER (WHERE t.driver_id = %s) AS as_driver,
+                       COUNT(*) FILTER (WHERE r.rider_id = %s) AS as_rider
+                   FROM connections c
+                   JOIN ride_requests r ON r.id = c.ride_request_id
+                   JOIN driver_trips t ON t.id = c.driver_trip_id
+                   WHERE c.status = 'completed' AND (t.driver_id = %s OR r.rider_id = %s)""",
+                (user_id, user_id, user_id, user_id),
+            )
+            row = cur.fetchone() or {}
+            return {"as_driver": int(row.get("as_driver") or 0), "as_rider": int(row.get("as_rider") or 0)}
 
     # ─── Admin ────────────────────────────────────────────────────────────────
 
