@@ -103,6 +103,9 @@ class RideRequestCreate(BaseModel):
     luggage_size: str = "none"
     preferred_car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+    # Set by the app for the request it creates to back a "Request to join"
+    # connection — hidden from Discover so it isn't shown as a real post.
+    for_connection: bool = False
 
 
 class DriverTripCreate(BaseModel):
@@ -115,6 +118,8 @@ class DriverTripCreate(BaseModel):
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+    # Same as RideRequestCreate.for_connection, for "Offer to drive".
+    for_connection: bool = False
 
 
 class ConnectionCreate(BaseModel):

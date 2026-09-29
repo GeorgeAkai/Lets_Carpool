@@ -299,6 +299,12 @@ describe("Feed view", () => {
     await user.click(connectBtn);
 
     await waitFor(() => screen.getByText(/track pending offers/i));
+
+    // The request created on the rider's behalf is flagged so it never
+    // shows up in anyone's Discover as if it were a real post.
+    const createCall = vi.mocked(fetch).mock.calls.find(([url, init]) =>
+      String(url).endsWith("/ride-requests") && (init as RequestInit | undefined)?.method === "POST");
+    expect(JSON.parse(String((createCall![1] as RequestInit).body)).for_connection).toBe(true);
   });
 });
 
@@ -697,5 +703,26 @@ describe("Profile view", () => {
     // Passenger mode (pre-seeded) — only the Ride Requests tab, never Driver Trips.
     expect(screen.getByRole("button", { name: /ride requests/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /driver trips/i })).toBeNull();
+  });
+
+  it("My Rides leaves out requests that only exist to back a connection", async () => {
+    const user = userEvent.setup();
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [
+        { ...RIDE_REQUEST_1, id: "rrq_real", rider_id: ME_RESPONSE.id, destination: { id: "d1", label: "Real Post Destination", exact: true } },
+        { ...RIDE_REQUEST_1, id: "rrq_backing", rider_id: ME_RESPONSE.id, destination: { id: "d2", label: "Backing Request Destination", exact: true }, for_connection: true },
+      ],
+    });
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/find your ride/i));
+    await user.click(screen.getAllByRole("button", { name: /^my rides$/i })[0]);
+
+    await waitFor(() => screen.getByText("Real Post Destination"));
+    expect(screen.queryByText("Backing Request Destination")).toBeNull();
   });
 });

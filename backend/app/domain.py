@@ -141,6 +141,7 @@ class RideRequest:
     luggage_size: str = "none"
     preferred_car_type: str | None = None
     notes: str | None = None
+    for_connection: bool = False
 
 
 @dataclass
@@ -159,6 +160,7 @@ class DriverTrip:
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = None
+    for_connection: bool = False
 
 
 @dataclass
@@ -337,6 +339,7 @@ def _row_to_ride_request(r: dict) -> RideRequest:
         luggage_size=r["luggage_size"] or "none",
         preferred_car_type=r["preferred_car_type"],
         notes=r["notes"],
+        for_connection=bool(r.get("for_connection")),
     )
 
 def _row_to_driver_trip(r: dict) -> DriverTrip:
@@ -351,6 +354,7 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         luggage_capacity=r["luggage_capacity"] or "medium",
         car_type=r["car_type"],
         notes=r["notes"],
+        for_connection=bool(r.get("for_connection")),
     )
 
 def _row_to_connection(r: dict) -> Connection:
@@ -625,7 +629,7 @@ class Store:
             passenger_count=passenger_count, tags=tags,
             status="open", created_at=now_utc(),
             luggage_size=luggage_size, preferred_car_type=preferred_car_type,
-            notes=notes,
+            notes=notes, for_connection=bool(data.get("for_connection")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -633,12 +637,12 @@ class Store:
                 """INSERT INTO ride_requests (id, rider_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        passenger_count, tags, status, created_at, luggage_size,
-                       preferred_car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       preferred_car_type, notes, for_connection)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (rr.id, rr.rider_id, rr.pickup_location_id,
                  rr.destination_location_id, rr.target_date, rr.flexibility,
                  rr.passenger_count, rr.tags, rr.status, rr.created_at,
-                 rr.luggage_size, rr.preferred_car_type, rr.notes),
+                 rr.luggage_size, rr.preferred_car_type, rr.notes, rr.for_connection),
             )
         return rr
 
@@ -698,7 +702,7 @@ class Store:
             seats_available=seats_available, seats_reserved=0,
             tags=tags, status="open", created_at=now_utc(),
             luggage_capacity=luggage_capacity, car_type=car_type,
-            notes=notes,
+            notes=notes, for_connection=bool(data.get("for_connection")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -706,13 +710,13 @@ class Store:
                 """INSERT INTO driver_trips (id, driver_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        seats_available, seats_reserved, tags, status, created_at,
-                       luggage_capacity, car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       luggage_capacity, car_type, notes, for_connection)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
                  trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
-                 trip.notes),
+                 trip.notes, trip.for_connection),
             )
         return trip
 
@@ -788,6 +792,7 @@ class Store:
                    WHERE dt.status IN ('open', 'matched')
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND dt.driver_id != %s
+                   AND NOT dt.for_connection
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (
@@ -815,6 +820,7 @@ class Store:
                    WHERE rr.status IN ('open', 'matched')
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND rr.rider_id != %s
+                   AND NOT rr.for_connection
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
                    {geo_conditions}
                    AND NOT EXISTS (

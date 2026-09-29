@@ -10,8 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import jwt as pyjwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+import psycopg2
 from fastapi.testclient import TestClient
 
+from backend.app.db import run_migrations
 from backend.app.domain import Store
 from backend.app.main import Settings, create_app
 
@@ -439,6 +441,88 @@ def test_driver_trips_and_ride_requests_carry_an_optional_free_text_note() -> No
         },
     )
     assert too_long.status_code == 422
+
+
+def test_listings_created_to_back_a_connection_stay_out_of_discover() -> None:
+    # Regression test: tapping "Request to join" creates a ride request on the
+    # rider's behalf. It used to be an ordinary public listing, so the driver
+    # saw it in Discover and tapping "Offer to drive" on it created *another*
+    # trip — which then showed up in the rider's Discover as a duplicate of
+    # the driver's real post.
+    api = client()
+    _, driver_headers = auth(api, "deree@example.com", "Deree")
+    _, rider_headers = auth(api, "passenger@example.com", "Passenger")
+    _, other_driver_headers = auth(api, "other-driver@example.com", "Other Driver")
+    chico = location(api, driver_headers, "Chico, California", 39.7285, -121.8375)
+    tahoe = location(api, driver_headers, "Lake Tahoe, California", 39.0968, -120.0324)
+    today = date.today().isoformat()
+    real_trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "seats_available": 3, "tags": [],
+        "car_type": "suv", "notes": "Heading to Lake Tahoe. Anyone?",
+    }).json()
+
+    # What onConnect does for "Request to join".
+    backing_request = api.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "passenger_count": 1, "tags": [],
+        "for_connection": True,
+    }).json()
+    conn = api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": backing_request["id"], "driver_trip_id": real_trip["id"],
+    })
+    assert conn.status_code == 200
+
+    for headers in (driver_headers, other_driver_headers):
+        requests = api.get("/ride-requests/search", headers=headers).json()
+        assert backing_request["id"] not in {r["id"] for r in requests}
+
+    # And the mirror case — a trip created for "Offer to drive".
+    backing_trip = api.post("/driver-trips", headers=other_driver_headers, json={
+        "pickup_location_id": chico["id"], "destination_location_id": tahoe["id"],
+        "target_date": today, "flexibility": "afternoon", "seats_available": 1, "tags": [],
+        "for_connection": True,
+    }).json()
+    trips = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert {t["id"] for t in trips} == {real_trip["id"]}
+    assert backing_trip["id"] not in {t["id"] for t in trips}
+
+    # Still the owner's, and still reachable through the connection.
+    mine = api.get("/me/ride-requests", headers=rider_headers).json()
+    assert next(r for r in mine if r["id"] == backing_request["id"])["for_connection"] is True
+    conns = api.get("/me/connections", headers=rider_headers).json()
+    assert conns[0]["ride_request"]["id"] == backing_request["id"]
+
+
+def test_migration_backfills_connection_backing_listings_created_before_the_flag() -> None:
+    api = client()
+    rider, rider_headers, driver, _, real_request, real_trip = make_request_and_trip(api)
+    backing = api.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": real_request["pickup_location_id"],
+        "destination_location_id": real_request["destination_location_id"],
+        "target_date": date.today().isoformat(), "flexibility": "morning", "passenger_count": 1, "tags": [],
+    }).json()
+    assert api.post("/connections", headers=rider_headers, json={
+        "ride_request_id": backing["id"], "driver_trip_id": real_trip["id"],
+    }).status_code == 200
+
+    # Simulate a database from before the flag existed, then migrate.
+    conn = psycopg2.connect(TEST_DATABASE_URL)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE ride_requests DROP COLUMN for_connection")
+        cur.execute("ALTER TABLE driver_trips DROP COLUMN for_connection")
+    run_migrations(TEST_DATABASE_URL)
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, for_connection FROM ride_requests")
+        flags = dict(cur.fetchall())
+        cur.execute("SELECT for_connection FROM driver_trips WHERE id = %s", (real_trip["id"],))
+        trip_flag = cur.fetchone()[0]
+    conn.close()
+
+    assert flags[backing["id"]] is True          # the initiator's backing request
+    assert flags[real_request["id"]] is False    # a real post, never connected by its owner
+    assert trip_flag is False                    # the driver's real post (not the initiator)
 
 
 def test_search_excludes_the_searching_users_own_listings() -> None:

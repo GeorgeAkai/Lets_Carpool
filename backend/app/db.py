@@ -145,6 +145,16 @@ def run_migrations(database_url: str) -> None:
         )
     """)
     cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS notes TEXT")
+    # True for the request the app creates on a rider's behalf when they tap
+    # "Request to join" on a driver's post — it only exists to back that
+    # connection, so it's kept out of Discover (see search_ride_requests).
+    # Checked before adding so the one-time backfill below only runs once.
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ride_requests' AND column_name = 'for_connection'
+    """)
+    backfill_for_connection = cur.fetchone() is None
+    cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS for_connection BOOLEAN NOT NULL DEFAULT FALSE")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS driver_trips (
@@ -164,6 +174,9 @@ def run_migrations(database_url: str) -> None:
         )
     """)
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS notes TEXT")
+    # Same as ride_requests.for_connection, for the trip created when a driver
+    # taps "Offer to drive" on a rider's request.
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS for_connection BOOLEAN NOT NULL DEFAULT FALSE")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS connections (
@@ -290,6 +303,23 @@ def run_migrations(database_url: str) -> None:
             created_at TIMESTAMPTZ NOT NULL
         )
     """)
+
+    # One-time backfill when for_connection is first added: flag listings the
+    # app created to back connections before the flag existed. The app always
+    # created a fresh listing on the initiator's side when connecting, so the
+    # initiator's own side of every existing connection is one of these. Runs
+    # only once so it can never hide a real post connected later via the API.
+    if backfill_for_connection:
+        cur.execute("""
+            UPDATE ride_requests rr SET for_connection = TRUE
+            FROM connections c
+            WHERE c.ride_request_id = rr.id AND c.initiator_user_id = rr.rider_id
+        """)
+        cur.execute("""
+            UPDATE driver_trips dt SET for_connection = TRUE
+            FROM connections c
+            WHERE c.driver_trip_id = dt.id AND c.initiator_user_id = dt.driver_id
+        """)
 
     cur.close()
     conn.close()

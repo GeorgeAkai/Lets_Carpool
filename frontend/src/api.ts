@@ -45,6 +45,7 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
+  for_connection?: boolean;
 };
 
 export type ApiRideRequest = {
@@ -63,6 +64,7 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
+  for_connection?: boolean;
 };
 
 export type ApiConnection = {
@@ -332,6 +334,9 @@ export function createDriverTrip(data: {
   luggage_capacity?: string;
   car_type?: string;
   notes?: string;
+  // True when created only to back an "Offer to drive" connection — the
+  // backend keeps these out of Discover.
+  for_connection?: boolean;
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
@@ -365,6 +370,9 @@ export function createRideRequest(data: {
   luggage_size?: string;
   preferred_car_type?: string;
   notes?: string;
+  // True when created only to back a "Request to join" connection — the
+  // backend keeps these out of Discover.
+  for_connection?: boolean;
 }): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", "/ride-requests", data);
 }

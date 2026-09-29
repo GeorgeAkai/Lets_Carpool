@@ -2599,9 +2599,11 @@ export function Home() {
   const loadMyListings = useCallback(async () => {
     try {
       const [trips, requests] = await Promise.all([api.getMyDriverTrips(), api.getMyRideRequests()])
+      // Listings created only to back a connection aren't posts of yours —
+      // they're represented by the connection in the Inbox instead.
       const combined: MyListing[] = [
-        ...trips.map(tripToMyListing),
-        ...requests.map(requestToMyListing),
+        ...trips.filter(t => !t.for_connection).map(tripToMyListing),
+        ...requests.filter(r => !r.for_connection).map(requestToMyListing),
       ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       setMyListings(combined)
     } catch { }
@@ -2686,11 +2688,11 @@ export function Home() {
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
+        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [], for_connection: true })
         conn = await api.createConnection(rr.id, listing.apiId)
       } else {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
+        const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [], for_connection: true })
         conn = await api.createConnection(listing.apiId, trip.id)
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
