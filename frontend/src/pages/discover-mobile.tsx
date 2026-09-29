@@ -4,7 +4,7 @@ import {
   Pencil, Map as MapIcon, Plus, Check,
 } from 'lucide-react'
 import {
-  Avatar, FLEX_LABEL, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
+  Avatar, FLEX_LABEL, FLEX_DOT, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
 } from './home'
 import type { Listing, RideTag, CarType, LuggageSize } from './home'
 
@@ -14,14 +14,14 @@ import type { Listing, RideTag, CarType, LuggageSize } from './home'
 
 export function MobileSearchBar({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   return (
-    <div className="flex items-center gap-2.5 rounded-2xl bg-card border border-border px-4 py-3.5 shadow-sm focus-within:ring-2 focus-within:ring-ring/25 focus-within:border-primary/30 transition-colors">
-      <Search className="size-5 shrink-0 text-muted-foreground" />
+    <div className="flex items-center gap-2.5 rounded-xl bg-card border border-border px-4 py-3 focus-within:ring-3 focus-within:ring-primary/15 focus-within:border-primary transition-colors">
+      <Search className="size-4 shrink-0 text-muted-foreground" />
       <input
         type="text"
         value={value}
         onChange={e => onChange(e.target.value)}
         placeholder="Where to? (e.g. San Francisco, Airport)"
-        className="flex-1 bg-transparent text-base text-foreground placeholder:text-muted-foreground focus:outline-none"
+        className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
       />
     </div>
   )
@@ -39,7 +39,7 @@ export function MobileFilterBar({
     <div className="flex items-center gap-2 overflow-x-auto pb-1 -mx-4 px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       <button
         onClick={onOpenFilters}
-        className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-full text-sm font-medium bg-muted text-muted-foreground hover:text-foreground transition-colors"
+        className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-semibold bg-card border border-border text-muted-foreground hover:text-foreground transition-colors"
       >
         <SlidersHorizontal className="size-3.5" /> Filters
         {activeCount > 0 && (
@@ -48,7 +48,7 @@ export function MobileFilterBar({
       </button>
       <button
         onClick={() => onQuickDate(quickDate === 'today' ? 'any' : 'today')}
-        className={`shrink-0 px-3.5 py-2 rounded-full text-sm font-medium transition-colors ${quickDate === 'today' ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}
+        className={`shrink-0 px-3.5 py-2 rounded-full text-xs font-semibold border transition-colors ${quickDate === 'today' ? 'bg-primary text-primary-foreground border-primary' : 'bg-card border-border text-muted-foreground hover:text-foreground'}`}
       >
         Date: {quickDate === 'today' ? 'Today' : 'Any'}
       </button>
@@ -56,7 +56,7 @@ export function MobileFilterBar({
         aria-label="Seats needed"
         value={seatsNeeded ?? ''}
         onChange={e => onSeatsNeeded(e.target.value ? Number(e.target.value) : null)}
-        className={`shrink-0 appearance-none px-3.5 py-2 rounded-full text-sm font-medium transition-colors cursor-pointer border-none focus:outline-none ${seatsNeeded ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}
+        className={`shrink-0 appearance-none px-3.5 py-2 rounded-full text-xs font-semibold border transition-colors cursor-pointer focus:outline-none ${seatsNeeded ? 'bg-primary text-primary-foreground border-primary' : 'bg-card border-border text-muted-foreground'}`}
       >
         <option value="">Seats needed</option>
         {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}+ seat{n > 1 ? 's' : ''}</option>)}
@@ -96,10 +96,10 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Showing</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Showing</p>
           <div className="flex flex-wrap gap-2">
             {(['all', 'driver', 'rider'] as const).map(t => (
-              <button key={t} onClick={() => setFilterType(t)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterType === t ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={t} onClick={() => setFilterType(t)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterType === t ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
               </button>
             ))}
@@ -107,10 +107,10 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Category</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Category</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-secondary text-secondary-foreground ring-1 ring-primary' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`text-xs font-medium px-3 py-1.5 rounded-full border transition-colors ${filterTag === tag ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}
@@ -118,10 +118,10 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Vehicle size</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Vehicle size</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
-              <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
+              <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
               </button>
             ))}
@@ -129,17 +129,17 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Luggage I'm bringing</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Luggage I'm bringing</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
-              <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
+              <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
               </button>
             ))}
           </div>
         </div>
 
-        <button onClick={onClose} className="w-full py-3 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+        <button onClick={onClose} className="w-full py-3 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
           Show results
         </button>
       </div>
@@ -150,7 +150,7 @@ export function FilterSheet({
 export function SectionHeader({ label, count, noun }: { label: string; count: number; noun: string }) {
   return (
     <div className="flex items-baseline justify-between px-1">
-      <h2 className="text-lg font-semibold text-foreground">{label}</h2>
+      <h2 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">{label}</h2>
       <span className="text-xs text-muted-foreground">{count} {noun} nearby</span>
     </div>
   )
@@ -168,10 +168,12 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
     <div className="bg-card rounded-2xl border border-border p-4 flex flex-col gap-3">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
           <div className="min-w-0">
             <p className="text-sm font-semibold text-foreground truncate">{listing.user.name}</p>
-            <p className="text-xs text-muted-foreground">{FLEX_LABEL[listing.flexibility]}</p>
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className={`size-1.5 rounded-full ${FLEX_DOT[listing.flexibility]}`} />{FLEX_LABEL[listing.flexibility]} · {listing.date}
+            </p>
           </div>
         </div>
         {isOwn ? (
@@ -179,8 +181,8 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
             Your Listing <Pencil className="size-3" />
           </button>
         ) : (
-          <span className={`shrink-0 text-xs font-medium px-2.5 py-1 rounded-full ${isDriver ? 'bg-primary/10 text-primary' : 'bg-accent/15 text-amber-700'}`}>
-            {isDriver ? 'Offering' : 'Needs ride'}
+          <span className={`shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full ${isDriver ? 'bg-secondary text-secondary-foreground' : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'}`}>
+            {isDriver ? `${freeSeats} seat${freeSeats !== 1 ? 's' : ''} left` : 'Needs ride'}
           </span>
         )}
       </div>
@@ -193,9 +195,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
       </div>
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        {isDriver ? (
-          <span className="flex items-center gap-1"><Users className="size-3" />{freeSeats} seat{freeSeats !== 1 ? 's' : ''} left</span>
-        ) : (
+        {!isDriver && (
           <span className="flex items-center gap-1"><Users className="size-3" />{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
         )}
         {isDriver && listing.carType && (
@@ -210,7 +210,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
       </div>
 
       {listing.notes && (
-        <p className="text-sm text-muted-foreground bg-muted rounded-xl px-3 py-2 whitespace-pre-wrap">{listing.notes}</p>
+        <p className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-3">“{listing.notes}”</p>
       )}
 
       {!isOwn && (
@@ -221,7 +221,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
         ) : (
           <button
             onClick={() => onConnect(listing)}
-            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
+            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all"
           >
             {isDriver ? 'Request to join' : 'Offer a ride'}
           </button>
