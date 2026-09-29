@@ -4,10 +4,10 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "./App";
 import { login, BASE } from "./api";
-import { setMockNeonSession } from "./test-support/neonAuthMock";
-import { fetchNeonJWT } from "./lib/auth";
+import { setMockAuthUser } from "./test-support/authMock";
+import { getAccessToken } from "./lib/auth";
 
-// Simulates a user who already has a live Neon session — required for NeonAuthSync
+// Simulates a user who already has a live Supabase session — required for AuthSync
 // to not treat the app as signed-out and clear the pre-seeded backend token below.
 // Also pre-seeds the mode-choice gate's sessionStorage flag as already-answered
 // (Passenger), so tests that aren't specifically about the gate itself land
@@ -16,7 +16,7 @@ import { fetchNeonJWT } from "./lib/auth";
 // gate first.
 function signInWithExistingToken() {
   localStorage.setItem("carpool_token", LOGIN_RESPONSE.access_token);
-  setMockNeonSession({ user: { id: "usr_test", email: ME_RESPONSE.email, name: ME_RESPONSE.profile.display_name } });
+  setMockAuthUser({ id: "usr_test", email: ME_RESPONSE.email });
   sessionStorage.setItem("carpool_mode", "rider");
 }
 
@@ -93,7 +93,7 @@ describe("API configuration", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await login("mock.neon.jwt");
+    await login("mock.supabase.jwt");
 
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.any(Object));
   });
@@ -106,7 +106,7 @@ describe("Auth gate", () => {
     // mock into every later test if it ever fails before reaching its own
     // cleanup line — vi.restoreAllMocks() doesn't reset plain vi.fn() mocks
     // created inside vi.mock(), only ones made with vi.spyOn().
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   });
 
   afterEach(() => {
@@ -116,7 +116,7 @@ describe("Auth gate", () => {
   it("shows sign-in screen when no token is stored", () => {
     mockFetch({});
     render(<MemoryRouter><App /></MemoryRouter>);
-    expect(screen.getByRole("button", { name: /sign in \/ sign up/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^sign in$/i })).toBeTruthy();
   });
 
   it("calls POST /auth/login and stores token on sign-in", async () => {
@@ -129,16 +129,42 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/enter your password/i), "correct-horse");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() =>
       expect(localStorage.getItem("carpool_token")).toBe(LOGIN_RESPONSE.access_token)
     );
   });
 
-  it("shows main app after successful sign-in", async () => {
+  it("doesn't reuse a stored backend token that belongs to a different account", async () => {
+    // Regression test: two accounts used in the same browser shared one
+    // carpool_token, so the newly signed-in account silently acted as the
+    // previous one (e.g. its own posts hidden from its own Discover feed).
+    localStorage.setItem("carpool_token", "stale.token.for-someone-else");
+    setMockAuthUser({ id: "usr_test", email: ME_RESPONSE.email });
+    sessionStorage.setItem("carpool_mode", "rider");
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      const path = String(url).replace(BASE, "").split("?")[0];
+      if (method === "GET" && path === "/me") {
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+        const body = auth.includes("stale.token") ? { ...ME_RESPONSE, email: "someone.else@example.com" } : ME_RESPONSE;
+        return { ok: true, status: 200, json: async () => body };
+      }
+      if (method === "POST" && path === "/auth/login") return { ok: true, status: 200, json: async () => LOGIN_RESPONSE };
+      return { ok: true, status: 200, json: async () => [] };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<MemoryRouter><App /></MemoryRouter>);
+
+    await waitFor(() => expect(localStorage.getItem("carpool_token")).toBe(LOGIN_RESPONSE.access_token));
+    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.objectContaining({ method: "POST" }));
+  });
+
+  it("shows the mode choice right after sign-in, then the main app", async () => {
     const user = userEvent.setup();
     mockFetch({
       "POST /auth/login": LOGIN_RESPONSE,
@@ -148,17 +174,21 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/enter your password/i), "correct-horse");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
+    // A fresh session has to answer the mode gate first — even though Home
+    // briefly mounted (and redirected) before sign-in.
+    await waitFor(() => screen.getByText(/how are you riding today/i));
+    await user.click(screen.getByRole("button", { name: /i need a ride/i }));
     await waitFor(() => screen.getByText(/find your ride/i));
   });
 
-  it("shows a retryable error instead of hanging forever when the Neon Auth token can't be fetched", async () => {
-    // Regression test: fetchNeonJWT() rejecting or resolving null used to
+  it("shows a retryable error instead of hanging forever when the Supabase access token can't be fetched", async () => {
+    // Regression test: getAccessToken() rejecting or resolving null used to
     // leave the app stuck on "Loading…" forever with no way forward.
-    vi.mocked(fetchNeonJWT).mockRejectedValue(new Error("network down"));
+    vi.mocked(getAccessToken).mockRejectedValue(new Error("network down"));
     mockFetch({});
     signInWithExistingToken();
 
@@ -171,7 +201,7 @@ describe("Auth gate", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /sign out/i })).toBeTruthy();
 
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   }, 10000);
 });
 

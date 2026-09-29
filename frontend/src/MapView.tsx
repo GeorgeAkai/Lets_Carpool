@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import * as maplibregl from "maplibre-gl"
 import "maplibre-gl/dist/maplibre-gl.css"
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url"
-import { useTheme } from "@neondatabase/auth-ui"
+import { useTheme } from "./lib/theme"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
 import {

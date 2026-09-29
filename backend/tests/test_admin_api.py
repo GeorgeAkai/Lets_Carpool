@@ -132,7 +132,7 @@ def test_audit_log_records_key_events() -> None:
     c = client()
     _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
     auth(c, "newuser@example.com", "New User")
-    c.post("/auth/login", json={"neon_token": "not-a-real-token"})
+    c.post("/auth/login", json={"supabase_token": "not-a-real-token"})
 
     logs = c.get("/admin/audit-logs", headers=admin_headers).json()
     event_types = {l["event_type"] for l in logs}

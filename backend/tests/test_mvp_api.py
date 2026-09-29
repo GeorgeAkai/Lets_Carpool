@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jwt as pyjwt
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
 from backend.app.domain import Store
@@ -19,38 +19,38 @@ TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql://carpool:carpool@localhost:5434/carpool"
 )
 
-# ─── Fake Neon Auth server ──────────────────────────────────────────────────────
-# /auth/login now cryptographically verifies the Neon Auth session JWT against a
-# JWKS endpoint (issue 24) instead of trusting a client-supplied email. To test
-# that for real without hitting the actual Neon Auth service, this spins up a
-# tiny local JWKS server and signs test tokens with a real Ed25519 keypair —
-# exercising the exact same verification code path production traffic will.
+# ─── Fake Supabase Auth ─────────────────────────────────────────────────────────
+# /auth/login cryptographically verifies the Supabase access token against the
+# project's JWKS endpoint instead of trusting a client-supplied email. To test
+# that for real without a Supabase project, this spins up a tiny local server
+# publishing the JWKS at Supabase's path and signs test tokens with a real
+# ES256 keypair — the same verification code path production traffic takes.
 
-_NEON_AUTH_PRIVATE_KEY = Ed25519PrivateKey.generate()
-_NEON_AUTH_KID = "test-key-1"
+_SUPABASE_PRIVATE_KEY = ec.generate_private_key(ec.SECP256R1())
+_SUPABASE_KID = "test-key-1"
+TEST_SUPABASE_JWT_SECRET = "legacy-hs256-secret-for-tests-only-0123456789"
 
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-_NEON_AUTH_JWKS_BODY = json.dumps({
+_pub = _SUPABASE_PRIVATE_KEY.public_key().public_numbers()
+_SUPABASE_JWKS_BODY = json.dumps({
     "keys": [{
-        "kty": "OKP", "crv": "Ed25519", "kid": _NEON_AUTH_KID, "use": "sig", "alg": "EdDSA",
-        "x": _b64url(_NEON_AUTH_PRIVATE_KEY.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw,
-        )),
+        "kty": "EC", "crv": "P-256", "kid": _SUPABASE_KID, "use": "sig", "alg": "ES256",
+        "x": _b64url(_pub.x.to_bytes(32, "big")), "y": _b64url(_pub.y.to_bytes(32, "big")),
     }],
 }).encode()
 
 
 class _JWKSHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path == "/.well-known/jwks.json":
+        if self.path == "/auth/v1/.well-known/jwks.json":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(_NEON_AUTH_JWKS_BODY)
+            self.wfile.write(_SUPABASE_JWKS_BODY)
         else:
             self.send_response(404)
             self.end_headers()
@@ -61,23 +61,38 @@ class _JWKSHandler(BaseHTTPRequestHandler):
 
 _jwks_server = ThreadingHTTPServer(("127.0.0.1", 0), _JWKSHandler)
 threading.Thread(target=_jwks_server.serve_forever, daemon=True).start()
-TEST_NEON_AUTH_URL = f"http://127.0.0.1:{_jwks_server.server_port}"
+TEST_SUPABASE_URL = f"http://127.0.0.1:{_jwks_server.server_port}"
+TEST_SUPABASE_ISSUER = f"{TEST_SUPABASE_URL}/auth/v1"
 
 
-def sign_neon_token(*, email: str, name: str, sub: str | None = None, expired: bool = False) -> str:
-    now = datetime.now(UTC)
-    private_pem = _NEON_AUTH_PRIVATE_KEY.private_bytes(
+def _private_pem() -> bytes:
+    return _SUPABASE_PRIVATE_KEY.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     )
-    payload = {
-        "sub": sub or f"neon_{email}",
-        "email": email,
-        "name": name,
-        "iss": TEST_NEON_AUTH_URL,
+
+
+def supabase_claims(*, email: str | None, name: str, sub: str | None = None, expired: bool = False,
+                    iss: str = TEST_SUPABASE_ISSUER, aud: str = "authenticated") -> dict:
+    now = datetime.now(UTC)
+    claims = {
+        "sub": sub or f"sb_{email}",
+        "user_metadata": {"full_name": name},
+        "role": "authenticated",
+        "iss": iss,
+        "aud": aud,
         "iat": now,
-        "exp": now + (timedelta(minutes=-5) if expired else timedelta(hours=24)),
+        "exp": now + (timedelta(minutes=-5) if expired else timedelta(hours=1)),
     }
-    return pyjwt.encode(payload, private_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID})
+    if email is not None:
+        claims["email"] = email
+    return claims
+
+
+def sign_supabase_token(*, email: str | None, name: str, **kwargs) -> str:
+    return pyjwt.encode(
+        supabase_claims(email=email, name=name, **kwargs), _private_pem(),
+        algorithm="ES256", headers={"kid": _SUPABASE_KID},
+    )
 
 
 TEST_CRON_SECRET = "test-cron-secret"
@@ -86,14 +101,15 @@ CRON_HEADERS = {"Authorization": f"Bearer {TEST_CRON_SECRET}"}
 
 def client() -> TestClient:
     settings = Settings(
-        database_url=TEST_DATABASE_URL, neon_auth_url=TEST_NEON_AUTH_URL, cron_secret=TEST_CRON_SECRET,
+        database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL,
+        supabase_jwt_secret=TEST_SUPABASE_JWT_SECRET, cron_secret=TEST_CRON_SECRET,
     )
     return TestClient(create_app(store=Store(TEST_DATABASE_URL), settings=settings))
 
 
 def auth(client: TestClient, email: str, name: str) -> tuple[dict, dict[str, str]]:
-    token = sign_neon_token(email=email, name=name)
-    response = client.post("/auth/login", json={"neon_token": token})
+    token = sign_supabase_token(email=email, name=name)
+    response = client.post("/auth/login", json={"supabase_token": token})
     assert response.status_code == 200
     body = response.json()
     token = body["access_token"]
@@ -146,12 +162,12 @@ def make_request_and_trip(
     return rider, rider_headers, driver, driver_headers, ride_request, driver_trip
 
 
-def test_healthcheck_reports_neon_backed_database() -> None:
+def test_healthcheck_reports_postgres_backed_database() -> None:
     response = client().get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["database"] == "neon"
+    assert response.json()["database"] == "postgres"
 
 
 def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
@@ -169,45 +185,85 @@ def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
     assert invalid.status_code == 401
 
 
-def test_login_rejects_a_token_not_signed_by_the_neon_auth_key() -> None:
+def test_login_rejects_a_token_not_signed_by_the_supabase_key() -> None:
     api = client()
-    forged_key = Ed25519PrivateKey.generate()
-    now = datetime.now(UTC)
+    forged_key = ec.generate_private_key(ec.SECP256R1())
     forged_pem = forged_key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     )
     forged_token = pyjwt.encode(
-        {"sub": "neon_attacker", "email": "victim@berkeley.edu", "name": "Attacker",
-         "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
-        forged_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
+        supabase_claims(email="victim@berkeley.edu", name="Attacker", sub="sb_attacker"),
+        forged_pem, algorithm="ES256", headers={"kid": _SUPABASE_KID},
     )
 
-    response = api.post("/auth/login", json={"neon_token": forged_token})
+    response = api.post("/auth/login", json={"supabase_token": forged_token})
 
     assert response.status_code == 401
 
 
-def test_login_rejects_an_expired_neon_auth_token() -> None:
+def test_login_rejects_an_expired_supabase_token() -> None:
     api = client()
-    expired_token = sign_neon_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
+    expired_token = sign_supabase_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
 
-    response = api.post("/auth/login", json={"neon_token": expired_token})
+    response = api.post("/auth/login", json={"supabase_token": expired_token})
+
+    assert response.status_code == 401
+
+
+def test_login_rejects_a_token_from_another_supabase_project() -> None:
+    api = client()
+    wrong_issuer = sign_supabase_token(
+        email="ada@berkeley.edu", name="Ada", iss="https://someone-else.supabase.co/auth/v1",
+    )
+
+    response = api.post("/auth/login", json={"supabase_token": wrong_issuer})
+
+    assert response.status_code == 401
+
+
+def test_login_rejects_a_non_user_token_audience() -> None:
+    api = client()
+    service_token = sign_supabase_token(email="ada@berkeley.edu", name="Ada", aud="service_role")
+
+    response = api.post("/auth/login", json={"supabase_token": service_token})
 
     assert response.status_code == 401
 
 
 def test_login_rejects_a_token_with_no_email_claim() -> None:
     api = client()
-    now = datetime.now(UTC)
-    private_pem = _NEON_AUTH_PRIVATE_KEY.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    no_email_token = sign_supabase_token(email=None, name="No Email", sub="sb_no_email")
+
+    response = api.post("/auth/login", json={"supabase_token": no_email_token})
+
+    assert response.status_code == 401
+
+
+def test_login_accepts_legacy_hs256_tokens_signed_with_the_project_secret() -> None:
+    api = client()
+    legacy = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace Hopper"), TEST_SUPABASE_JWT_SECRET, algorithm="HS256",
     )
-    no_email_token = pyjwt.encode(
-        {"sub": "neon_no_email", "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
-        private_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
+    forged = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace Hopper"), "not-the-project-secret-0123456789", algorithm="HS256",
     )
 
-    response = api.post("/auth/login", json={"neon_token": no_email_token})
+    ok = api.post("/auth/login", json={"supabase_token": legacy})
+    bad = api.post("/auth/login", json={"supabase_token": forged})
+
+    assert ok.status_code == 200
+    assert ok.json()["user"]["profile"]["display_name"] == "Grace Hopper"
+    assert bad.status_code == 401
+
+
+def test_login_rejects_hs256_tokens_when_no_legacy_secret_is_configured() -> None:
+    settings = Settings(database_url=TEST_DATABASE_URL, supabase_url=TEST_SUPABASE_URL, cron_secret=TEST_CRON_SECRET)
+    api = TestClient(create_app(store=Store(TEST_DATABASE_URL), settings=settings))
+    token = pyjwt.encode(
+        supabase_claims(email="grace@example.com", name="Grace"), "any-secret-at-all-0123456789abcdef", algorithm="HS256",
+    )
+
+    response = api.post("/auth/login", json={"supabase_token": token})
 
     assert response.status_code == 401
 
@@ -215,7 +271,7 @@ def test_login_rejects_a_token_with_no_email_claim() -> None:
 def test_login_rejects_garbage_input() -> None:
     api = client()
 
-    response = api.post("/auth/login", json={"neon_token": "not.a.jwt"})
+    response = api.post("/auth/login", json={"supabase_token": "not.a.jwt"})
 
     assert response.status_code == 401
 

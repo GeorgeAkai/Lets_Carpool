@@ -1,5 +1,5 @@
 import React, {
-  useState, useMemo, useEffect, useCallback, useRef, useContext, type CSSProperties,
+  useState, useMemo, useEffect, useCallback, useRef, type CSSProperties,
   useId,
 } from 'react'
 import {
@@ -10,14 +10,13 @@ import {
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
-import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
-import { useTheme } from '@neondatabase/auth-ui'
+import { useTheme } from '../lib/theme'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
-import { authClient, fetchNeonJWT } from '../lib/auth'
+import { getAccessToken, signOut, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
@@ -2132,47 +2131,47 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   )
 }
 
-// ─── Neon ↔ Backend session sync ─────────────────────────────────────────────
+// ─── Supabase ↔ Backend session sync ──────────────────────────────────────────
 
 const AUTH_TOKEN_RETRY_LIMIT = 3
 
-function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
-  onAuthenticated: (neonToken: string) => Promise<void>
+function AuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
+  onAuthenticated: (accessToken: string, email: string) => Promise<void>
   onUnauthenticated: () => void
   onAuthError: (message: string) => void
 }) {
-  const ctx = useContext(AuthUIContext)
-  const { data: session, isPending } = ctx.hooks.useSession()
+  const { user, isPending } = useAuthSession()
   const lastSyncedId = useRef<string | null | undefined>(undefined)
 
   useEffect(() => {
     if (isPending) return
-    if (!session?.user) {
+    if (!user) {
       if (lastSyncedId.current !== null) {
         lastSyncedId.current = null
         onUnauthenticated()
       }
       return
     }
-    const uid = session.user.id
+    const uid = user.id
     if (lastSyncedId.current === uid) return
 
     // The backend verifies this token's signature itself — it never trusts a
     // client-supplied email/name (that would let anyone authenticate as anyone).
-    // fetchNeonJWT can reject or resolve null (e.g. the Neon Auth server is
-    // briefly unreachable) — retry a few times with backoff, and surface an
-    // error instead of hanging on "Loading…" forever if it never recovers.
+    // getAccessToken or the backend exchange can fail (e.g. a brief network
+    // blip) — retry a few times with backoff, and surface an error instead of
+    // hanging on "Loading…" forever if it never recovers.
     let cancelled = false
 
     const attempt = async (attemptNumber: number): Promise<void> => {
       try {
-        const token = await fetchNeonJWT()
+        const token = await getAccessToken()
         if (cancelled) return
-        if (!token) throw new Error('Neon Auth returned no token')
+        if (!token) throw new Error('Supabase returned no access token')
         lastSyncedId.current = uid
-        await onAuthenticated(token)
+        await onAuthenticated(token, user.email)
       } catch {
         if (cancelled) return
+        lastSyncedId.current = undefined
         if (attemptNumber < AUTH_TOKEN_RETRY_LIMIT) {
           setTimeout(() => { if (!cancelled) attempt(attemptNumber + 1) }, 1000 * attemptNumber)
         } else {
@@ -2183,7 +2182,7 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
     attempt(1)
 
     return () => { cancelled = true }
-  }, [session?.user?.id, isPending, onAuthenticated, onUnauthenticated, onAuthError])
+  }, [user?.id, isPending, onAuthenticated, onUnauthenticated, onAuthError]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return null
 }
@@ -2374,11 +2373,8 @@ export function Home() {
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
-  // Driven by next-themes (via NeonAuthUIProvider in App.tsx), not a separate
-  // mechanism of our own — it already owns the `class` on <html>, persists to
-  // localStorage, and is active on every route (Home never having mounted was
-  // exactly why the old carpool_dark-based toggle didn't survive across pages:
-  // NeonAuthUIProvider wraps every route and would silently overwrite it).
+  // Owned by ThemeProvider (lib/theme.tsx, wrapping every route in App.tsx) so
+  // the choice applies on the sign-in screens too and survives navigation.
   const { resolvedTheme, setTheme } = useTheme()
   const darkMode = resolvedTheme === 'dark'
 
@@ -2398,7 +2394,6 @@ export function Home() {
 
   // ── Passenger/Driver mode ── persists per session; switches primary actions/views
   const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
-  useEffect(() => { sessionStorage.setItem('carpool_mode', mode) }, [mode])
 
   // Gate Discover behind an explicit one-time choice instead of defaulting
   // silently to Passenger — sessionStorage having no value yet means this is
@@ -2406,6 +2401,11 @@ export function Home() {
   // the rest of the session; switching later is a deliberate action in
   // Profile, not this gate reappearing.
   const [modeGateOpen, setModeGateOpen] = useState(() => sessionStorage.getItem('carpool_mode') === null)
+  // Persist only once the gate has actually been answered — persisting the
+  // default 'rider' on first mount (e.g. the brief Home render before a
+  // signed-out visitor is redirected to sign-in) made the gate look already
+  // answered, so it was skipped right after signing in.
+  useEffect(() => { if (!modeGateOpen) sessionStorage.setItem('carpool_mode', mode) }, [mode, modeGateOpen])
 
   // ── Feed ──
   const [searchQuery, setSearchQuery] = useState('')
@@ -2521,15 +2521,21 @@ export function Home() {
     return () => { ws?.close(); wsRef.current = null }
   }, [currentUser])
 
-  // ── Neon session → backend sync ──
-  const handleAuthenticated = useCallback(async (neonToken: string) => {
+  // ── Supabase session → backend sync ──
+  const handleAuthenticated = useCallback(async (accessToken: string, email: string) => {
     try {
+      // Reuse the stored backend token only if it belongs to the account that's
+      // signed in now — a token left over from a different account in this
+      // browser would otherwise silently act as that other user.
       const existingToken = localStorage.getItem('carpool_token')
       if (existingToken) {
-        try { const user = await api.getMe(); setCurrentUser(user); requestLocation(); return }
-        catch { localStorage.removeItem('carpool_token') }
+        try {
+          const user = await api.getMe()
+          if (user.email.toLowerCase() === email.toLowerCase()) { setCurrentUser(user); requestLocation(); return }
+        } catch { /* expired or invalid — fall through to a fresh login */ }
+        localStorage.removeItem('carpool_token')
       }
-      const user = await api.login(neonToken)
+      const user = await api.login(accessToken)
       setCurrentUser(user); requestLocation()
       setAuthError(null)
     } finally { setAuthLoading(false) }
@@ -2539,8 +2545,8 @@ export function Home() {
     api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
   }, [])
 
-  // Fires only after NeonAuthSync exhausts its retries — e.g. the Neon Auth
-  // server is unreachable — so the UI never hangs on "Loading…" forever.
+  // Fires only after AuthSync exhausts its retries — e.g. Supabase or the
+  // backend is unreachable — so the UI never hangs on "Loading…" forever.
   const handleAuthError = useCallback((message: string) => {
     setAuthError(message); setAuthLoading(false)
   }, [])
@@ -2777,7 +2783,7 @@ export function Home() {
   const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
-    authClient.signOut().catch(() => {})
+    signOut().catch(() => {})
     api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null); setOpenChatConnectionId(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
@@ -2816,7 +2822,7 @@ export function Home() {
   if (authLoading) {
     return (
       <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
       </div>
     )
@@ -2824,7 +2830,7 @@ export function Home() {
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
@@ -2836,7 +2842,7 @@ export function Home() {
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
-      <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
       {(() => {

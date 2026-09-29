@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
+from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, Store, User
 
 
@@ -23,21 +23,16 @@ class Settings(BaseSettings):
     # Space-separated list of allowed CORS origins, e.g. "https://myapp.vercel.app"
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
 
-    # Neon Auth server used to cryptographically verify sign-in tokens (must
-    # match the frontend's VITE_NEON_AUTH_URL). Required for /auth/login to work.
-    # Path confirmed against a live Neon Auth server (better-auth's plugin-
-    # specific /jwks route 404s there; the standard OAuth/OIDC well-known
-    # discovery path is what's actually served).
-    neon_auth_url: str | None = None
-    neon_auth_jwks_path: str = "/.well-known/jwks.json"
-    # Issuer/audience aren't set by default — unlike the JWKS path, I couldn't
-    # verify these against a real signed token, and guessing wrong here means
-    # every sign-in fails closed with no way to tell why (same failure mode as
-    # the wrong default JWKS path did). Signature + expiry are still verified
-    # unconditionally either way. Set these once you've confirmed the actual
-    # `iss`/`aud` claims your Neon Auth project issues (decode a real token).
-    neon_auth_issuer: str | None = None
-    neon_auth_audience: str | None = None
+    # Supabase project URL (e.g. https://abcd1234.supabase.co) — the same value
+    # as the frontend's VITE_SUPABASE_URL. Required for /auth/login: access
+    # tokens are verified against this project's published signing keys, and
+    # must carry its issuer and the "authenticated" audience.
+    supabase_url: str | None = None
+    # Only needed for projects still on Supabase's legacy HS256 JWT secret
+    # (Project Settings -> API -> JWT Settings). Projects using asymmetric
+    # signing keys are verified through JWKS and can leave this unset.
+    supabase_jwt_secret: str | None = None
+    supabase_jwt_audience: str = "authenticated"
 
     # Shared secret Vercel Cron sends as `Authorization: Bearer <secret>` when
     # invoking scheduled requests. Required to trigger the /cron/expire sweep
@@ -53,19 +48,17 @@ class Settings(BaseSettings):
         return {e.strip().lower() for e in self.admin_emails.split() if e.strip()}
 
     @property
-    def neon_auth_jwks_url(self) -> str | None:
-        if not self.neon_auth_url:
-            return None
-        return self.neon_auth_url.rstrip("/") + self.neon_auth_jwks_path
+    def supabase_auth_base(self) -> str | None:
+        return self.supabase_url.rstrip("/") + "/auth/v1" if self.supabase_url else None
 
 
 # ─── Request/Response models ──────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    # The raw Neon Auth session JWT (from the frontend's `authClient.getJWTToken()`),
-    # verified server-side against the Neon Auth JWKS endpoint — never a client-
-    # supplied name/email, which would let anyone authenticate as anyone.
-    neon_token: str = Field(..., min_length=1)
+    # The Supabase Auth access token for the signed-in user, verified server-
+    # side (see verify_supabase_token) — never a client-supplied name/email,
+    # which would let anyone authenticate as anyone.
+    supabase_token: str = Field(..., min_length=1)
 
 
 class ProfileUpdate(BaseModel):
@@ -246,7 +239,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "service": app.state.settings.api_name, "database": "neon"}
+        return {"status": "ok", "service": app.state.settings.api_name, "database": "postgres"}
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -254,14 +247,16 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         settings = app.state.settings
         ip = client_ip(request)
-        if not settings.neon_auth_jwks_url:
-            raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
+        auth_base = settings.supabase_auth_base
+        if not auth_base:
+            raise DomainError("Server is not configured with SUPABASE_URL", 500)
         try:
-            claims = verify_neon_auth_token(
-                payload.neon_token,
-                jwks_url=settings.neon_auth_jwks_url,
-                issuer=settings.neon_auth_issuer,
-                audience=settings.neon_auth_audience,
+            claims = verify_supabase_token(
+                payload.supabase_token,
+                jwks_url=auth_base + "/.well-known/jwks.json",
+                jwt_secret=settings.supabase_jwt_secret,
+                issuer=auth_base,
+                audience=settings.supabase_jwt_audience,
             )
         except DomainError as exc:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": str(exc)})
@@ -269,8 +264,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         email = claims.get("email")
         if not isinstance(email, str) or not email:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": "missing email claim"})
-            raise DomainError("Neon Auth token did not include an email claim", 401)
-        name = claims.get("name") or email.split("@")[0]
+            raise DomainError("Sign-in token did not include an email claim", 401)
+        metadata = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
+        name = metadata.get("full_name") or metadata.get("name") or email.split("@")[0]
         user, is_new = app.state.store.authenticate_email(email, str(name))
         if user.status == "suspended":
             app.state.store.log_audit("LOGIN_FAILED", user.id, user.email, ip, {"reason": "account suspended"})

@@ -235,8 +235,9 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(neonToken: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
+// Exchanges a Supabase Auth access token for this API's own session token.
+export async function login(supabaseAccessToken: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { supabase_token: supabaseAccessToken });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }
