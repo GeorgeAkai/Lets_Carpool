@@ -242,8 +242,8 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(neonToken: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
+export async function login(token: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { token });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }

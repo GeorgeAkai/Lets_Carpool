@@ -19,10 +19,10 @@ TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql://carpool:carpool@localhost:5434/carpool"
 )
 
-# ─── Fake Neon Auth server ──────────────────────────────────────────────────────
-# /auth/login now cryptographically verifies the Neon Auth session JWT against a
+# ─── Fake Supabase Auth server ──────────────────────────────────────────────────────
+# /auth/login now cryptographically verifies the Supabase Auth session JWT against a
 # JWKS endpoint (issue 24) instead of trusting a client-supplied email. To test
-# that for real without hitting the actual Neon Auth service, this spins up a
+# that for real without hitting the actual Supabase Auth service, this spins up a
 # tiny local JWKS server and signs test tokens with a real Ed25519 keypair —
 # exercising the exact same verification code path production traffic will.
 
@@ -64,7 +64,7 @@ threading.Thread(target=_jwks_server.serve_forever, daemon=True).start()
 TEST_NEON_AUTH_URL = f"http://127.0.0.1:{_jwks_server.server_port}"
 
 
-def sign_neon_token(*, email: str, name: str, sub: str | None = None, expired: bool = False) -> str:
+def sign_supabase_token(*, email: str, name: str, sub: str | None = None, expired: bool = False) -> str:
     now = datetime.now(UTC)
     private_pem = _NEON_AUTH_PRIVATE_KEY.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
@@ -73,7 +73,7 @@ def sign_neon_token(*, email: str, name: str, sub: str | None = None, expired: b
         "sub": sub or f"neon_{email}",
         "email": email,
         "name": name,
-        "iss": TEST_NEON_AUTH_URL,
+        "iss": TEST_NEON_AUTH_URL, "aud": "authenticated",
         "iat": now,
         "exp": now + (timedelta(minutes=-5) if expired else timedelta(hours=24)),
     }
@@ -86,14 +86,14 @@ CRON_HEADERS = {"Authorization": f"Bearer {TEST_CRON_SECRET}"}
 
 def client() -> TestClient:
     settings = Settings(
-        database_url=TEST_DATABASE_URL, neon_auth_url=TEST_NEON_AUTH_URL, cron_secret=TEST_CRON_SECRET,
+        database_url=TEST_DATABASE_URL, supabase_url=TEST_NEON_AUTH_URL, supabase_jwks_path="/.well-known/jwks.json", cron_secret=TEST_CRON_SECRET,
     )
     return TestClient(create_app(store=Store(TEST_DATABASE_URL), settings=settings))
 
 
 def auth(client: TestClient, email: str, name: str) -> tuple[dict, dict[str, str]]:
-    token = sign_neon_token(email=email, name=name)
-    response = client.post("/auth/login", json={"neon_token": token})
+    token = sign_supabase_token(email=email, name=name)
+    response = client.post("/auth/login", json={"token": token})
     assert response.status_code == 200
     body = response.json()
     token = body["access_token"]
@@ -146,12 +146,12 @@ def make_request_and_trip(
     return rider, rider_headers, driver, driver_headers, ride_request, driver_trip
 
 
-def test_healthcheck_reports_neon_backed_database() -> None:
+def test_healthcheck_reports_postgres_backed_database() -> None:
     response = client().get("/health")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
-    assert response.json()["database"] == "neon"
+    assert response.json()["database"] == "postgres"
 
 
 def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
@@ -169,7 +169,7 @@ def test_email_sign_in_issues_jwt_and_stores_email_domain() -> None:
     assert invalid.status_code == 401
 
 
-def test_login_rejects_a_token_not_signed_by_the_neon_auth_key() -> None:
+def test_login_rejects_a_token_not_signed_by_the_supabase_key() -> None:
     api = client()
     forged_key = Ed25519PrivateKey.generate()
     now = datetime.now(UTC)
@@ -178,20 +178,20 @@ def test_login_rejects_a_token_not_signed_by_the_neon_auth_key() -> None:
     )
     forged_token = pyjwt.encode(
         {"sub": "neon_attacker", "email": "victim@berkeley.edu", "name": "Attacker",
-         "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
+         "iss": TEST_NEON_AUTH_URL, "aud": "authenticated", "iat": now, "exp": now + timedelta(hours=24)},
         forged_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
     )
 
-    response = api.post("/auth/login", json={"neon_token": forged_token})
+    response = api.post("/auth/login", json={"token": forged_token})
 
     assert response.status_code == 401
 
 
-def test_login_rejects_an_expired_neon_auth_token() -> None:
+def test_login_rejects_an_expired_supabase_token() -> None:
     api = client()
-    expired_token = sign_neon_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
+    expired_token = sign_supabase_token(email="ada@berkeley.edu", name="Ada Lovelace", expired=True)
 
-    response = api.post("/auth/login", json={"neon_token": expired_token})
+    response = api.post("/auth/login", json={"token": expired_token})
 
     assert response.status_code == 401
 
@@ -203,11 +203,11 @@ def test_login_rejects_a_token_with_no_email_claim() -> None:
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     )
     no_email_token = pyjwt.encode(
-        {"sub": "neon_no_email", "iss": TEST_NEON_AUTH_URL, "iat": now, "exp": now + timedelta(hours=24)},
+        {"sub": "neon_no_email", "iss": TEST_NEON_AUTH_URL, "aud": "authenticated", "iat": now, "exp": now + timedelta(hours=24)},
         private_pem, algorithm="EdDSA", headers={"kid": _NEON_AUTH_KID},
     )
 
-    response = api.post("/auth/login", json={"neon_token": no_email_token})
+    response = api.post("/auth/login", json={"token": no_email_token})
 
     assert response.status_code == 401
 
@@ -215,7 +215,7 @@ def test_login_rejects_a_token_with_no_email_claim() -> None:
 def test_login_rejects_garbage_input() -> None:
     api = client()
 
-    response = api.post("/auth/login", json={"neon_token": "not.a.jwt"})
+    response = api.post("/auth/login", json={"token": "not.a.jwt"})
 
     assert response.status_code == 401
 
@@ -980,7 +980,7 @@ class FakeRouter:
 
 def corridor_client(router: FakeRouter) -> TestClient:
     settings = Settings(
-        database_url=TEST_DATABASE_URL, neon_auth_url=TEST_NEON_AUTH_URL, cron_secret=TEST_CRON_SECRET,
+        database_url=TEST_DATABASE_URL, supabase_url=TEST_NEON_AUTH_URL, supabase_jwks_path="/.well-known/jwks.json", cron_secret=TEST_CRON_SECRET,
     )
     return TestClient(create_app(store=Store(TEST_DATABASE_URL, router=router), settings=settings))
 

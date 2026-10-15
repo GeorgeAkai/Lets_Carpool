@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
+from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, Store, User
 from backend.app.routing import OSRMClient
 
@@ -30,21 +30,17 @@ class Settings(BaseSettings):
     # to endpoint-radius matching.
     osrm_base_url: str = "http://localhost:5001"
 
-    # Neon Auth server used to cryptographically verify sign-in tokens (must
-    # match the frontend's VITE_NEON_AUTH_URL). Required for /auth/login to work.
-    # Path confirmed against a live Neon Auth server (better-auth's plugin-
-    # specific /jwks route 404s there; the standard OAuth/OIDC well-known
-    # discovery path is what's actually served).
-    neon_auth_url: str | None = None
-    neon_auth_jwks_path: str = "/.well-known/jwks.json"
-    # Issuer/audience aren't set by default — unlike the JWKS path, I couldn't
-    # verify these against a real signed token, and guessing wrong here means
-    # every sign-in fails closed with no way to tell why (same failure mode as
-    # the wrong default JWKS path did). Signature + expiry are still verified
-    # unconditionally either way. Set these once you've confirmed the actual
-    # `iss`/`aud` claims your Neon Auth project issues (decode a real token).
-    neon_auth_issuer: str | None = None
-    neon_auth_audience: str | None = None
+    # Supabase project URL (must match the frontend's VITE_SUPABASE_URL). Access
+    # tokens are verified against its JWKS endpoint. Required for /auth/login.
+    supabase_url: str | None = None
+    supabase_jwks_path: str = "/auth/v1/.well-known/jwks.json"
+    # Legacy projects that still sign with a shared HS256 secret: set this
+    # (Supabase dashboard -> Settings -> API -> JWT Secret) instead of using JWKS.
+    supabase_jwt_secret: str | None = None
+    # Supabase issues aud="authenticated" for signed-in users. Issuer is
+    # `<supabase_url>/auth/v1` and is checked when set.
+    supabase_jwt_issuer: str | None = None
+    supabase_jwt_audience: str | None = "authenticated"
 
     # Shared secret Vercel Cron sends as `Authorization: Bearer <secret>` when
     # invoking scheduled requests. Required to trigger the /cron/expire sweep
@@ -60,19 +56,19 @@ class Settings(BaseSettings):
         return {e.strip().lower() for e in self.admin_emails.split() if e.strip()}
 
     @property
-    def neon_auth_jwks_url(self) -> str | None:
-        if not self.neon_auth_url:
+    def supabase_jwks_url(self) -> str | None:
+        if not self.supabase_url:
             return None
-        return self.neon_auth_url.rstrip("/") + self.neon_auth_jwks_path
+        return self.supabase_url.rstrip("/") + self.supabase_jwks_path
 
 
 # ─── Request/Response models ──────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    # The raw Neon Auth session JWT (from the frontend's `authClient.getJWTToken()`),
-    # verified server-side against the Neon Auth JWKS endpoint — never a client-
+    # The raw Supabase access token (the Supabase access token),
+    # verified server-side against the Supabase JWKS endpoint — never a client-
     # supplied name/email, which would let anyone authenticate as anyone.
-    neon_token: str = Field(..., min_length=1)
+    token: str = Field(..., min_length=1)
 
 
 class ProfileUpdate(BaseModel):
@@ -267,7 +263,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "service": app.state.settings.api_name, "database": "neon"}
+        return {"status": "ok", "service": app.state.settings.api_name, "database": "postgres"}
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -275,14 +271,15 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         settings = app.state.settings
         ip = client_ip(request)
-        if not settings.neon_auth_jwks_url:
-            raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
+        if not settings.supabase_jwks_url and not settings.supabase_jwt_secret:
+            raise DomainError("Server is not configured with SUPABASE_URL", 500)
         try:
-            claims = verify_neon_auth_token(
-                payload.neon_token,
-                jwks_url=settings.neon_auth_jwks_url,
-                issuer=settings.neon_auth_issuer,
-                audience=settings.neon_auth_audience,
+            claims = verify_supabase_token(
+                payload.token,
+                jwks_url=settings.supabase_jwks_url,
+                hs256_secret=settings.supabase_jwt_secret,
+                issuer=settings.supabase_jwt_issuer,
+                audience=settings.supabase_jwt_audience,
             )
         except DomainError as exc:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": str(exc)})
@@ -290,8 +287,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         email = claims.get("email")
         if not isinstance(email, str) or not email:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": "missing email claim"})
-            raise DomainError("Neon Auth token did not include an email claim", 401)
-        name = claims.get("name") or email.split("@")[0]
+            raise DomainError("Token did not include an email claim", 401)
+        meta = claims.get("user_metadata") or {}
+        name = meta.get("name") or meta.get("full_name") or claims.get("name") or email.split("@")[0]
         user, is_new = app.state.store.authenticate_email(email, str(name))
         if user.status == "suspended":
             app.state.store.log_audit("LOGIN_FAILED", user.id, user.email, ip, {"reason": "account suspended"})
