@@ -5,6 +5,14 @@ Working notes from an architecture review, aimed at making this app match or bea
 get matched to a driver going the same way, for the fastest combined time with minimal
 detours.
 
+## Status
+
+- **Phase 1 — done**: server-side OSRM client (`backend/app/routing.py`), stored driver routes, direction-aware corridor search, server-computed `detour_minutes`.
+- **Phase 2 — done**: detour shown on match cards; exact coordinates still withheld pre-connection.
+- **Phase 3 — decided** ([ADR 0001](docs/adr/0001-proposed-matches-on-route-corridor.md)): system proposes the best match, the user requests or skips; the `Connection` state machine is unchanged.
+- **Phase 4 — done**: self-hosted OSRM (`scripts/osrm-prepare.sh`, docker-compose) and a real-time strategy that polls outside localhost (`api.createRealtime`, every 8 s; `VITE_REALTIME_STRATEGY` overrides). Polling has no equivalent for `driver_nearby`; a hosted realtime service (Ably/Pusher) can replace it behind the same interface.
+- **Phase 5 — not started**: ratings (schema-ready, deferred) and deeper driver verification.
+
 ## Current state
 
 - **Frontend**: Vite + React 18 SPA (not React Native, despite the PRD's original plan),

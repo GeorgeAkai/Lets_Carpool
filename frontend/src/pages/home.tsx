@@ -2702,8 +2702,8 @@ export function Home() {
     return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
-  // ── WebSocket ──
-  const wsRef = useRef<WebSocket | null>(null)
+  // ── Real-time (WebSocket locally, polling in production — see api.createRealtime) ──
+  const wsRef = useRef<{ close: () => void } | null>(null)
   const showToastRef = useRef<(msg: string, type: 'success' | 'error') => void>(() => {})
 
   // ── Toast ──
@@ -2718,7 +2718,7 @@ export function Home() {
 
   useEffect(() => {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
-    const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
+    const ws = api.createRealtime(currentUser.id, (msg: WsMessage) => {
       if (msg.type === 'chat_message') {
         const chatIsOpenForThis = openChatConnectionIdRef.current === msg.connection_id
         if (chatIsOpenForThis) {
@@ -2742,7 +2742,7 @@ export function Home() {
       }
     })
     wsRef.current = ws
-    return () => { ws?.close(); wsRef.current = null }
+    return () => { ws.close(); wsRef.current = null }
   }, [currentUser])
 
   // ── Auth session → backend sync ──
