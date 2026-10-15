@@ -28,6 +28,22 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 export type LocationView = { id: string; label: string; exact: boolean; latitude?: number; longitude?: number };
 
+// Public trust signals, attached to every listing and profile.
+export type UserStats = {
+  rating_avg: number | null;
+  rating_count: number;
+  completed_trips: number;
+  id_verified: boolean;
+};
+
+export type TripPricing = {
+  distance_km: number;
+  gas_cost_cents: number;
+  split_between: number;
+  suggested_price_cents: number;
+  price_per_seat_cents: number;
+};
+
 export type ApiDriverTrip = {
   id: string;
   driver_id: string;
@@ -45,6 +61,20 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
+  // Minutes this rider would add to the trip; only set on corridor searches
+  // (search with both pickup and destination coordinates).
+  detour_minutes?: number | null;
+  departure_time?: string | null;        // "HH:MM:SS"
+  estimated_arrival_time?: string | null; // "HH:MM:SS", from the route duration
+  duration_minutes?: number;
+  price_per_seat_cents?: number | null;
+  auto_accept_verified?: boolean;
+  series_id?: string | null;
+  series_trip_ids?: string[];
+  pricing?: TripPricing;
+  driver_stats?: UserStats;
+  // Plate only appears once a connection is accepted.
+  vehicle?: { make: string | null; model: string | null; color: string | null; car_type: string | null; plate?: string | null } | null;
 };
 
 export type ApiRideRequest = {
@@ -63,6 +93,10 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
+  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  detour_minutes?: number | null;
+  departure_time?: string | null;
+  rider_stats?: UserStats;
 };
 
 export type ApiConnection = {
@@ -76,8 +110,10 @@ export type ApiConnection = {
   ride_request: ApiRideRequest;
   driver_trip: ApiDriverTrip;
   completed_confirmed_by?: string[];
-  rider_profile?: ApiProfile | null;
-  driver_profile?: ApiProfile | null;
+  rider_profile?: (ApiProfile & Partial<UserStats>) | null;
+  driver_profile?: (ApiProfile & Partial<UserStats>) | null;
+  my_rating?: number | null;
+  rider_at_pickup_at?: string | null;
 };
 
 export type ApiProfile = {
@@ -88,6 +124,8 @@ export type ApiProfile = {
   photo_verified: boolean;
   interests: string[];
   nationality: string | null;
+  // Own profile only, or the other party's once a ride is accepted.
+  phone?: string | null;
 };
 
 export type ApiVehicle = {
@@ -100,6 +138,7 @@ export type ApiVehicle = {
   has_license: boolean;
   has_insurance: boolean;
   has_good_driving_record: boolean;
+  plate?: string | null;
 } | null;
 
 export type ApiUser = {
@@ -132,6 +171,7 @@ export type SearchQuery = {
   pickup_latitude?: number;
   pickup_longitude?: number;
   pickup_radius_meters?: number;
+  route_buffer_meters?: number;
   target_date?: string;
   tag?: string;
   car_type?: string;
@@ -203,14 +243,11 @@ export type RouteSuggestion = {
 export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
+  | { type: "pickup_updated"; connection_id: string }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
-export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
-  if (!BASE.includes("localhost") && !BASE.includes("127.0.0.1")) {
-    return null;
-  }
-
+function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
   const t = token();
   let ws: WebSocket;
   try {
@@ -233,10 +270,85 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
   return ws;
 }
 
+// ─── Real-time strategy ───────────────────────────────────────────────────────
+// The API runs as Vercel serverless functions, which can't hold WebSockets open,
+// so outside localhost the client polls instead. VITE_REALTIME_STRATEGY
+// ("websocket" | "polling") overrides the default (websocket on localhost,
+// polling everywhere else). Polling hits GET /me/connections and
+// GET /notifications every POLL_INTERVAL_MS (paused while the tab is hidden)
+// and synthesises the same WsMessage events. `driver_nearby` has no polling
+// equivalent. A hosted realtime service (Ably/Pusher) can replace this later
+// behind the same `createRealtime` interface.
+
+export const POLL_INTERVAL_MS = 8000;
+
+export type RealtimeStrategy = "websocket" | "polling";
+
+export function realtimeStrategy(): RealtimeStrategy {
+  const forced = import.meta.env.VITE_REALTIME_STRATEGY;
+  if (forced === "websocket" || forced === "polling") return forced;
+  return BASE.includes("localhost") || BASE.includes("127.0.0.1") ? "websocket" : "polling";
+}
+
+function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void } {
+  const statuses = new Map<string, string>();
+  const seenNotifications = new Set<string>();
+  let primed = false;
+  let stopped = false;
+  let running = false;
+
+  const poll = async () => {
+    if (stopped || running || document.hidden) return;
+    running = true;
+    try {
+      const [connections, notifications] = await Promise.all([getMyConnections(), getNotifications()]);
+      if (stopped) return;
+
+      const events: WsMessage[] = [];
+      for (const c of connections) {
+        const previous = statuses.get(c.id);
+        if (primed && previous === undefined) events.push({ type: "pickup_updated", connection_id: c.id });
+        else if (previous !== undefined && previous !== c.status) events.push({ type: "connection_update", connection_id: c.id, status: c.status });
+        statuses.set(c.id, c.status);
+      }
+
+      const chatConnectionIds = new Set<string>();
+      for (const n of notifications) {
+        if (seenNotifications.has(n.id)) continue;
+        seenNotifications.add(n.id);
+        if (primed && n.type === "chat_message" && n.related_id) chatConnectionIds.add(n.related_id);
+      }
+      for (const connectionId of chatConnectionIds) {
+        const messages = await getMessages(connectionId);
+        const latest = messages[messages.length - 1];
+        if (latest) events.push({ type: "chat_message", connection_id: connectionId, message: latest });
+      }
+
+      primed = true;
+      if (!stopped) events.forEach(onMessage);
+    } catch { /* transient network/auth error — try again next tick */ }
+    finally { running = false; }
+  };
+
+  void poll();
+  const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+  const onVisible = () => { if (!document.hidden) void poll(); };
+  document.addEventListener("visibilitychange", onVisible);
+  return {
+    close: () => { stopped = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); },
+  };
+}
+
+export function createRealtime(userId: string, onMessage: (msg: WsMessage) => void): { close: () => void } {
+  if (realtimeStrategy() === "polling") return createPoller(onMessage);
+  const ws = createWebSocket(userId, onMessage);
+  return { close: () => ws?.close() };
+}
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(neonToken: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
+export async function login(token: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { token });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }
@@ -257,10 +369,13 @@ export function updateProfile(
   bio?: string | null,
   interests?: string[],
   nationality?: string | null,
+  phone?: string | null,
 ): Promise<ApiProfile> {
   return request<ApiProfile>("PATCH", "/me/profile", {
     display_name: displayName, photo_url: photoUrl, bio,
     interests: interests ?? [], nationality: nationality ?? null,
+    // Left out entirely when not editing it, so the server keeps the stored number.
+    ...(phone !== undefined ? { phone } : {}),
   });
 }
 
@@ -277,6 +392,7 @@ export function updateDriverReadiness(data: {
   has_license?: boolean;
   has_insurance?: boolean;
   has_good_driving_record?: boolean;
+  plate?: string | null;
 }): Promise<NonNullable<ApiVehicle>> {
   return request("PUT", "/me/driver-readiness", data);
 }
@@ -331,8 +447,19 @@ export function createDriverTrip(data: {
   luggage_capacity?: string;
   car_type?: string;
   notes?: string;
+  departure_time?: string | null;
+  price_per_seat_cents?: number | null;
+  auto_accept_verified?: boolean;
+  repeat_weekdays?: number[];
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
+}
+
+// "Each rider pays" while the driver is still filling in the form.
+export function previewTripPrice(pickupLocationId: string, destinationLocationId: string, seatsAvailable: number): Promise<TripPricing & { duration_minutes: number }> {
+  return request("POST", "/driver-trips/price-preview", {
+    pickup_location_id: pickupLocationId, destination_location_id: destinationLocationId, seats_available: seatsAvailable,
+  });
 }
 
 export function cancelDriverTrip(tripId: string): Promise<ApiDriverTrip> {
@@ -361,6 +488,7 @@ export function createRideRequest(data: {
   flexibility: string;
   passenger_count: number;
   tags: string[];
+  departure_time?: string | null;
   luggage_size?: string;
   preferred_car_type?: string;
   notes?: string;
@@ -370,6 +498,10 @@ export function createRideRequest(data: {
 
 export function cancelRideRequest(requestId: string): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", `/ride-requests/${requestId}/cancel`);
+}
+
+export function updateRideRequestPickup(requestId: string, pickupLocationId: string): Promise<ApiRideRequest> {
+  return request<ApiRideRequest>("PATCH", `/ride-requests/${requestId}/pickup`, { pickup_location_id: pickupLocationId });
 }
 
 export function getMyRideRequests(): Promise<ApiRideRequest[]> {
@@ -382,6 +514,30 @@ export function createConnection(rideRequestId: string, driverTripId: string): P
   return request<ApiConnection>("POST", "/connections", {
     ride_request_id: rideRequestId,
     driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiProposal = { trip: ApiDriverTrip | null; remaining: number };
+
+export function getRideRequestProposal(rideRequestId: string): Promise<ApiProposal> {
+  return request<ApiProposal>("GET", `/ride-requests/${rideRequestId}/proposal`);
+}
+
+export function skipRideRequestProposal(rideRequestId: string, driverTripId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/ride-requests/${rideRequestId}/proposal/skip`, {
+    driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: number };
+
+export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
+  return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/driver-trips/${driverTripId}/proposal/skip`, {
+    ride_request_id: rideRequestId,
   });
 }
 
@@ -492,7 +648,57 @@ export type ApiPublicProfile = {
   photo_verified: boolean;
   interests: string[];
   nationality: string | null;
+} & Partial<UserStats>;
+
+// ─── Ratings, trip day, saved routes, ride alerts ────────────────────────────
+
+export function rateConnection(connectionId: string, stars: number, comment?: string): Promise<unknown> {
+  return request("POST", `/connections/${connectionId}/rating`, { stars, comment });
+}
+
+export type TripDayStatus = {
+  connection_id: string;
+  pickup: { label: string; latitude: number; longitude: number };
+  departure_time: string | null;
+  driver: { latitude: number; longitude: number; updated_at: string; distance_to_pickup_m: number; eta_minutes: number } | null;
+  rider_at_pickup_at: string | null;
 };
+
+export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {
+  return request("GET", `/connections/${connectionId}/live`);
+}
+
+export function markAtPickup(connectionId: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/at-pickup`);
+}
+
+export type SavedRoute = {
+  id: string;
+  label: string;
+  pickup: LocationView;
+  destination: LocationView;
+  departure_time: string | null;
+  weekdays: number[];
+};
+
+export function getSavedRoutes(): Promise<SavedRoute[]> {
+  return request("GET", "/me/routes");
+}
+
+export function createSavedRoute(data: {
+  label: string; pickup_location_id: string; destination_location_id: string;
+  departure_time?: string | null; weekdays?: number[];
+}): Promise<SavedRoute> {
+  return request("POST", "/me/routes", data);
+}
+
+export function deleteSavedRoute(routeId: string): Promise<unknown> {
+  return request("DELETE", `/me/routes/${routeId}`);
+}
+
+export function createRideAlert(destinationLocationId: string, targetDate: string): Promise<unknown> {
+  return request("POST", "/ride-alerts", { destination_location_id: destinationLocationId, target_date: targetDate });
+}
 
 export function getUserProfile(targetUserId: string): Promise<ApiPublicProfile> {
   return request<ApiPublicProfile>("GET", `/users/${targetUserId}/profile`);
@@ -533,6 +739,10 @@ export function dismissNotification(notificationId: string): Promise<{ status: s
 
 // ─── Admin ────────────────────────────────────────────────────────────────────
 
+export function setUserIdVerified(userId: string, verified: boolean): Promise<{ id: string; id_verified: boolean }> {
+  return request("POST", `/admin/users/${userId}/${verified ? "verify-id" : "unverify-id"}`);
+}
+
 export type ApiAdminStats = {
   total_users: number;
   new_users_7d: number;
@@ -558,6 +768,7 @@ export type ApiAdminUser = {
   is_driver: boolean;
   is_rider: boolean;
   open_report_count: number;
+  id_verified: boolean;
 };
 
 export type ApiAdminReport = {

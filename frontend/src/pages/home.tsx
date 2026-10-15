@@ -1,24 +1,29 @@
 import React, {
-  useState, useMemo, useEffect, useCallback, useRef, useContext, type CSSProperties,
+  useState, useMemo, useEffect, useCallback, useRef, type CSSProperties,
   useId,
 } from 'react'
 import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
   Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, ChevronLeft,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, Navigation,
+  ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive, Home as HomeIcon,
 } from 'lucide-react'
 import { motion } from 'motion/react'
-import { useNavigate } from 'react-router-dom'
-import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
-import { useTheme } from '@neondatabase/auth-ui'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { useTheme } from 'next-themes'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
-import { authClient, fetchNeonJWT } from '../lib/auth'
+import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
+import { formatPlace } from '../lib/places'
+import {
+  HomeScreen, ResultsScreen, RideDetailScreen, TripDayScreen, OfferRideScreen, StarRating, fmtTime,
+  defaultRideSearch, pickNextTrip, type RideSearch,
+} from './ride-flow'
 import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
   ViewToggleFab, OfferRideFab,
@@ -28,6 +33,7 @@ import { AdminView } from './admin'
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
+  | 'results' | 'ride' | 'trip' | 'offer'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -43,20 +49,38 @@ export interface Listing {
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
   notes?: string | null
+  // Minutes this rider would add to the driver's trip; undefined when the
+  // listing isn't on the rider's route corridor (or no route to compare to).
+  detourMinutes?: number | null
 }
 
 export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
-  flexibility: Flexibility; seats?: number; passengers?: number; tags: RideTag[]
+  flexibility: Flexibility; seats?: number; seatsReserved?: number; passengers?: number; tags: RideTag[]
   status: string; createdAt: string; notes?: string | null
+  // Own listings come back with exact coordinates, which "Re-book / Clone"
+  // reuses to pre-fill the post form without re-geocoding.
+  pickupLat?: number; pickupLng?: number; destLat?: number; destLng?: number
+  carType?: CarType; luggage?: LuggageSize
 }
 
-interface Connection {
+// Values the post form can be pre-filled with (from "Re-book / Clone").
+export interface PostPrefill {
+  key: string; type: ListingType
+  from: LocationValue | null; to: LocationValue | null
+  flexibility: Flexibility; seats?: number; passengers?: number; tags: RideTag[]
+  carType?: CarType; luggage?: LuggageSize
+}
+
+export interface Connection {
   id: string
   withUser: { name: string; initials: string; photoUrl: string | null }
   withUserId: string
+  initiatorUserId: string | null
   myRole: 'rider' | 'driver'
   route: string
+  from: string
+  to: string
   date: string
   status: ConnStatus
   splitConfirmed: boolean
@@ -66,9 +90,13 @@ interface Connection {
   pickupLat?: number; pickupLng?: number; pickupLabel?: string
   destLat?: number; destLng?: number; destLabel?: string
   riderPickupLat?: number; riderPickupLng?: number; riderPickupLabel?: string
+  lastMessage?: { content: string; createdAt: string; senderId: string } | null
+  // The full API record, for screens that need more than the inbox summary
+  // (trip-day plate/phone, times, pricing).
+  raw?: api.ApiConnection
 }
 
-interface LocationValue {
+export interface LocationValue {
   label: string
   lat: number
   lng: number
@@ -85,7 +113,7 @@ interface NominatimResult {
   address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
 }
 
-async function reverseGeocode(lat: number, lng: number): Promise<string> {
+export async function reverseGeocode(lat: number, lng: number): Promise<string> {
   try {
     const res = await fetch(
       `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
@@ -105,12 +133,16 @@ function shortLabel(r: NominatimResult): string {
   const city = a.city ?? a.town ?? a.village
   if (city) parts.push(city)
   if (a.state) parts.push(a.state)
-  return parts.filter(Boolean).join(', ')
+  // formatPlace drops the repeat when the place *is* the city ("Sacramento,
+  // Sacramento, California" → "Sacramento, CA").
+  return formatPlace(parts.filter(Boolean).join(', '))
 }
 
-function LocationInput({
-  label, value, onChange, placeholder, required, nearCoords,
+export function LocationInput({
+  label, value, onChange, placeholder, required, nearCoords, variant = 'form',
 }: {
+  // 'bare': borderless field with a small caption, for the Home search card.
+  variant?: 'form' | 'bare'
   label: string
   value: LocationValue | null
   onChange: (v: LocationValue | null) => void
@@ -183,11 +215,12 @@ function LocationInput({
     setSuggestions([])
   }
 
+  const bare = variant === 'bare'
   return (
-    <div ref={containerRef} className="space-y-1.5">
-      <label className="text-sm font-semibold">{label}</label>
+    <div ref={containerRef} className={bare ? 'flex-1 min-w-0' : 'space-y-1.5'}>
+      <label htmlFor={listboxId + '-input'} className={bare ? 'block text-xs text-muted-foreground' : 'text-sm font-semibold'}>{label}</label>
       <div className="relative">
-        <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+        {!bare && <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />}
         <input
           type="text"
           required={required}
@@ -203,7 +236,10 @@ function LocationInput({
             search(e.target.value)
           }}
           onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
-          className="w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground"
+          id={listboxId + '-input'}
+          className={bare
+            ? 'w-full bg-transparent border-0 p-0 pr-6 text-[17px] text-foreground placeholder:text-muted-foreground focus:outline-none'
+            : 'w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground'}
         />
         {loading && (
           <div className="absolute right-3 top-1/2 -translate-y-1/2 size-3.5 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
@@ -265,8 +301,8 @@ export const CAR_TYPE_EMOJI: Record<CarType, string> = {
   sedan: '🚗', suv: '🚙', van: '🚐', minivan: '🚐', truck: '🚚', other: '🚗',
 }
 
-export const SERIF: CSSProperties = { fontFamily: "'DM Serif Display', serif" }
-export const MONO: CSSProperties = { fontFamily: "'DM Mono', monospace" }
+export const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+export const MONO: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -288,12 +324,12 @@ function apiFlexibility(f: string): Flexibility {
 
 const VALID_RIDE_TAGS = new Set(['airport', 'student', 'church', 'college', 'work', 'event'])
 
-function tripToListing(trip: api.ApiDriverTrip): Listing {
+export function tripToListing(trip: api.ApiDriverTrip): Listing {
   const name = trip.driver_name ?? 'Driver'
   return {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: trip.driver_photo_url },
-    from: trip.pickup.label, to: trip.destination.label,
+    from: formatPlace(trip.pickup.label), to: formatPlace(trip.destination.label),
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsUsed: trip.seats_reserved,
     tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -301,6 +337,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     luggageCapacity: (trip.luggage_capacity as LuggageSize) ?? undefined,
     status: trip.status === 'open' ? 'open' : 'matched',
     postedAt: relativeTime(trip.created_at), notes: trip.notes,
+    detourMinutes: trip.detour_minutes ?? undefined,
   }
 }
 
@@ -309,7 +346,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
   return {
     id: req.id, type: 'rider', apiId: req.id, ownerId: req.rider_id,
     user: { name, initials: toInitials(name), verified: false, photoUrl: req.rider_photo_url },
-    from: req.pickup.label, to: req.destination.label,
+    from: formatPlace(req.pickup.label), to: formatPlace(req.destination.label),
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
@@ -319,53 +356,73 @@ function requestToListing(req: api.ApiRideRequest): Listing {
   }
 }
 
-function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
+export function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
   return {
     id: trip.id, type: 'driver',
-    from: trip.pickup.label, to: trip.destination.label,
+    from: formatPlace(trip.pickup.label), to: formatPlace(trip.destination.label),
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
-    seats: trip.seats_available,
-    tags: trip.tags.filter((t): t is RideTag => t === 'airport' || t === 'student'),
+    seats: trip.seats_available, seatsReserved: trip.seats_reserved,
+    tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
     status: trip.status, createdAt: trip.created_at, notes: trip.notes,
+    pickupLat: trip.pickup.latitude, pickupLng: trip.pickup.longitude,
+    destLat: trip.destination.latitude, destLng: trip.destination.longitude,
+    carType: (trip.car_type as CarType) ?? undefined, luggage: (trip.luggage_capacity as LuggageSize) ?? undefined,
   }
 }
 
 function requestToMyListing(req: api.ApiRideRequest): MyListing {
   return {
     id: req.id, type: 'rider',
-    from: req.pickup.label, to: req.destination.label,
+    from: formatPlace(req.pickup.label), to: formatPlace(req.destination.label),
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
-    tags: req.tags.filter((t): t is RideTag => t === 'airport' || t === 'student'),
+    tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
     status: req.status, createdAt: req.created_at, notes: req.notes,
+    pickupLat: req.pickup.latitude, pickupLng: req.pickup.longitude,
+    destLat: req.destination.latitude, destLng: req.destination.longitude,
+    luggage: (req.luggage_size as LuggageSize) ?? undefined,
   }
 }
 
-function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
+export function todayLocalISO(): string {
+  const now = new Date()
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+}
+
+// Upcoming = still bookable (open/matched) and not already in the past;
+// everything else (cancelled, completed, expired, or a stale date) is archive.
+function isActiveListing(l: MyListing): boolean {
+  return (l.status === 'open' || l.status === 'matched') && l.date >= todayLocalISO()
+}
+
+export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
   const isDriver = conn.driver_trip.driver_id === currentUserId
   const withUserId = isDriver ? conn.ride_request.rider_id : conn.driver_trip.driver_id
   const profile = isDriver ? conn.rider_profile : conn.driver_profile
   const otherName = profile?.display_name ?? (isDriver ? 'Rider' : 'Driver')
   const trip = conn.driver_trip
+  const from = formatPlace(trip.pickup.label)
+  const to = formatPlace(trip.destination.label)
   return {
-    id: conn.id,
+    id: conn.id, raw: conn,
     withUser: { name: otherName, initials: toInitials(otherName), photoUrl: profile?.photo_url ?? null },
     withUserId,
+    initiatorUserId: conn.initiator_user_id ?? null,
     myRole: isDriver ? 'driver' : 'rider',
-    route: `${trip.pickup.label} → ${trip.destination.label}`,
+    route: `${from} ➔ ${to}`, from, to,
     date: trip.target_date,
     status: conn.status as ConnStatus,
     splitConfirmed: false, unreadMessages: 0,
     driverTripId: conn.driver_trip_id, rideRequestId: conn.ride_request_id,
     pickupLat: trip.pickup.latitude,
     pickupLng: trip.pickup.longitude,
-    pickupLabel: trip.pickup.label,
+    pickupLabel: from,
     destLat: trip.destination.latitude,
     destLng: trip.destination.longitude,
-    destLabel: trip.destination.label,
+    destLabel: to,
     riderPickupLat: conn.ride_request.pickup.latitude,
     riderPickupLng: conn.ride_request.pickup.longitude,
-    riderPickupLabel: conn.ride_request.pickup.label,
+    riderPickupLabel: formatPlace(conn.ride_request.pickup.label),
   }
 }
 
@@ -407,12 +464,12 @@ const STATUS_CHIP = {
 
 function ConnStatusBadge({ status }: { status: ConnStatus }) {
   const cfg: Record<ConnStatus, { label: string; cls: string }> = {
-    pending:   { label: 'Pending',   cls: STATUS_CHIP.amber },
-    accepted:  { label: 'Accepted',  cls: STATUS_CHIP.green },
-    declined:  { label: 'Declined',  cls: STATUS_CHIP.red },
-    completed: { label: 'Completed', cls: STATUS_CHIP.grey },
-    cancelled: { label: 'Cancelled', cls: STATUS_CHIP.red },
-    expired:   { label: 'Expired',   cls: STATUS_CHIP.grey },
+    pending:   { label: 'Pending',   cls: 'bg-amber-500/15 text-amber-700 dark:text-amber-400' },
+    accepted:  { label: 'Accepted',  cls: 'bg-green-500/15 text-green-700 dark:text-green-400' },
+    declined:  { label: 'Declined',  cls: 'bg-red-500/10 text-red-600 dark:text-red-400' },
+    completed: { label: 'Completed', cls: 'bg-muted text-muted-foreground' },
+    cancelled: { label: 'Cancelled', cls: 'bg-muted text-muted-foreground' },
+    expired:   { label: 'Expired',   cls: 'bg-muted text-muted-foreground' },
   }
   const { label, cls } = cfg[status]
   return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cls}`}>{label}</span>
@@ -420,11 +477,11 @@ function ConnStatusBadge({ status }: { status: ConnStatus }) {
 
 function ListingStatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
-    open:      STATUS_CHIP.blue,
-    matched:   STATUS_CHIP.green,
-    expired:   STATUS_CHIP.grey,
-    cancelled: STATUS_CHIP.red,
-    completed: STATUS_CHIP.grey,
+    open:      'bg-green-500/15 text-green-700 dark:text-green-400',
+    matched:   'bg-primary/10 text-primary',
+    expired:   'bg-muted text-muted-foreground',
+    cancelled: 'bg-red-500/10 text-red-600 dark:text-red-400',
+    completed: 'bg-muted text-muted-foreground',
   }
   return (
     <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${colors[status] ?? STATUS_CHIP.grey}`}>
@@ -481,6 +538,20 @@ function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' 
 
 // ─── Listing card ─────────────────────────────────────────────────────────────
 
+// Detour is computed server-side from the driver's real route, so the card can
+// say how much a pickup costs the driver without ever receiving exact pins.
+// Only listings inside the rider's route corridor carry a value, and the
+// corridor check is direction-aware — hence "same direction".
+function DetourBadge({ minutes }: { minutes: number | null | undefined }) {
+  if (minutes == null) return null
+  const label = minutes < 1 ? 'On your way' : `+${Math.round(minutes)} min detour`
+  return (
+    <p className="pl-5 text-xs font-medium text-primary flex items-center gap-1.5">
+      <Navigation className="size-3" />{label}<Dot className="size-3 text-border" /><span className="text-muted-foreground font-normal">same direction</span>
+    </p>
+  )
+}
+
 function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; alreadyConnected: boolean }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -522,6 +593,7 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
           )}
           <span className="text-xs text-muted-foreground">{listing.date}</span>
         </div>
+        <DetourBadge minutes={listing.detourMinutes} />
       </div>
 
       {(listing.tags.length > 0 || (luggage && luggage !== 'none')) && (
@@ -562,12 +634,20 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
 
 // ─── Algorithmic match ranking ─────────────────────────────────────────────────
 //
-// Ranks candidates using only signals that are actually available pre-connection:
-// shared profile interests, verified status, and — when the current user already
-// has an open listing of their own — closeness of target date and flexibility
-// window to it. Exact pickup coordinates are deliberately withheld pre-connection
-// (see the location privacy model), so this does not fabricate a distance/ETA
-// figure the way a full route-corridor match would.
+// Ranks candidates using signals that are available pre-connection. The dominant
+// one, when the rider has an open request with coordinates, is the server-computed
+// detour (minutes added to the driver's trip by picking this rider up) — the
+// backend does the route math, so exact pins are never sent to the client. The
+// rest are tie-breakers: closeness of target date and flexibility window, shared
+// profile interests and verified status. Without a rider reference (e.g. driver
+// mode) there's no detour signal and the original three-term score is used.
+
+const DETOUR_CUTOFF_MIN = 15
+
+function detourScore(detourMinutes: number | null | undefined): number {
+  if (detourMinutes == null) return 0 // not on the rider's route corridor
+  return Math.min(Math.max(1 - detourMinutes / DETOUR_CUTOFF_MIN, 0), 1)
+}
 
 function flexibilityCloseness(a: Flexibility, b: Flexibility): number {
   if (a === b) return 1
@@ -604,24 +684,28 @@ function useRankedMatches(
     const pool = candidates.filter(c => c.ownerId !== currentUserId && c.status === 'open')
     if (pool.length === 0) { setMatches([]); return }
 
+    const useDetour = referenceListing?.type === 'rider' && referenceListing.pickupLat != null
     const preScored = pool.map(listing => {
       const windowScore = referenceListing
         ? 0.6 * dateCloseness(listing.date, referenceListing.date) + 0.4 * flexibilityCloseness(listing.flexibility, referenceListing.flexibility)
         : 0.5
-      return { listing, windowScore }
-    }).sort((a, b) => b.windowScore - a.windowScore).slice(0, 8)
+      const detour = useDetour ? detourScore(listing.detourMinutes) : 0
+      return { listing, windowScore, detour, preScore: useDetour ? 0.6 * detour + 0.25 * windowScore : windowScore }
+    }).sort((a, b) => b.preScore - a.preScore).slice(0, 8)
 
     setLoading(true)
     Promise.all(preScored.map(({ listing }) => api.getUserProfile(listing.ownerId).catch(() => null)))
       .then(profiles => {
         if (cancelled) return
         const lowerMine = new Set(currentUserInterests.map(i => i.toLowerCase()))
-        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore }, i) => {
+        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore, detour }, i) => {
           const profile = profiles[i]
           const sharedInterests = (profile?.interests ?? []).filter(t => lowerMine.has(t.toLowerCase()))
           const interestScore = Math.min(sharedInterests.length / 3, 1)
           const verifiedScore = profile?.photo_verified ? 1 : 0
-          const score = 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
+          const score = useDetour
+            ? 0.6 * detour + 0.25 * windowScore + 0.1 * interestScore + 0.05 * verifiedScore
+            : 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
           return { listing, profile, sharedInterests, score }
         }).sort((a, b) => b.score - a.score)
         setMatches(enriched.slice(0, 3))
@@ -733,6 +817,7 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
         )}
         <span className="text-muted-foreground">{listing.date}</span>
       </div>
+      <DetourBadge minutes={listing.detourMinutes} />
 
       {(profile?.nationality || sharedInterests.length > 0) && (
         <div className="flex flex-wrap gap-1.5">
@@ -772,6 +857,152 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   )
 }
 
+// ─── Proposed match (Empower-style) ─────────────────────────────────────────────
+//
+// For a rider with an open request, the server picks the single best driver trip
+// (lowest detour on the corridor, then date/flexibility). The rider either
+// requests it — the normal pending Connection, driver still accepts/declines —
+// or skips it and gets the next one. Skips are remembered per request.
+
+function ProposedMatch({ rideRequest, onAccepted, showToast }: {
+  rideRequest: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getRideRequestProposal(rideRequest.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [rideRequest.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best ride…</p>
+  const trip = proposal?.trip
+  if (!trip) return null
+  const listing = tripToListing(trip)
+  const freeSeats = (listing.seats ?? 0) - (listing.seatsUsed ?? 0)
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(rideRequest.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to request ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipRideRequestProposal(rideRequest.id, trip.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best match</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The driver heading your way with the smallest detour.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{freeSeats} of {listing.seats} seats free · {listing.date}</p>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Request this ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Driver-side mirror of ProposedMatch: the best open ride request along the
+// driver's own trip. "Offer a ride" is a driver-initiated pending Connection.
+function ProposedRider({ trip, onAccepted, showToast }: {
+  trip: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiDriverProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getDriverTripProposal(trip.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [trip.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best rider…</p>
+  const req = proposal?.request
+  if (!req) return null
+  const listing = { ...requestToListing(req), detourMinutes: req.detour_minutes ?? undefined }
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(req.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to offer ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipDriverTripProposal(trip.id, req.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best rider</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The rider along your route who adds the least time.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''} · {listing.date}</p>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Offer a ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
   listings: Listing[]; referenceListing: MyListing | undefined
   currentUserId: string; currentUserInterests: string[]
@@ -807,15 +1038,17 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 // ─── Driver-mode home ───────────────────────────────────────────────────────────
 
 function DriverHomeView({
-  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
+  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, onProposalAccepted, showToast, setView,
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
-  filterSheetOpen, setFilterSheetOpen, connectedListingIds,
+  filterSheetOpen, setFilterSheetOpen, hasLocation, connectedListingIds,
 }: {
+  hasLocation: boolean
   myOpenTrip: MyListing | undefined; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onProposalAccepted: (conn: api.ApiConnection) => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
@@ -837,8 +1070,7 @@ function DriverHomeView({
   // anything useful, so they're deliberately left out of this predicate.
   const mobileMatches = useMemo(() => {
     if (!isMobile) return matches
-    const now = new Date()
-    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+    const todayLocal = todayLocalISO()
     return matches.filter(m => {
       const l = m.listing
       const matchSearch = searchQuery.trim() === '' || l.to.toLowerCase().includes(searchQuery.toLowerCase()) || l.from.toLowerCase().includes(searchQuery.toLowerCase())
@@ -852,13 +1084,15 @@ function DriverHomeView({
   if (isMobile) {
     const activeFilterCount = [filterTag !== '', filterLuggage !== ''].filter(Boolean).length
     return (
-      <div className="space-y-4">
-        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
+      // pb-28 keeps the last card's CTA clear of the floating Map View / + controls.
+      <div className="space-y-4 pb-28">
+        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} hasLocation={hasLocation} />
+        {/* Seats-needed is a rider-side filter; a driver browsing ride requests has no use for it. */}
         <MobileFilterBar
           onOpenFilters={() => setFilterSheetOpen(true)}
           activeCount={activeFilterCount}
           quickDate={quickDateFilter} onQuickDate={setQuickDateFilter}
-          seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
+          seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded} showSeats={false}
         />
         {!myOpenTrip && (
           <div className="rounded-2xl border border-dashed border-border bg-card p-5 text-center">
@@ -866,6 +1100,7 @@ function DriverHomeView({
             <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
           </div>
         )}
+        {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
         <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
         {loading ? (
           <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Finding nearby requests…</p>
@@ -922,6 +1157,8 @@ function DriverHomeView({
           <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
         </div>
       )}
+
+      {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
 
       <div>
         <div className="flex items-center justify-between">
@@ -996,8 +1233,9 @@ function FeedView({
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
-  listings, onConnect, loading, currentUserId, setView, connectedListingIds, bestMatches,
+  listings, onConnect, loading, currentUserId, setView, hasLocation, connectedListingIds, bestMatches,
 }: {
+  hasLocation: boolean
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
@@ -1017,15 +1255,20 @@ function FeedView({
   if (isMobile) {
     const activeFilterCount = [filterType !== 'all', filterTag !== '', filterCarType !== '', filterLuggage !== ''].filter(Boolean).length
     return (
-      <div className="space-y-4">
-        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} />
+      // pb-28 keeps the last card's CTA clear of the floating Map View / + controls.
+      <div className="space-y-4 pb-28">
+        <MobileSearchBar value={searchQuery} onChange={setSearchQuery} hasLocation={hasLocation} />
         <MobileFilterBar
           onOpenFilters={() => setFilterSheetOpen(true)}
           activeCount={activeFilterCount}
           quickDate={quickDateFilter} onQuickDate={setQuickDateFilter}
           seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
         />
-        <SectionHeader label="Nearby Drivers" count={listings.length} noun={listings.length === 1 ? 'driver' : 'drivers'} />
+        <SectionHeader
+          label={filterType === 'driver' ? 'Nearby Drivers' : filterType === 'rider' ? 'Nearby Riders' : 'Nearby Rides'}
+          count={listings.length}
+          noun={filterType === 'driver' ? (listings.length === 1 ? 'driver' : 'drivers') : filterType === 'rider' ? (listings.length === 1 ? 'rider' : 'riders') : (listings.length === 1 ? 'ride' : 'rides')}
+        />
         {loading ? (
           <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Loading…</p>
         ) : listings.length > 0 ? (
@@ -1140,9 +1383,10 @@ function FeedView({
 
 // ─── Post view ────────────────────────────────────────────────────────────────
 
-function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
+function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill, onClearPrefill }: {
   onPost: (listing: MyListing) => void; userCoords: { lat: number; lng: number } | null
   defaultType: ListingType; vehicle: api.ApiVehicle
+  prefill?: PostPrefill | null; onClearPrefill?: () => void
 }) {
   // Locked to the app-wide mode (chosen at login / switched deliberately from
   // Profile) rather than an independent in-form toggle — posting the "other"
@@ -1150,19 +1394,19 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   // behavior the mode gate exists to remove.
   const type = defaultType
   const submittingRef = useRef(false)
-  const [from, setFrom] = useState<LocationValue | null>(null)
-  const [to, setTo] = useState<LocationValue | null>(null)
-  const [date, setDate] = useState('')
-  const [flexibility, setFlexibility] = useState<Flexibility>('morning')
-  const [seats, setSeats] = useState(myVehicle?.seats ? String(myVehicle.seats) : '3')
-  const [passengers, setPassengers] = useState('1')
-  const [gasEstimate, setGasEstimate] = useState('')
-  const [tags, setTags] = useState<Set<RideTag>>(new Set())
-  const [vehicle, setVehicle] = useState(myVehicle ? [myVehicle.color, myVehicle.make, myVehicle.model].filter(Boolean).join(' ') : '')
-  const [carType, setCarType] = useState<CarType | ''>((myVehicle?.car_type as CarType) ?? '')
-  const [luggageSize, setLuggageSize] = useState<LuggageSize>('none')
-  const [luggageCapacity, setLuggageCapacity] = useState<LuggageSize>('medium')
   const [notes, setNotes] = useState('')
+  const [from, setFrom] = useState<LocationValue | null>(prefill?.from ?? null)
+  const [to, setTo] = useState<LocationValue | null>(prefill?.to ?? null)
+  const [date, setDate] = useState('')
+  const [flexibility, setFlexibility] = useState<Flexibility>(prefill?.flexibility ?? 'morning')
+  const [seats, setSeats] = useState(prefill?.seats ? String(prefill.seats) : myVehicle?.seats ? String(myVehicle.seats) : '3')
+  const [passengers, setPassengers] = useState(prefill?.passengers ? String(prefill.passengers) : '1')
+  const [gasEstimate, setGasEstimate] = useState('')
+  const [tags, setTags] = useState<Set<RideTag>>(new Set(prefill?.tags ?? []))
+  const [vehicle, setVehicle] = useState(myVehicle ? [myVehicle.color, myVehicle.make, myVehicle.model].filter(Boolean).join(' ') : '')
+  const [carType, setCarType] = useState<CarType | ''>(prefill?.carType ?? (myVehicle?.car_type as CarType) ?? '')
+  const [luggageSize, setLuggageSize] = useState<LuggageSize>(prefill?.type === 'rider' && prefill.luggage ? prefill.luggage : 'none')
+  const [luggageCapacity, setLuggageCapacity] = useState<LuggageSize>(prefill?.type === 'driver' && prefill.luggage ? prefill.luggage : 'medium')
   const [declared, setDeclared] = useState(false)
   const [submitted, setSubmitted] = useState(false)
   const [error, setError] = useState('')
@@ -1208,10 +1452,13 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   const setCount = (n: number) => { const v = String(Math.min(8, Math.max(1, n))); type === 'driver' ? setSeats(v) : setPassengers(v) }
 
   return (
-    <div className="max-w-2xl mx-auto">
-      <div className="mb-6">
-        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Post a listing</h1>
-        <p className="text-sm text-muted-foreground mt-1">Share your route and connect with the community.</p>
+    <div className="max-w-lg mx-auto">
+      <div className="mb-8">
+        <h1 style={SERIF} className="text-[2.25rem] xl:text-[2.75rem] leading-tight text-foreground">{prefill ? 'Re-book this ride' : 'Post a listing'}</h1>
+        <p className="text-muted-foreground mt-1">
+          {prefill ? 'Same route as before — pick a new date and post.' : 'Share your trip or request a ride.'}
+          {prefill && onClearPrefill && <button type="button" onClick={onClearPrefill} className="ml-2 text-primary font-medium hover:underline">Start blank</button>}
+        </p>
       </div>
 
       <div className="flex items-center justify-between gap-3 rounded-2xl p-1 pr-4 mb-8 bg-card border border-border">
@@ -1339,81 +1586,208 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle }: {
   )
 }
 
-// ─── My Listings view ─────────────────────────────────────────────────────────
+// ─── My Rides view ────────────────────────────────────────────────────────────
 
-function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showToast, mode, onGoPost }: {
-  myListings: MyListing[]; onCancel: (listing: MyListing) => Promise<void>
+type RidesTab = 'active' | 'past' | 'pools'
+
+function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClone, onCancel }: {
+  listing: MyListing; conversationCount: number
+  onManage: () => void; onViewMatches: () => void; onClone: () => void; onCancel: () => Promise<void>
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const active = isActiveListing(listing)
+  const isDriver = listing.type === 'driver'
+
+  const cancel = async () => {
+    setCancelling(true)
+    try { await onCancel() } finally { setCancelling(false); setConfirming(false) }
+  }
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`bg-card rounded-2xl border border-border p-5 flex flex-col gap-4 ${active ? '' : 'opacity-90'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full ${isDriver ? 'bg-primary/10 text-primary' : 'bg-accent/15 text-amber-700 dark:text-amber-400'}`}>
+          {isDriver ? <Car className="size-3" /> : <Users className="size-3" />}
+          {isDriver ? 'Driving' : 'Riding'}
+        </span>
+        <ListingStatusBadge status={listing.status === 'open' && !active ? 'expired' : listing.status} />
+      </div>
+
+      {/* Route: vertical pickup → destination rail */}
+      <div className="flex items-stretch gap-3 min-w-0">
+        <div className="flex flex-col items-center pt-1.5 pb-1.5">
+          <span className="size-2.5 rounded-full border-2 border-primary" />
+          <span className="w-px flex-1 bg-border my-1" />
+          <span className="size-2.5 rounded-full bg-primary" />
+        </div>
+        <div className="min-w-0 flex-1 space-y-2">
+          <p className="text-sm text-muted-foreground truncate" title={listing.from}>{listing.from}</p>
+          <p className="text-base font-semibold text-foreground truncate" title={listing.to}>{listing.to}</p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span className="flex items-center gap-1"><Calendar className="size-3" />{listing.date} · {FLEX_LABEL[listing.flexibility]}</span>
+        {listing.seats != null && <span className="flex items-center gap-1"><Users className="size-3" />{listing.seats - (listing.seatsReserved ?? 0)} of {listing.seats} seats free</span>}
+        {listing.passengers != null && <span className="flex items-center gap-1"><Users className="size-3" />{listing.passengers} passenger{listing.passengers > 1 ? 's' : ''}</span>}
+        {conversationCount > 0 && <span className="flex items-center gap-1 text-primary font-medium"><MessageCircle className="size-3" />{conversationCount} conversation{conversationCount > 1 ? 's' : ''}</span>}
+      </div>
+      {listing.tags.length > 0 && <div className="flex flex-wrap gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>}
+
+      <div className="mt-auto pt-1 flex flex-wrap gap-2">
+        {active ? (
+          <>
+            <button onClick={onManage} className="flex-1 min-w-[8rem] inline-flex items-center justify-center gap-1.5 rounded-xl bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors">
+              <Settings2 className="size-4" />Manage Ride
+            </button>
+            <button onClick={onViewMatches} className="flex-1 min-w-[8rem] inline-flex items-center justify-center gap-1.5 rounded-xl border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
+              <Search className="size-4" />View Matches
+            </button>
+            <div className="w-full flex items-center justify-between gap-2">
+              <button onClick={onClone} className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
+                <Copy className="size-3.5" />Clone
+              </button>
+              {confirming ? (
+                <span className="flex items-center gap-1.5">
+                  <button onClick={() => setConfirming(false)} disabled={cancelling} className="px-2.5 py-1.5 rounded-lg text-xs font-medium text-muted-foreground hover:bg-muted">Keep</button>
+                  <button onClick={cancel} disabled={cancelling} className="px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-destructive text-white disabled:opacity-60">
+                    {cancelling ? 'Cancelling…' : 'Confirm cancel'}
+                  </button>
+                </span>
+              ) : (
+                <button onClick={() => setConfirming(true)} className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-medium text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors">
+                  <X className="size-3.5" />Cancel Listing
+                </button>
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <button onClick={onClone} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors">
+              <Copy className="size-4" />Re-book
+            </button>
+            {conversationCount > 0 && (
+              <button onClick={onManage} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
+                <MessageCircle className="size-4" />Conversations
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </motion.div>
+  )
+}
+
+function MyListingsView({ myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay }: {
+  onOpenTripDay: (c: Connection) => void
+  myListings: MyListing[]; connections: Connection[]
+  onCancel: (listing: MyListing) => Promise<void>
+  onManage: (listing: MyListing) => void; onViewMatches: (listing: MyListing) => void
+  onClone: (listing: MyListing) => void; onPostNew: () => void
   userCoords: { lat: number; lng: number } | null; currentUserId: string
   showToast: (msg: string, type: 'success' | 'error') => void
   mode: ListingType
-  onGoPost: () => void
 }) {
   const isMobile = useIsMobile()
-  // Only the listing type matching the current app-wide mode is shown — no
-  // mixed pages, matching Discover and Post. Pools is a standalone Sidebar
-  // entry on desktop already; only surface it as a second tab here on
-  // mobile, where the bottom nav was trimmed to 4 tabs.
-  const [tab, setTab] = useState<ListingType | 'pools'>(mode)
-  const [cancelling, setCancelling] = useState<string | null>(null)
-  const shown = myListings.filter(l => l.type === tab)
-  const handleCancel = async (listing: MyListing) => {
-    setCancelling(listing.id); try { await onCancel(listing) } finally { setCancelling(null) }
-  }
-  const tabs = isMobile ? ([mode, 'pools'] as const) : ([mode] as const)
+  const [tab, setTab] = useState<RidesTab>('active')
+  // Only the listing type matching the app-wide mode is shown — no mixed
+  // pages, matching Discover and Post.
+  const modeListings = useMemo(() => myListings.filter(l => l.type === mode), [myListings, mode])
+  const activeListings = useMemo(() => modeListings.filter(isActiveListing), [modeListings])
+  const pastListings = useMemo(() => modeListings.filter(l => !isActiveListing(l)), [modeListings])
+  const shown = (tab === 'past' ? pastListings : activeListings)
+    .slice()    // Active: soonest first. Past: most recent first.
+    .sort((a, b) => tab === 'past' ? b.date.localeCompare(a.date) : a.date.localeCompare(b.date))
+
+  const conversationCount = (l: MyListing) =>
+    connections.filter(c => (l.type === 'driver' ? c.driverTripId : c.rideRequestId) === l.id && inboxBucket(c.status) !== 'archived').length
+
+  // Pools is a standalone Sidebar entry on desktop already — only surface it
+  // as a third tab here on mobile, where the bottom nav was trimmed to 4 tabs.
+  const tabs: { id: RidesTab; label: string; count?: number }[] = [
+    { id: 'active', label: 'Active', count: activeListings.length },
+    { id: 'past', label: 'Past / Archive', count: pastListings.length },
+    ...(isMobile ? [{ id: 'pools' as const, label: 'Pools' }] : []),
+  ]
+
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">My Rides</h1>
-        <p className="text-sm text-muted-foreground mt-1">Track your listings and bookings.</p>
+    <div className="space-y-5">
+      <div className="flex items-end justify-between gap-4">
+        <div>
+          <h1 style={SERIF} className="text-[2.25rem] xl:text-[2.75rem] leading-tight text-foreground">My Rides</h1>
+          <p className="text-muted-foreground mt-1">{mode === 'driver' ? 'Manage the trips you’re driving.' : 'Manage your ride requests.'}</p>
+        </div>
+        <button onClick={onPostNew} className="hidden sm:inline-flex shrink-0 items-center gap-1.5 px-4 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+          + New listing
+        </button>
       </div>
-      <div className={`flex gap-1 p-1 rounded-xl bg-card border border-border ${tabs.length === 1 ? 'w-fit' : ''}`}>
-        {tabs.map(t => (
-          <button key={t} onClick={() => setTab(t)} className={`${tabs.length === 1 ? 'px-6' : 'flex-1'} py-2 rounded-lg text-sm font-semibold transition-all ${tab === t ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
-            {t === 'driver' ? 'Driver Trips' : t === 'rider' ? 'Ride Requests' : 'Pools'}
-          </button>
-        ))}
+
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex rounded-xl bg-muted p-1 gap-1" role="tablist">
+          {tabs.map(t => (
+            <button key={t.id} role="tab" aria-selected={tab === t.id} onClick={() => setTab(t.id)} className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-1.5 ${tab === t.id ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}>
+              {t.label}
+              {t.count != null && <span className={`text-[11px] tabular-nums ${tab === t.id ? 'text-muted-foreground' : 'opacity-70'}`}>{t.count}</span>}
+            </button>
+          ))}
+        </div>
+        {tab !== 'pools' && (
+          <span className="self-start sm:self-auto text-xs font-semibold px-3 py-1.5 rounded-full bg-muted text-muted-foreground">
+            {mode === 'driver' ? 'Your driver trips' : 'Your ride requests'}
+          </span>
+        )}
       </div>
+
+      {tab === 'active' && (() => {
+        const today = todayLocalISO()
+        const booked = connections
+          .filter(c => c.myRole === mode && (c.status === 'accepted' || c.status === 'pending') && c.date >= today)
+          .sort((a, b) => a.date.localeCompare(b.date))
+        return booked.length > 0 ? (
+          <section className="space-y-2.5" aria-label="Upcoming rides">
+            <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Upcoming rides</h2>
+            {booked.map(c => {
+              const d = new Date(`${c.date}T00:00:00`)
+              const time = c.raw?.driver_trip.departure_time
+              return (
+                <button key={c.id} type="button" onClick={() => onOpenTripDay(c)}
+                  className="w-full text-left bg-card border border-border rounded-2xl p-3.5 flex items-center gap-3 hover:bg-muted transition-colors">
+                  <div className="size-12 rounded-xl bg-muted flex flex-col items-center justify-center shrink-0">
+                    <span className="text-[11px] text-muted-foreground font-semibold uppercase">{d.toLocaleDateString([], { weekday: 'short' })}</span>
+                    <span className="text-[17px] font-bold">{d.getDate()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[15px] font-semibold truncate">{time ? `${fmtTime(time)} ` : ''}{c.myRole === 'driver' ? `picking up ${c.withUser.name}` : `with ${c.withUser.name}`}</p>
+                    <p className="text-[13px] text-muted-foreground truncate">{c.from} ➔ {c.to}</p>
+                  </div>
+                  <ConnStatusBadge status={c.status} />
+                </button>
+              )
+            })}
+          </section>
+        ) : null
+      })()}
+
       {tab === 'pools' ? (
         <PoolView userCoords={userCoords} currentUserId={currentUserId} showToast={showToast} />
       ) : shown.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <p className="text-5xl mb-4">{tab === 'driver' ? '🚗' : '🧍'}</p>
-          <p className="font-bold text-base text-foreground mb-1">No {tab === 'driver' ? 'driver trips' : 'ride requests'} yet</p>
-          <p className="text-sm text-muted-foreground mb-5">Post your first listing to get started.</p>
-          <button onClick={onGoPost} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Create a listing</button>
+        <div className="text-center py-20 text-muted-foreground rounded-3xl border border-dashed border-border">
+          {tab === 'past' ? <Archive className="size-10 mx-auto mb-4 opacity-20" /> : <ClipboardList className="size-10 mx-auto mb-4 opacity-20" />}
+          <p className="font-medium">{tab === 'past' ? 'No past rides yet' : 'No upcoming rides'}</p>
+          <p className="text-sm mt-1">{tab === 'past' ? 'Completed, cancelled and expired listings will show up here.' : 'Post a trip or a ride request to get started.'}</p>
+          {tab === 'active' && (
+            <button onClick={onPostNew} className="mt-4 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Post a listing</button>
+          )}
         </div>
       ) : (
-        <div className="flex flex-col gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4">
           {shown.map(listing => (
-            <motion.div key={listing.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-2">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-                    <span className="truncate">{listing.from}</span>
-                    <ArrowRight className="size-3 text-muted-foreground shrink-0" />
-                    <span className="truncate">{listing.to}</span>
-                  </div>
-                  <p className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
-                    <span>{listing.date}</span>
-                    <span>·</span>
-                    <span className={`size-1.5 rounded-full ${FLEX_DOT[listing.flexibility]}`} />
-                    <span>{FLEX_LABEL[listing.flexibility]}</span>
-                    {listing.seats != null && <><span>·</span><span>{listing.seats} seats</span></>}
-                    {listing.passengers != null && <><span>·</span><span>{listing.passengers} passenger{listing.passengers > 1 ? 's' : ''}</span></>}
-                  </p>
-                </div>
-                <ListingStatusBadge status={listing.status} />
-              </div>
-              {listing.tags.length > 0 && <div className="flex flex-wrap gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>}
-              {listing.notes && <NotePreview notes={listing.notes} />}
-              {listing.status === 'open' && (
-                <div className="flex justify-end">
-                  <button onClick={() => handleCancel(listing)} disabled={cancelling === listing.id} className="text-xs font-semibold px-3 py-1.5 rounded-xl text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors disabled:opacity-50">
-                    {cancelling === listing.id ? 'Cancelling…' : 'Cancel listing'}
-                  </button>
-                </div>
-              )}
-            </motion.div>
+            <MyRideCard
+              key={listing.id} listing={listing} conversationCount={conversationCount(listing)}
+              onManage={() => onManage(listing)} onViewMatches={() => onViewMatches(listing)}
+              onClone={() => onClone(listing)} onCancel={() => onCancel(listing)}
+            />
           ))}
         </div>
       )}
@@ -1421,162 +1795,272 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
   )
 }
 
-// ─── Connection card ──────────────────────────────────────────────────────────
+// ─── Inbox (master-detail) ────────────────────────────────────────────────────
 
-function ConnectionCard({
-  connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat,
-  autoOpen, isActive, onActivate,
+type InboxFilter = 'all' | 'active' | 'completed' | 'archived'
+
+// Declined/cancelled/expired threads are dead ends — they live under
+// "Archived" so the default list only shows conversations that still matter.
+function inboxBucket(status: ConnStatus): Exclude<InboxFilter, 'all'> {
+  if (status === 'pending' || status === 'accepted') return 'active'
+  if (status === 'completed') return 'completed'
+  return 'archived'
+}
+
+function inboxMatches(filter: InboxFilter, status: ConnStatus): boolean {
+  const bucket = inboxBucket(status)
+  return filter === 'all' ? bucket !== 'archived' : bucket === filter
+}
+
+function shortTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const now = new Date()
+  return d.toDateString() === now.toDateString()
+    ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+function connectionPreview(c: Connection, currentUserId: string): string {
+  if (c.lastMessage) return `${c.lastMessage.senderId === currentUserId ? 'You: ' : ''}${c.lastMessage.content}`
+  const iStarted = c.initiatorUserId === currentUserId
+  switch (c.status) {
+    case 'pending': return iStarted ? 'Request sent — waiting for a reply' : 'New ride request'
+    case 'accepted': return 'Chat unlocked — say hi!'
+    case 'completed': return 'Ride completed'
+    default: return 'No longer active'
+  }
+}
+
+function ConversationListItem({ connection, selected, currentUserId, onSelect }: {
+  connection: Connection; selected: boolean; currentUserId: string; onSelect: () => void
+}) {
+  const unread = connection.unreadMessages
+  return (
+    <button
+      onClick={onSelect}
+      aria-current={selected ? 'true' : undefined}
+      className={`w-full text-left px-4 py-3.5 flex gap-3 transition-colors border-l-2 ${selected ? 'bg-primary/5 border-primary' : 'border-transparent hover:bg-muted/60'}`}
+    >
+      <div className="relative shrink-0">
+        <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
+        {unread > 0 && (
+          <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unread > 9 ? '9+' : unread}</span>
+        )}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className={`text-sm truncate ${unread > 0 ? 'font-bold text-foreground' : 'font-semibold text-foreground'}`}>{connection.withUser.name}</span>
+          <span className="text-[11px] text-muted-foreground shrink-0">{connection.lastMessage ? shortTime(connection.lastMessage.createdAt) : connection.date}</span>
+        </div>
+        <p className="text-xs text-muted-foreground truncate mt-0.5">{connection.from} ➔ {connection.to}</p>
+        <div className="flex items-center gap-2 mt-1.5">
+          <ConnStatusBadge status={connection.status} />
+          <span className={`text-xs truncate ${unread > 0 ? 'text-foreground font-medium' : 'text-muted-foreground'}`}>{connectionPreview(connection, currentUserId)}</span>
+        </div>
+      </div>
+    </button>
+  )
+}
+
+function ConversationPane({
+  connection, currentUserId, onBack, onAccept, onDecline, onCancel, onComplete, showToast,
+  onViewRoute, onStartDriving, onMarkRead, initialPanel, incomingMessage, onMessageSent, onUpdatePickup, onOpenTripDay,
 }: {
-  connection: Connection; currentUserId: string
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
+  onOpenTripDay: (conn: Connection) => void
+  connection: Connection; currentUserId: string; onBack?: () => void
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
-  onViewRoute: (conn: Connection) => void
-  onStartDriving: (conn: Connection) => void
-  onOpenChat: (conn: Connection) => void
-  autoOpen?: 'gassplit' | null
-  isActive: boolean
-  onActivate: () => void
+  onViewRoute: (conn: Connection) => void; onStartDriving: (conn: Connection) => void
+  onMarkRead: (id: string) => void
+  initialPanel?: 'gassplit' | null
+  incomingMessage: { connectionId: string; message: api.ApiMessage } | null
+  onMessageSent: (connectionId: string, message: api.ApiMessage) => void
 }) {
-  const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | null>(null)
-
-  // Another card became the active one — collapse this one so only a single
-  // panel is ever open across the inbox at a time.
-  useEffect(() => {
-    if (!isActive) setExpanded(null)
-  }, [isActive])
+  const [panel, setPanel] = useState<'gassplit' | 'safety' | 'pickup' | null>(initialPanel ?? null)
+  const [pickupDraft, setPickupDraft] = useState<LocationValue | null>(
+    connection.riderPickupLat != null && connection.riderPickupLng != null
+      ? { label: connection.riderPickupLabel ?? '', lat: connection.riderPickupLat, lng: connection.riderPickupLng }
+      : null,
+  )
+  const [savingPickup, setSavingPickup] = useState(false)
+  const [myRating, setMyRating] = useState<number | null>(connection.raw?.my_rating ?? null)
+  const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
+  const [msgsLoaded, setMsgsLoaded] = useState(false)
+  const [msgText, setMsgText] = useState('')
+  const [sending, setSending] = useState(false)
   const [gasSuggestion, setGasSuggestion] = useState<api.GasSplitSuggestion | null>(null)
   const [splitAmount, setSplitAmount] = useState('')
   const [splitDone, setSplitDone] = useState(connection.splitConfirmed)
   const [reportReason, setReportReason] = useState('')
   const [reportMode, setReportMode] = useState(false)
   const [busy, setBusy] = useState(false)
-  const cardRef = useRef<HTMLDivElement>(null)
+  const threadRef = useRef<HTMLDivElement>(null)
+  const { id: connectionId, status } = connection
 
-  const toggleSection = async (section: 'gassplit' | 'blockreport') => {
-    const next = expanded === section ? null : section
-    setExpanded(next)
-    if (next !== null) onActivate()
-    if (next === 'gassplit' && !gasSuggestion) {
-      try { const s = await api.suggestGasSplit(connection.id); setGasSuggestion(s); setSplitAmount(String((s.amount_cents / 100).toFixed(2))) } catch { /* ignore */ }
-    }
+  useEffect(() => {
+    let cancelled = false
+    onMarkRead(connectionId)
+    api.getMessages(connectionId)
+      .then(fetched => { if (!cancelled) setMsgs(fetched) })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setMsgsLoaded(true) })
+    return () => { cancelled = true }
+  }, [connectionId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Live messages for the open thread arrive over the WebSocket via Home.
+  useEffect(() => {
+    if (!incomingMessage || incomingMessage.connectionId !== connectionId) return
+    setMsgs(prev => prev.some(m => m.id === incomingMessage.message.id) ? prev : [...prev, incomingMessage.message])
+    onMarkRead(connectionId)
+  }, [incomingMessage]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const el = threadRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [msgs.length])
+
+  useEffect(() => {
+    if (panel !== 'gassplit' || gasSuggestion || status !== 'accepted') return
+    api.suggestGasSplit(connectionId)
+      .then(s => { setGasSuggestion(s); setSplitAmount((s.amount_cents / 100).toFixed(2)) })
+      .catch(() => {})
+  }, [panel, gasSuggestion, status, connectionId])
+
+  const appendSent = (msg: api.ApiMessage) => { setMsgs(prev => [...prev, msg]); onMessageSent(connectionId, msg) }
+
+  const sendCanned = async (key: string) => {
+    setSending(true)
+    try { appendSent(await api.sendCannedMessage(connectionId, key)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
+    finally { setSending(false) }
   }
 
-  // Deep link from a notification: open the right panel and scroll to this card.
-  // (Chat deep links skip this entirely — they open the full-screen chat instead.)
-  useEffect(() => {
-    if (!autoOpen) return
-    cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    toggleSection(autoOpen)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoOpen])
+  const sendFree = async () => {
+    if (!msgText.trim()) return
+    setSending(true)
+    try { appendSent(await api.sendMessage(connectionId, msgText.trim())); setMsgText('') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
+    finally { setSending(false) }
+  }
 
   const confirmSplit = async () => {
     const cents = Math.round(parseFloat(splitAmount) * 100)
     if (isNaN(cents) || cents < 1) return
-    try { await api.confirmGasSplit(connection.id, cents, gasSuggestion?.assumptions ?? {}); setSplitDone(true); showToast('Split confirmed ✓', 'success') }
+    try { await api.confirmGasSplit(connectionId, cents, gasSuggestion?.assumptions ?? {}); setSplitDone(true); showToast('Split confirmed ✓', 'success') }
     catch (e) { showToast(e instanceof Error ? e.message : 'Failed to confirm', 'error') }
   }
 
-  const handleAccept = async () => { setBusy(true); try { await onAccept(connection.id); showToast('Connection accepted', 'success') } catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') } finally { setBusy(false) } }
-  const handleDecline = async () => { setBusy(true); try { await onDecline(connection.id); showToast('Connection declined', 'success') } catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') } finally { setBusy(false) } }
-  const handleCancel = async () => { setBusy(true); try { await onCancel(connection.id); showToast('Connection cancelled', 'success') } catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') } finally { setBusy(false) } }
-  const handleComplete = async () => { setBusy(true); try { await onComplete(connection.id); showToast('Ride completed!', 'success') } catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') } finally { setBusy(false) } }
+  const run = (fn: (id: string) => Promise<void>, ok: string) => async () => {
+    setBusy(true)
+    try { await fn(connectionId); showToast(ok, 'success') }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
+    finally { setBusy(false) }
+  }
   const handleBlock = async () => {
-    try { await api.blockUser(connection.withUserId); showToast('User blocked', 'success'); setExpanded(null) }
+    try { await api.blockUser(connection.withUserId); showToast('User blocked', 'success'); setPanel(null) }
     catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
   }
   const handleReport = async () => {
     if (!reportReason.trim()) return
-    try { await api.reportUser(connection.withUserId, reportReason.trim()); showToast('Report submitted', 'success'); setReportReason(''); setReportMode(false); setExpanded(null) }
+    try { await api.reportUser(connection.withUserId, reportReason.trim()); showToast('Report submitted', 'success'); setReportReason(''); setReportMode(false); setPanel(null) }
     catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
   }
 
-  const { status } = connection
+  // Rider-only, once accepted: the exact pickup address the driver navigates to.
+  const handleSavePickup = async () => {
+    if (!pickupDraft) return
+    setSavingPickup(true)
+    try {
+      await onUpdatePickup(connectionId, connection.rideRequestId, pickupDraft)
+      showToast('Pickup address updated', 'success')
+      setPanel(null)
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to update pickup', 'error') }
+    finally { setSavingPickup(false) }
+  }
+
+  const iStarted = connection.initiatorUserId === currentUserId
   const hasRouteCoords = !!(connection.pickupLat && connection.destLat)
   const hasRiderPickupCoords = !!(connection.riderPickupLat && connection.riderPickupLng)
+  const btn = 'shrink-0 inline-flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-sm font-medium transition-colors disabled:opacity-60'
+  const btnOutline = `${btn} border border-border text-foreground hover:bg-muted`
 
   return (
-    <motion.div ref={cardRef} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }} className={`rounded-2xl border overflow-hidden transition-colors ${['declined', 'cancelled', 'completed', 'expired'].includes(status) ? 'bg-muted/60 opacity-80' : 'bg-card'} ${autoOpen ? 'border-primary/50 ring-2 ring-primary/20' : 'border-border'}`}>
-      {/* Header strip */}
-      <div className="px-5 pt-5 pb-3">
+    <div className="flex flex-col h-full min-h-0 bg-card">
+      {/* ── Fixed header: who, which trip, and the trip's primary controls ── */}
+      <div className="shrink-0 border-b border-border px-4 sm:px-5 pt-4 pb-3 space-y-3">
         <div className="flex items-start gap-3">
-          <div className="relative shrink-0">
-            <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="card" />
-            {connection.unreadMessages > 0 && (
-              <span className="absolute -top-1 -right-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages > 9 ? '9+' : connection.unreadMessages}</span>
-            )}
-          </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
+          {onBack && (
+            <button onClick={onBack} aria-label="Back to conversations" className="p-1.5 -ml-1.5 rounded-lg hover:bg-muted text-muted-foreground"><ChevronLeft className="size-5" /></button>
+          )}
+          <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-semibold text-foreground truncate">{connection.withUser.name}</h2>
               <ConnStatusBadge status={status} />
-              <span className={CHIP}>{connection.myRole === 'driver' ? "You're driving" : "You're riding"}</span>
             </div>
-            <p className="text-xs text-muted-foreground mt-0.5 truncate">{connection.route} · {connection.date}</p>
-            {splitDone && <p className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400"><Check className="size-3.5" />Gas split confirmed</p>}
+            <p className="text-xs text-muted-foreground mt-0.5 truncate">
+              {connection.myRole === 'driver' ? "You're driving" : "You're riding"} · {connection.from} ➔ {connection.to}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2">
+              <span className="inline-flex items-center gap-1"><Calendar className="size-3" />{connection.date}</span>
+              {splitDone && <span className="inline-flex items-center gap-1 text-green-600 dark:text-green-400"><Check className="size-3" />Split confirmed</span>}
+            </p>
           </div>
-          <button onClick={() => toggleSection('blockreport')} aria-label="More actions" className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground transition-colors shrink-0"><MoreHorizontal className="size-4" /></button>
+          <button onClick={() => setPanel(panel === 'safety' ? null : 'safety')} aria-label="Safety options" className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground"><MoreHorizontal className="size-4" /></button>
         </div>
-        {['declined', 'cancelled', 'completed', 'expired'].includes(status) && (
-          <p className="text-xs text-muted-foreground mt-3">{status === 'completed' ? '✓ This ride has been completed.' : `✗ Connection ${status}.`}</p>
-        )}
-      </div>
 
-      {/* Action buttons */}
-      <div className="px-5 pb-5 flex flex-wrap gap-2 empty:hidden">
-        {status === 'pending' && (
-          <>
-            <button onClick={handleAccept} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 transition-colors"><Check className="size-4" />Accept</button>
-            <button onClick={handleDecline} disabled={busy} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-muted px-4 py-2.5 text-sm font-semibold text-muted-foreground hover:text-foreground disabled:opacity-60 transition-colors"><X className="size-4" />Decline</button>
-            <div className="basis-full flex flex-wrap gap-2">
-              <button onClick={() => onOpenChat(connection)} className={`${GHOST_BTN} relative`}>
-                <MessageCircle className="size-4" />Message
-                {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
-              </button>
-              <button onClick={handleCancel} disabled={busy} className={`${GHOST_BTN} text-muted-foreground`}>Cancel</button>
-            </div>
-          </>
-        )}
-        {status === 'accepted' && (
-          <>
-            <button onClick={() => onOpenChat(connection)} className="relative flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-primary text-primary-foreground px-4 py-2.5 text-sm font-semibold hover:bg-primary/90 transition-colors">
-              <MessageCircle className="size-4" />Chat
-              {connection.unreadMessages > 0 && <span className="ml-1 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{connection.unreadMessages}</span>}
-            </button>
-            {connection.myRole === 'driver' && hasRiderPickupCoords && (
-              <button onClick={() => onStartDriving(connection)} className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-white px-4 py-2.5 text-sm font-semibold hover:bg-emerald-700 transition-colors">
-                <Car className="size-4" />Start Driving
-              </button>
+        {(status === 'pending' || status === 'accepted') && (
+          <div className="flex gap-2 overflow-x-auto -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {status === 'pending' && !iStarted && (
+              <>
+                <button onClick={run(onAccept, 'Connection accepted')} disabled={busy} className={`${btn} bg-primary text-primary-foreground font-semibold hover:bg-primary/90`}><Check className="size-4" />Accept</button>
+                <button onClick={run(onDecline, 'Connection declined')} disabled={busy} className={btnOutline}><X className="size-4" />Decline</button>
+              </>
             )}
-            <div className="basis-full flex flex-wrap gap-2">
-              {hasRouteCoords && (
-                <button onClick={() => onViewRoute(connection)} className={GHOST_BTN}><Map className="size-4" />Route</button>
-              )}
-              <button onClick={() => toggleSection('gassplit')} className={`${GHOST_BTN} ${expanded === 'gassplit' ? 'bg-secondary text-secondary-foreground border-primary' : ''}`}><Fuel className="size-4" />Gas Split</button>
-              <button onClick={handleComplete} disabled={busy} className={GHOST_BTN}><Check className="size-4" />Complete</button>
-              <button onClick={handleCancel} disabled={busy} className={`${GHOST_BTN} text-muted-foreground`}>Cancel</button>
-            </div>
-          </>
+            {status === 'pending' && iStarted && (
+              <>
+                <span className="shrink-0 self-center text-xs text-muted-foreground mr-1">Waiting for {connection.withUser.name} to respond</span>
+                <button onClick={run(onCancel, 'Request cancelled')} disabled={busy} className={btnOutline}>Cancel request</button>
+              </>
+            )}
+            {status === 'accepted' && (
+              <>
+                {connection.myRole === 'driver' && hasRiderPickupCoords && (
+                  <button onClick={() => onStartDriving(connection)} className={`${btn} bg-green-600 text-white font-semibold hover:bg-green-700`}><Car className="size-4" />Start Driving</button>
+                )}
+                <button onClick={() => onOpenTripDay(connection)} className={`${btn} bg-primary text-primary-foreground font-semibold hover:brightness-105`}><Calendar className="size-4" />Trip day</button>
+                {hasRouteCoords && <button onClick={() => onViewRoute(connection)} className={btnOutline}><Map className="size-4" />Route</button>}
+                {connection.myRole === 'rider' && (
+                  <button onClick={() => setPanel(panel === 'pickup' ? null : 'pickup')} aria-pressed={panel === 'pickup'} className={btnOutline}><MapPin className="size-4" />Pickup address</button>
+                )}
+                <button onClick={() => setPanel(panel === 'gassplit' ? null : 'gassplit')} aria-pressed={panel === 'gassplit'} className={`${btn} ${panel === 'gassplit' ? 'bg-accent/20 text-amber-800 dark:text-amber-300' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
+                <button onClick={run(onComplete, 'Ride completed!')} disabled={busy} className={btnOutline}><Check className="size-4" />Complete</button>
+                <button onClick={run(onCancel, 'Ride cancelled')} disabled={busy} className={`${btn} text-muted-foreground hover:text-destructive hover:bg-destructive/10`}>Cancel</button>
+              </>
+            )}
+          </div>
         )}
       </div>
 
-      {/* Gas split panel */}
-      {expanded === 'gassplit' && status === 'accepted' && (
-        <div className="border-t border-border bg-muted/40 px-5 py-4 space-y-3">
-          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">⛽ Confirm gas split</p>
+      {/* ── Collapsible panels ── */}
+      {panel === 'gassplit' && status === 'accepted' && (
+        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Confirm gas split</p>
           {gasSuggestion ? (
             <>
               <p className="text-sm text-muted-foreground">Suggested: <span style={MONO} className="text-foreground font-medium">${(gasSuggestion.amount_cents / 100).toFixed(2)}</span></p>
               {splitDone ? (
-                <p className="text-sm text-emerald-700 dark:text-emerald-400 font-semibold flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
+                <p className="text-sm text-green-700 dark:text-green-400 font-medium flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
               ) : (
                 <div className="flex gap-2 items-center">
                   <div className="relative flex-1 max-w-[140px]">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                    <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15" />
+                    <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} aria-label="Split amount" className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
                   </div>
-                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 transition-colors">Confirm split</button>
+                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Confirm</button>
                 </div>
               )}
               <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
@@ -1584,111 +2068,55 @@ function ConnectionCard({
           ) : <p className="text-sm text-muted-foreground animate-pulse">Loading suggestion…</p>}
         </div>
       )}
-
-      {/* Block/report panel */}
-      {expanded === 'blockreport' && (
-        <div className="border-t border-border bg-muted/40 px-5 py-4 space-y-3">
+      {panel === 'pickup' && status === 'accepted' && connection.myRole === 'rider' && (
+        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
+          <LocationInput label="Pickup address" value={pickupDraft} onChange={setPickupDraft} placeholder="Search for your pickup address…" />
+          <div className="flex gap-2">
+            <button onClick={handleSavePickup} disabled={!pickupDraft || savingPickup} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-60 transition-colors">
+              {savingPickup ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => setPanel(null)} className="px-4 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
+          </div>
+          <p className="text-xs text-muted-foreground">Your driver will see the exact address you set here.</p>
+        </div>
+      )}
+      {panel === 'safety' && (
+        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
           {!reportMode ? (
             <div className="flex gap-2">
-              <button onClick={handleBlock} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><UserX className="size-4" />Block</button>
-              <button onClick={() => setReportMode(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-border text-sm text-foreground hover:bg-muted transition-colors"><Flag className="size-4" />Report</button>
+              <button onClick={handleBlock} className={btnOutline}><UserX className="size-4" />Block</button>
+              <button onClick={() => setReportMode(true)} className={btnOutline}><Flag className="size-4" />Report</button>
             </div>
           ) : (
             <div className="space-y-2">
               <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Reason</label>
-              <input type="text" value={reportReason} onChange={e => setReportReason(e.target.value)} placeholder="Describe the issue…" className="w-full px-3 py-2 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15" />
+              <input type="text" value={reportReason} onChange={e => setReportReason(e.target.value)} placeholder="Describe the issue…" className="w-full px-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
               <div className="flex gap-2">
                 <button onClick={handleReport} disabled={!reportReason.trim()} className="px-3 py-2 rounded-xl bg-destructive text-white text-sm font-medium disabled:opacity-50">Submit</button>
-                <button onClick={() => setReportMode(false)} className="px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
+                <button onClick={() => setReportMode(false)} className="px-3 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Back</button>
               </div>
             </div>
           )}
         </div>
       )}
-    </motion.div>
-  )
-}
 
-// ─── Full-screen chat ─────────────────────────────────────────────────────────
-// Its own dedicated screen rather than an accordion panel wedged inside a card
-// already crowded with route/gas-split/complete/cancel buttons — the chat
-// itself is the thing people spend the most time in, so it gets the room.
-
-function FullScreenChatView({ connection, currentUserId, onClose, showToast, incomingMessage }: {
-  connection: Connection; currentUserId: string
-  onClose: () => void
-  showToast: (msg: string, type: 'success' | 'error') => void
-  incomingMessage: { connectionId: string; message: api.ApiMessage } | null
-}) {
-  const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
-  const [loaded, setLoaded] = useState(false)
-  const [msgText, setMsgText] = useState('')
-  const [sending, setSending] = useState(false)
-  const msgEndRef = useRef<HTMLDivElement>(null)
-  const { status } = connection
-
-  useEffect(() => {
-    let cancelled = false
-    api.getMessages(connection.id).then(fetched => {
-      if (cancelled) return
-      setMsgs(fetched); setLoaded(true)
-      setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'auto' }), 50)
-    }).catch(() => setLoaded(true))
-    return () => { cancelled = true }
-  }, [connection.id])
-
-  // Live-append a message that arrives over the websocket while this chat is
-  // already open, instead of only reflecting it as an unread-count bump.
-  useEffect(() => {
-    if (!incomingMessage || incomingMessage.connectionId !== connection.id) return
-    setMsgs(prev => prev.some(m => m.id === incomingMessage.message.id) ? prev : [...prev, incomingMessage.message])
-    setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
-  }, [incomingMessage, connection.id])
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  const sendCanned = async (key: string) => {
-    setSending(true)
-    try { const msg = await api.sendCannedMessage(connection.id, key); setMsgs(prev => [...prev, msg]); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
-    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
-    finally { setSending(false) }
-  }
-
-  const sendFree = async () => {
-    if (!msgText.trim()) return; setSending(true)
-    try { const msg = await api.sendMessage(connection.id, msgText.trim()); setMsgs(prev => [...prev, msg]); setMsgText(''); setTimeout(() => msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50) }
-    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
-    finally { setSending(false) }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 bg-background flex flex-col" role="dialog" aria-modal="true" aria-label={`Chat with ${connection.withUser.name}`}>
-      {/* Header */}
-      <div className="shrink-0 flex items-center gap-3 px-4 py-3 border-b border-border bg-card">
-        <button onClick={onClose} aria-label="Close chat" className="p-2 -ml-2 rounded-full hover:bg-muted text-muted-foreground hover:text-foreground transition-colors">
-          <ChevronLeft className="size-5" />
-        </button>
-        <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="md" />
-        <div className="min-w-0">
-          <h2 className="text-sm font-semibold text-foreground truncate">{connection.withUser.name}</h2>
-          <p className="text-xs text-muted-foreground truncate">{connection.route} · {status === 'pending' ? 'Pending connection' : 'Accepted'}</p>
-        </div>
-      </div>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2.5 max-w-2xl w-full mx-auto">
+      {/* ── Scrollable thread ── */}
+      <div ref={threadRef} className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-5 py-4 space-y-2.5 bg-muted/20">
+        {!msgsLoaded && <p className="text-xs text-muted-foreground text-center py-6 animate-pulse">Loading messages…</p>}
+        {msgsLoaded && msgs.length === 0 && (
+          <div className="h-full flex flex-col items-center justify-center text-center text-muted-foreground py-10">
+            <MessageCircle className="size-8 mb-2 opacity-25" />
+            <p className="text-sm">No messages yet.</p>
+            <p className="text-xs mt-0.5">{status === 'pending' ? 'Send a quick message to coordinate.' : status === 'accepted' ? 'Say hi and sort out the pickup details.' : ''}</p>
+          </div>
+        )}
         {msgs.map(m => {
           const isMine = m.sender_id === currentUserId
           return (
             <div key={m.id} className={`flex items-end gap-2 ${isMine ? 'flex-row-reverse' : 'flex-row'}`}>
               {!isMine && <Avatar initials={connection.withUser.initials} photoUrl={connection.withUser.photoUrl} size="sm" />}
-              <div className={`max-w-[75%] space-y-0.5 ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
-                {!isMine && <span className="text-xs font-semibold text-muted-foreground pl-1">{connection.withUser.name}</span>}
-                <div className={`px-3 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-[4px]' : 'bg-card text-foreground border border-border rounded-bl-[4px]'}`}>
+              <div className={`max-w-[75%] flex flex-col gap-0.5 ${isMine ? 'items-end' : 'items-start'}`}>
+                <div className={`px-3.5 py-2 rounded-2xl text-sm leading-snug ${isMine ? 'bg-primary text-primary-foreground rounded-br-sm' : 'bg-card text-foreground border border-border rounded-bl-sm'}`}>
                   {m.content}
                 </div>
                 <span className="text-[10px] text-muted-foreground px-1">{new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
@@ -1696,80 +2124,174 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
             </div>
           )
         })}
-        {msgs.length === 0 && loaded && (
-          <p className="text-sm text-muted-foreground text-center py-10">No messages yet. Say hi!</p>
-        )}
-        <div ref={msgEndRef} />
       </div>
 
-      {/* Composer */}
-      <div className="shrink-0 border-t border-border bg-card">
-      <div className="p-4 max-w-2xl w-full mx-auto">
+      {/* ── Sticky composer ── */}
+      <div className="shrink-0 border-t border-border bg-card px-4 sm:px-5 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
         {status === 'pending' ? (
           <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">Quick messages while connection is pending:</p>
-            <div className="flex flex-wrap gap-2">
+            <p className="text-xs text-muted-foreground">Quick messages while the request is pending — full chat unlocks once accepted.</p>
+            <div className="flex gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
-                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="px-3 py-1.5 rounded-xl bg-secondary border border-primary text-xs font-medium text-secondary-foreground hover:bg-primary/15 disabled:opacity-50 transition-colors text-left">{text}</button>
+                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="shrink-0 px-3 py-1.5 rounded-full bg-muted text-sm text-foreground hover:bg-muted/70 disabled:opacity-50 transition-colors">{text}</button>
               ))}
             </div>
           </div>
         ) : status === 'accepted' ? (
-          <div className="flex gap-2">
-            <input type="text" autoFocus value={msgText} onChange={e => setMsgText(e.target.value)} onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendFree()} placeholder={`Message ${connection.withUser.name}…`} className="flex-1 px-4 py-2.5 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors" />
-            <button onClick={sendFree} disabled={sending || !msgText.trim()} aria-label="Send" className="size-10 shrink-0 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 disabled:opacity-50 transition-colors"><Send className="size-4" /></button>
+          <form className="flex gap-2" onSubmit={e => { e.preventDefault(); sendFree() }}>
+            <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} placeholder={`Message ${connection.withUser.name}…`} aria-label="Message" className="flex-1 min-w-0 px-4 py-2.5 rounded-full bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
+            <button type="submit" disabled={sending || !msgText.trim()} aria-label="Send message" className="shrink-0 size-10 rounded-full bg-primary text-primary-foreground disabled:opacity-50 flex items-center justify-center transition-colors"><Send className="size-4" /></button>
+          </form>
+        ) : status === 'completed' ? (
+          <div className="flex flex-col items-center gap-1">
+            <p className="text-sm text-muted-foreground">{myRating ? 'Your rating' : `Rate your ride with ${connection.withUser.name}`}</p>
+            <StarRating value={myRating} onChange={async n => {
+              setMyRating(n)
+              try { await api.rateConnection(connectionId, n); showToast('Thanks for rating', 'success') }
+              catch (e) { setMyRating(connection.raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+            }} />
           </div>
-        ) : <p className="text-sm text-muted-foreground text-center">Chat unavailable in this state.</p>}
-      </div>
+        ) : (
+          <p className="text-sm text-muted-foreground text-center">This conversation is closed — the ride was {status}.</p>
+        )}
       </div>
     </div>
   )
 }
 
-// ─── Connections view ─────────────────────────────────────────────────────────
-
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, deepLink }: {
+function InboxView({
+  connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving,
+  onMarkRead, deepLink, onDeepLinkHandled, listingFilter, onClearListingFilter, incomingMessage, onMessageSent, onUpdatePickup, onOpenTripDay,
+}: {
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
+  onOpenTripDay: (conn: Connection) => void
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
-  onOpenChat: (conn: Connection) => void
-  deepLink?: { connectionId: string; section: 'gassplit' } | null
+  onMarkRead: (id: string) => void
+  deepLink?: { connectionId: string; section: 'chat' | 'gassplit' } | null
+  onDeepLinkHandled: () => void
+  listingFilter: { id: string; label: string } | null
+  onClearListingFilter: () => void
+  incomingMessage: { connectionId: string; message: api.ApiMessage } | null
+  onMessageSent: (connectionId: string, message: api.ApiMessage) => void
 }) {
+  const isMobile = useIsMobile()
+  const [filter, setFilter] = useState<InboxFilter>('all')
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [initialPanel, setInitialPanel] = useState<'gassplit' | null>(null)
   const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
-  // Only one card's chat/gas-split/report panel stays open at a time — opening
-  // a different one collapses whatever was open before, instead of letting
-  // several expand simultaneously and cluttering the inbox.
-  const [openConnectionId, setOpenConnectionId] = useState<string | null>(null)
+
+  const scoped = useMemo(
+    () => listingFilter ? connections.filter(c => c.driverTripId === listingFilter.id || c.rideRequestId === listingFilter.id) : connections,
+    [connections, listingFilter],
+  )
+  const visible = useMemo(() => scoped.filter(c => inboxMatches(filter, c.status)), [scoped, filter])
+  const counts = useMemo(() => {
+    const out: Record<InboxFilter, number> = { all: 0, active: 0, completed: 0, archived: 0 }
+    for (const c of scoped) { out[inboxBucket(c.status)] += 1; if (inboxBucket(c.status) !== 'archived') out.all += 1 }
+    return out
+  }, [scoped])
+
+  // Deep link from a notification: jump straight to that thread (and panel).
+  useEffect(() => {
+    if (!deepLink) return
+    const target = connections.find(c => c.id === deepLink.connectionId)
+    if (!target) return
+    setFilter(inboxBucket(target.status) === 'archived' ? 'archived' : 'all')
+    setInitialPanel(deepLink.section === 'gassplit' ? 'gassplit' : null)
+    setSelectedId(target.id)
+    onDeepLinkHandled()
+  }, [deepLink, connections]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Desktop always shows a conversation in the detail pane; mobile shows the
+  // list until one is tapped.
+  useEffect(() => {
+    if (selectedId && visible.some(c => c.id === selectedId)) return
+    if (selectedId && isMobile && scoped.some(c => c.id === selectedId)) return
+    setSelectedId(!isMobile && visible.length > 0 ? visible[0].id : null)
+  }, [visible, scoped, selectedId, isMobile])
+
+  const selected = connections.find(c => c.id === selectedId) ?? null
+  const select = (id: string) => { setInitialPanel(null); setSelectedId(id) }
+
+  const pane = selected && (
+    <ConversationPane
+      key={selected.id}
+      connection={selected} currentUserId={currentUserId}
+      onBack={isMobile ? () => setSelectedId(null) : undefined}
+      onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
+      showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
+      initialPanel={initialPanel} incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup} onOpenTripDay={onOpenTripDay}
+    />
+  )
+
+  const FILTERS: { id: InboxFilter; label: string }[] = [
+    { id: 'all', label: 'All' }, { id: 'active', label: 'Active' },
+    { id: 'completed', label: 'Completed' }, { id: 'archived', label: 'Archived' },
+  ]
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <div>
-        <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Inbox</h1>
-        <p className="text-sm text-muted-foreground mt-1">
+        <h1 style={SERIF} className="text-[2.25rem] xl:text-[2.75rem] leading-tight text-foreground">Inbox</h1>
+        <p className="text-muted-foreground mt-1">
           {totalUnread > 0
-            ? <span className="text-primary font-semibold">{totalUnread} unread message{totalUnread !== 1 ? 's' : ''}</span>
+            ? <span className="text-primary font-medium">{totalUnread} unread message{totalUnread !== 1 ? 's' : ''}</span>
             : 'Track pending offers, accepted rides, and chats.'}
         </p>
       </div>
-      {connections.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-center">
-          <p className="text-5xl mb-4">💬</p>
-          <p className="font-bold text-base text-foreground mb-1">No connections yet</p>
-          <p className="text-sm text-muted-foreground">Connect with a driver or rider from Discover.</p>
-        </div>
-      ) : (
-        <div className="flex flex-col gap-4 max-w-2xl">
-          {connections.map(c => (
-            <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
-              onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
-              showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat}
-              autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
-              isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
-          ))}
+
+      {listingFilter && (
+        <div className="flex items-center justify-between gap-3 rounded-2xl bg-primary/10 text-primary px-4 py-2.5 text-sm">
+          <span className="truncate">Conversations for <span className="font-semibold">{listingFilter.label}</span></span>
+          <button onClick={onClearListingFilter} className="shrink-0 font-semibold hover:underline">Show all</button>
         </div>
       )}
+
+      <div className="rounded-3xl border border-border bg-card overflow-hidden xl:grid xl:grid-cols-[minmax(0,35fr)_minmax(0,65fr)] xl:h-[calc(100dvh-16rem)] xl:min-h-[520px]">
+        <aside className="flex flex-col min-h-0 xl:border-r border-border">
+          <div className="shrink-0 flex gap-1 p-2 border-b border-border overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist" aria-label="Conversation filter">
+            {FILTERS.map(f => (
+              <button key={f.id} role="tab" aria-selected={filter === f.id} onClick={() => setFilter(f.id)} className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filter === f.id ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+                {f.id === 'archived' && <Archive className="size-3.5" />}
+                {f.label}
+                <span className="text-[11px] tabular-nums opacity-60">{counts[f.id]}</span>
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-border">
+            {visible.length === 0 ? (
+              <div className="text-center py-16 px-6 text-muted-foreground">
+                <MessageCircle className="size-10 mx-auto mb-4 opacity-20" />
+                <p className="font-medium">{connections.length === 0 ? 'No connections yet' : filter === 'archived' ? 'Nothing archived' : 'No conversations here'}</p>
+                <p className="text-sm mt-1">{connections.length === 0 ? 'Connect with a driver or rider from Discover.' : 'Try another filter.'}</p>
+              </div>
+            ) : visible.map(c => (
+              <ConversationListItem key={c.id} connection={c} currentUserId={currentUserId} selected={c.id === selectedId} onSelect={() => select(c.id)} />
+            ))}
+          </div>
+        </aside>
+
+        {!isMobile && (
+          <section className="min-h-0 flex flex-col" aria-label="Conversation">
+            {pane ?? (
+              <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-10 text-center">
+                <MessageCircle className="size-10 mb-3 opacity-20" />
+                <p className="font-medium">Select a conversation</p>
+                <p className="text-sm mt-1">Trip details, controls and chat will show up here.</p>
+              </div>
+            )}
+          </section>
+        )}
+      </div>
+
+      {/* Mobile: the open thread takes over the whole screen (over the bottom
+          nav) so the composer can sit at the very bottom like a messaging app. */}
+      {isMobile && pane && <div className="fixed inset-0 z-50 flex flex-col bg-background">{pane}</div>}
     </div>
   )
 }
@@ -1870,12 +2392,13 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin, onSignOut }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
   onOpenAdmin: () => void
-  onSignOut: () => void
 }) {
+  const [confirmingModeSwitch, setConfirmingModeSwitch] = useState(false)
+  const otherMode: ListingType = mode === 'rider' ? 'driver' : 'rider'
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
   const [displayName, setDisplayName] = useState(profile.display_name)
@@ -1883,10 +2406,19 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   const [interests, setInterests] = useState<string[]>(profile.interests ?? [])
   const [interestDraft, setInterestDraft] = useState('')
   const [nationality, setNationality] = useState(profile.nationality ?? '')
-  const [profileSaving, setProfileSaving] = useState(false)
-  const [profileMsg, setProfileMsg] = useState<{ text: string; ok: boolean } | null>(null)
-  const [confirmingModeSwitch, setConfirmingModeSwitch] = useState(false)
-  const otherMode: ListingType = mode === 'rider' ? 'driver' : 'rider'
+  const [phone, setPhone] = useState(profile.phone ?? '')
+  const [make, setMake] = useState(vehicle?.make ?? '')
+  const [model, setModel] = useState(vehicle?.model ?? '')
+  const [color, setColor] = useState(vehicle?.color ?? '')
+  const [plate, setPlate] = useState(vehicle?.plate ?? '')
+  const [vSeats, setVSeats] = useState(vehicle?.seats != null ? String(vehicle.seats) : '')
+  const [vCarType, setVCarType] = useState(vehicle?.car_type ?? '')
+  const [hasLicense, setHasLicense] = useState(vehicle?.has_license ?? false)
+  const [hasInsurance, setHasInsurance] = useState(vehicle?.has_insurance ?? false)
+  const [hasRecord, setHasRecord] = useState(vehicle?.has_good_driving_record ?? false)
+  const [saving, setSaving] = useState(false)
+  const [saveMsg, setSaveMsg] = useState<{ text: string; ok: boolean } | null>(null)
+  const [photoUploading, setPhotoUploading] = useState(false)
 
   const addInterest = () => {
     const tag = interestDraft.trim()
@@ -1894,225 +2426,222 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
     setInterestDraft('')
   }
   const removeInterest = (tag: string) => setInterests(prev => prev.filter(t => t !== tag))
-  const [make, setMake] = useState(vehicle?.make ?? '')
-  const [model, setModel] = useState(vehicle?.model ?? '')
-  const [color, setColor] = useState(vehicle?.color ?? '')
-  const [vSeats, setVSeats] = useState(String(vehicle?.seats ?? ''))
-  const [vCarType, setVCarType] = useState(vehicle?.car_type ?? '')
-  const [hasLicense, setHasLicense] = useState(vehicle?.has_license ?? false)
-  const [hasInsurance, setHasInsurance] = useState(vehicle?.has_insurance ?? false)
-  const [hasRecord, setHasRecord] = useState(vehicle?.has_good_driving_record ?? false)
-  const [vehicleSaving, setVehicleSaving] = useState(false)
-  const [vehicleMsg, setVehicleMsg] = useState<{ text: string; ok: boolean } | null>(null)
 
-  const saveProfile = async () => {
-    setProfileSaving(true); setProfileMsg(null)
+  // Only what actually changed gets saved — in particular, a rider who never
+  // touches the vehicle section must not end up with an empty vehicle record
+  // (which would mark them as "driver ready" and skip vehicle setup later).
+  const profileDirty =
+    displayName !== profile.display_name || bio !== (profile.bio ?? '') || nationality !== (profile.nationality ?? '') ||
+    phone !== (profile.phone ?? '') ||
+    interests.join('\u0000') !== (profile.interests ?? []).join('\u0000')
+  const vehicleDirty =
+    make !== (vehicle?.make ?? '') || model !== (vehicle?.model ?? '') || color !== (vehicle?.color ?? '') ||
+    plate !== (vehicle?.plate ?? '') ||
+    vSeats !== (vehicle?.seats != null ? String(vehicle.seats) : '') || vCarType !== (vehicle?.car_type ?? '') ||
+    hasLicense !== (vehicle?.has_license ?? false) || hasInsurance !== (vehicle?.has_insurance ?? false) ||
+    hasRecord !== (vehicle?.has_good_driving_record ?? false)
+  const dirty = profileDirty || vehicleDirty || interestDraft.trim() !== ''
+
+  const saveChanges = async () => {
+    const pendingInterest = interestDraft.trim()
+    const nextInterests = pendingInterest && !interests.includes(pendingInterest) ? [...interests, pendingInterest] : interests
+    if (pendingInterest) { setInterests(nextInterests); setInterestDraft('') }
+    if (!displayName.trim()) { setSaveMsg({ text: 'Display name is required', ok: false }); return }
+    setSaving(true); setSaveMsg(null)
     try {
-      const updated = await api.updateProfile(displayName, profile.photo_url, bio || null, interests, nationality || null)
-      onProfileUpdate({
-        ...currentUser,
-        profile: { ...profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality },
-      })
-      setProfileMsg({ text: 'Profile saved', ok: true })
-    } catch (e) { setProfileMsg({ text: e instanceof Error ? e.message : 'Failed to save', ok: false }) }
-    finally { setProfileSaving(false) }
+      let next: ApiUser = currentUser
+      if (profileDirty || pendingInterest) {
+        const updated = await api.updateProfile(displayName.trim(), profile.photo_url, bio || null, nextInterests, nationality || null, phone.trim() || null)
+        next = { ...next, profile: { ...next.profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality, phone: updated.phone } }
+      }
+      if (vehicleDirty) {
+        const v = await api.updateDriverReadiness({
+          make: make || undefined, model: model || undefined, color: color || undefined,
+          seats: vSeats ? parseInt(vSeats, 10) : undefined, car_type: vCarType || undefined,
+          has_license: hasLicense, has_insurance: hasInsurance, has_good_driving_record: hasRecord,
+          plate: plate.trim() || null,
+        })
+        next = { ...next, vehicle: v }
+      }
+      onProfileUpdate(next)
+      setSaveMsg({ text: 'Changes saved', ok: true })
+    } catch (e) { setSaveMsg({ text: e instanceof Error ? e.message : 'Failed to save', ok: false }) }
+    finally { setSaving(false) }
   }
 
-  const saveVehicle = async () => {
-    setVehicleSaving(true); setVehicleMsg(null)
-    try {
-      const v = await api.updateDriverReadiness({
-        make: make || undefined, model: model || undefined, color: color || undefined,
-        seats: vSeats ? parseInt(vSeats, 10) : undefined, car_type: vCarType || undefined,
-        has_license: hasLicense, has_insurance: hasInsurance, has_good_driving_record: hasRecord,
-      })
-      onProfileUpdate({ ...currentUser, vehicle: v })
-      setVehicleMsg({ text: 'Vehicle saved', ok: true })
-    } catch (e) { setVehicleMsg({ text: e instanceof Error ? e.message : 'Failed to save', ok: false }) }
-    finally { setVehicleSaving(false) }
+  const onPhotoSelected = (file: File | undefined) => {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = async (ev) => {
+      setPhotoUploading(true)
+      try {
+        const updated = await api.uploadPhoto(ev.target?.result as string)
+        onProfileUpdate({ ...currentUser, profile: { ...profile, photo_url: updated.photo_url, photo_verified: true } })
+      } catch (err) { setSaveMsg({ text: err instanceof Error ? err.message : 'Upload failed', ok: false }) }
+      finally { setPhotoUploading(false) }
+    }
+    reader.readAsDataURL(file)
   }
 
-  const inputCls = 'w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors'
-  const cardCls = 'rounded-2xl bg-card border border-border p-5'
-  const labelCls = 'text-sm font-semibold block mb-1.5'
-  const saveMsg = (m: { text: string; ok: boolean } | null) => m && <p className={`text-sm font-medium ${m.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-destructive'}`}>{m.text}</p>
+  const inputCls = 'w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors'
+  const eligibility = [hasLicense, hasInsurance, hasRecord].filter(Boolean).length
+  const driverReady = eligibility === 3 && !!make && !!model
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Profile</h1>
-
-      <div className="flex items-center gap-4">
-        <div className="relative group shrink-0">
-          {profile.photo_url ? (
-            <img src={profile.photo_url} alt="Profile" className="size-20 rounded-full object-cover ring-2 ring-primary/20" />
-          ) : (
-            <div style={MONO} className="size-20 rounded-full bg-primary text-primary-foreground text-2xl font-bold flex items-center justify-center">{toInitials(profile.display_name)}</div>
-          )}
-          <label className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity cursor-pointer" aria-label="Upload profile photo">
-            <Camera className="size-5 text-white" />
-            <input type="file" accept="image/*" className="sr-only" onChange={async (e) => {
-              const file = e.target.files?.[0]; if (!file) return
-              const reader = new FileReader()
-              reader.onload = async (ev) => {
-                const dataUrl = ev.target?.result as string
-                try { const updated = await api.uploadPhoto(dataUrl); onProfileUpdate({ ...currentUser, profile: { ...profile, photo_url: updated.photo_url, photo_verified: true } }) }
-                catch (err) { alert(err instanceof Error ? err.message : 'Upload failed') }
-              }
-              reader.readAsDataURL(file)
-            }} />
-          </label>
-        </div>
-        <div className="min-w-0">
-          <p className="text-lg font-bold text-foreground truncate">{profile.display_name}</p>
-          <p className="text-sm text-muted-foreground truncate">{currentUser.email}</p>
-          <div className="mt-1 flex flex-wrap gap-1.5">
-            {currentUser.email_domain && (
-              <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.green}`}><Check className="size-3" />Email verified</span>
-            )}
-            {profile.photo_verified ? (
-              <span className={`inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.green}`}><Check className="size-3" />Photo verified</span>
-            ) : (
-              <span className="text-xs text-muted-foreground">Hover your photo to upload one</span>
-            )}
-          </div>
-        </div>
+    <div className="space-y-6">
+      <div>
+        <h1 style={SERIF} className="text-[2.25rem] xl:text-[2.75rem] leading-tight text-foreground">Profile</h1>
+        <p className="text-muted-foreground mt-1">How riders and drivers see you, plus your vehicle details.</p>
       </div>
 
-      <div className={cardCls}>
-        <SectionLabel>Riding as</SectionLabel>
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2.5 min-w-0">
-            <span className="text-2xl">{mode === 'rider' ? '🧍' : '🚗'}</span>
+      <div className="grid gap-6 lg:grid-cols-2 items-start">
+        {/* ── Left: public profile ── */}
+        <section className="rounded-3xl bg-card border border-border p-6 space-y-5">
+          <div className="flex items-center gap-5">
+            <div className="relative shrink-0">
+              {profile.photo_url ? (
+                <img src={profile.photo_url} alt="Profile" className="size-20 rounded-full object-cover ring-2 ring-primary/20" />
+              ) : (
+                <div style={MONO} className="size-20 rounded-full bg-secondary text-secondary-foreground text-2xl font-semibold flex items-center justify-center">{toInitials(profile.display_name)}</div>
+              )}
+              <label className="absolute -bottom-1 -right-1 size-8 rounded-full bg-primary text-primary-foreground ring-2 ring-card flex items-center justify-center cursor-pointer hover:bg-primary/90 transition-colors" aria-label="Upload profile photo">
+                <Camera className="size-4" />
+                <input type="file" accept="image/*" className="sr-only" onChange={e => onPhotoSelected(e.target.files?.[0])} />
+              </label>
+            </div>
             <div className="min-w-0">
-              <p className="text-sm font-semibold text-foreground">{mode === 'rider' ? 'Rider' : 'Driver'}</p>
-              <p className="text-xs text-muted-foreground">
-                You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
-              </p>
+              <h2 className="text-xl font-semibold text-foreground truncate">{profile.display_name}</h2>
+              <p className="text-sm text-muted-foreground truncate">{currentUser.email}</p>
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-500/15 text-green-700 dark:text-green-400"><Check className="size-3" />Email Verified</span>
+                {profile.photo_verified
+                  ? <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-500/15 text-green-700 dark:text-green-400"><Check className="size-3" />Photo Verified</span>
+                  : <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-full bg-muted text-muted-foreground">{photoUploading ? 'Uploading photo…' : 'Add a photo to get verified'}</span>}
+                {currentUser.email_domain && <span className="inline-flex items-center text-[11px] font-medium px-2 py-0.5 rounded-full bg-primary/10 text-primary">@{currentUser.email_domain}</span>}
+              </div>
             </div>
           </div>
-          {!confirmingModeSwitch && (
-            <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="shrink-0 px-3 py-1.5 rounded-xl bg-input-background border border-border text-xs font-semibold text-foreground hover:bg-muted transition-colors">
+
+          <div className="space-y-3">
+            <div className="space-y-1.5"><label htmlFor="pf-name" className="text-sm font-medium">Display name</label><input id="pf-name" value={displayName} onChange={e => setDisplayName(e.target.value)} className={inputCls} /></div>
+            <div className="space-y-1.5"><label htmlFor="pf-bio" className="text-sm font-medium">Bio</label><textarea id="pf-bio" value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tell others a bit about yourself…" className={`${inputCls} resize-none`} /></div>
+            <div className="space-y-1.5">
+              <label htmlFor="pf-nat" className="text-sm font-medium">Nationality <span className="text-muted-foreground font-normal">(optional)</span></label>
+              <input id="pf-nat" value={nationality} onChange={e => setNationality(e.target.value)} placeholder="e.g. Kenyan" className={inputCls} />
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="pf-phone" className="text-sm font-medium">Phone <span className="text-muted-foreground font-normal">(optional)</span></label>
+              <input id="pf-phone" type="tel" autoComplete="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 123 4567" className={inputCls} />
+              <p className="text-xs text-muted-foreground">Only shared with your ride partner once a ride is accepted, so they can call you on trip day.</p>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="pf-int" className="text-sm font-medium">Interests <span className="text-muted-foreground font-normal">(icebreakers, e.g. "Loves Afrobeat")</span></label>
+              {interests.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mb-1">
+                  {interests.map(tag => (
+                    <span key={tag} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-primary/10 text-primary font-medium">
+                      {tag}
+                      <button type="button" onClick={() => removeInterest(tag)} aria-label={`Remove ${tag}`} className="hover:text-foreground"><X className="size-3" /></button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <input
+                id="pf-int" value={interestDraft} onChange={e => setInterestDraft(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addInterest() } }}
+                placeholder="Type an interest and press Enter…" className={inputCls}
+              />
+            </div>
+          </div>
+        </section>
+
+        {/* ── Right: driver readiness ── */}
+        <section className="rounded-3xl bg-card border border-border p-6 space-y-5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-foreground">Driver Readiness</h3>
+              <p className="text-sm text-muted-foreground mt-1">Vehicle details and self-declared eligibility. Only needed if you offer rides.</p>
+            </div>
+            <span className={`shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-full ${driverReady ? 'bg-green-500/15 text-green-700 dark:text-green-400' : 'bg-muted text-muted-foreground'}`}>
+              {driverReady ? 'Ready to drive' : `${eligibility}/3 declared`}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {([['Make', make, setMake, 'e.g. Toyota'], ['Model', model, setModel, 'e.g. Prius'], ['Color', color, setColor, 'e.g. Blue']] as const).map(([label, val, setter, ph]) => (
+              <div key={label} className="space-y-1.5">
+                <label htmlFor={`veh-${label}`} className="text-sm font-medium">{label}</label>
+                <input id={`veh-${label}`} value={val} onChange={e => setter(e.target.value)} placeholder={ph} className={inputCls} />
+              </div>
+            ))}
+            <div className="space-y-1.5"><label htmlFor="veh-seats" className="text-sm font-medium">Seats</label><input id="veh-seats" type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} placeholder="4" className={inputCls} /></div>
+            <div className="space-y-1.5 col-span-2">
+              <label htmlFor="veh-plate" className="text-sm font-medium">License plate</label>
+              <input id="veh-plate" value={plate} onChange={e => setPlate(e.target.value.toUpperCase())} maxLength={10} placeholder="e.g. 8KXR214" className={`${inputCls} uppercase tracking-wider`} />
+              <p className="text-xs text-muted-foreground">Riders see it only after you accept them, so they can find your car at pickup.</p>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium">Vehicle type</p>
+            <div className="flex flex-wrap gap-2">
+              {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
+                <button key={ct} type="button" aria-pressed={vCarType === ct} onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-sm font-medium transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                  {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <p className="text-sm font-medium">Eligibility</p>
+            {([['has_license', "Driver's License", 'I hold a valid license', hasLicense, setHasLicense], ['has_insurance', 'Insurance', 'My vehicle is insured', hasInsurance, setHasInsurance], ['has_record', 'Clean Record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, string, boolean, (v: boolean) => void][]).map(([key, title, desc, val, setter]) => (
+              <label key={key} className={`flex items-center gap-3 rounded-2xl border px-4 py-3 cursor-pointer transition-colors ${val ? 'border-primary/40 bg-primary/5' : 'border-border hover:bg-muted/50'}`}>
+                <input type="checkbox" checked={val} onChange={() => setter(!val)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-foreground">{title}</span>
+                  <span className="block text-xs text-muted-foreground">{desc}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      {/* Mode is chosen once per session at sign-in; changing it is a
+          deliberate, confirmed action here rather than a one-tap toggle. */}
+      <div className="grid gap-6 lg:grid-cols-2 items-start">
+        <section className="rounded-3xl bg-card border border-border p-6 space-y-3">
+          <div>
+            <h3 className="text-base font-semibold text-foreground">Current mode</h3>
+            <p className="text-sm text-muted-foreground mt-0.5">
+              You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
+            </p>
+          </div>
+          {!confirmingModeSwitch ? (
+            <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="w-full py-2.5 rounded-xl border border-border text-sm font-semibold text-foreground hover:bg-muted transition-colors">
               Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
             </button>
+          ) : (
+            <div className="rounded-2xl bg-muted p-4 space-y-3">
+              <p className="text-sm text-foreground">
+                Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
+              </p>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+                  Confirm switch
+                </button>
+                <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
           )}
-        </div>
-        {confirmingModeSwitch && (
-          <div className="mt-4 rounded-xl bg-muted p-4 space-y-3">
-            <p className="text-sm text-foreground">
-              Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
-            </p>
-            <div className="flex gap-2">
-              <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2.5 rounded-xl bg-card border border-border text-sm font-semibold text-muted-foreground hover:text-foreground transition-colors">
-                Cancel
-              </button>
-              <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                Confirm switch
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div className={cardCls}>
-        <SectionLabel>Edit profile</SectionLabel>
-        <div className="flex flex-col gap-4">
-          <div><label className={labelCls}>Display name</label><input value={displayName} onChange={e => setDisplayName(e.target.value)} className={inputCls} /></div>
-          <div><label className={labelCls}>Bio</label><textarea value={bio} onChange={e => setBio(e.target.value)} rows={3} placeholder="Tell others a bit about yourself…" className={`${inputCls} resize-none`} /></div>
-          <div>
-            <label className={labelCls}>Nationality <span className="text-muted-foreground font-normal">(optional)</span></label>
-            <input value={nationality} onChange={e => setNationality(e.target.value)} placeholder="e.g. Kenyan" className={inputCls} />
-          </div>
-          <div>
-            <label className={labelCls}>Interests <span className="text-muted-foreground font-normal">(optional icebreakers, e.g. "Loves Afrobeat")</span></label>
-            {interests.length > 0 && (
-              <div className="flex flex-wrap gap-2 mb-2">
-                {interests.map(tag => (
-                  <span key={tag} className="inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-secondary text-secondary-foreground border border-primary font-medium">
-                    {tag}
-                    <button type="button" onClick={() => removeInterest(tag)} aria-label={`Remove ${tag}`} className="hover:opacity-70"><X className="size-3" /></button>
-                  </span>
-                ))}
-              </div>
-            )}
-            <input
-              value={interestDraft} onChange={e => setInterestDraft(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' || e.key === ',') { e.preventDefault(); addInterest() } }}
-              onBlur={addInterest}
-              placeholder="Type an interest and press Enter…" className={inputCls}
-            />
-          </div>
-          <div className="flex items-center gap-3">
-            <button onClick={saveProfile} disabled={profileSaving} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{profileSaving ? 'Saving…' : 'Save profile'}</button>
-            {saveMsg(profileMsg)}
-          </div>
-        </div>
-      </div>
-
-      {mode === 'driver' && (
-        <div className={cardCls}>
-          <SectionLabel>Driver Readiness</SectionLabel>
-          <p className="text-sm text-muted-foreground -mt-1 mb-4">Vehicle details and self-declared eligibility.</p>
-          <div className="flex flex-col gap-4">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {[['Make', make, setMake], ['Model', model, setModel], ['Color', color, setColor]].map(([label, val, setter]) => (
-                <div key={label as string}>
-                  <label className="text-xs font-semibold text-muted-foreground block mb-1">{label as string}</label>
-                  <input value={val as string} onChange={e => (setter as (v: string) => void)(e.target.value)} placeholder={label as string} className={inputCls} />
-                </div>
-              ))}
-            </div>
-            <div>
-              <label className="text-xs font-semibold text-muted-foreground block mb-2" id="profile-seats-label">Seats</label>
-              <div className="flex items-center gap-3" role="group" aria-labelledby="profile-seats-label">
-                <button type="button" aria-label="Decrease seats" onClick={() => setVSeats(String(Math.max(1, (parseInt(vSeats, 10) || 1) - 1)))} className="size-9 rounded-xl bg-input-background border border-border font-bold text-foreground hover:bg-muted transition-colors">−</button>
-                <span style={MONO} className="w-6 text-center text-lg font-bold text-foreground">{vSeats || '–'}</span>
-                <button type="button" aria-label="Increase seats" onClick={() => setVSeats(String(Math.min(9, (parseInt(vSeats, 10) || 0) + 1)))} className="size-9 rounded-xl bg-input-background border border-border font-bold text-foreground hover:bg-muted transition-colors">+</button>
-              </div>
-            </div>
-            <div>
-              <label className="text-xs font-semibold text-muted-foreground block mb-2">Vehicle type</label>
-              <div className="flex flex-wrap gap-2">
-                {(['sedan', 'suv', 'van', 'minivan', 'truck', 'other'] as CarType[]).map(ct => (
-                  <button key={ct} type="button" onClick={() => setVCarType(vCarType === ct ? '' : ct)} className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition-colors ${vCarType === ct ? 'bg-primary text-primary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`}>
-                    {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div className="flex flex-col gap-2">
-              {([['has_license', "I have a valid driver's license", hasLicense, setHasLicense], ['has_insurance', 'I have valid car insurance', hasInsurance, setHasInsurance], ['has_record', 'I have a good driving record', hasRecord, setHasRecord]] as [string, string, boolean, (v: boolean) => void][]).map(([key, label, val, setter]) => (
-                <label key={key} className="flex items-center gap-2.5 text-sm text-foreground cursor-pointer">
-                  <input type="checkbox" checked={val} onChange={() => setter(!val)} className="size-[18px] rounded accent-primary" />
-                  {label}
-                </label>
-              ))}
-            </div>
-            <div className="flex items-center gap-3">
-              <button onClick={saveVehicle} disabled={vehicleSaving} className="px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">{vehicleSaving ? 'Saving…' : 'Save vehicle'}</button>
-              {saveMsg(vehicleMsg)}
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className={cardCls}>
-        <SectionLabel>Identity</SectionLabel>
-        {currentUser.email_domain ? (
-          <span className={`inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-full ${STATUS_CHIP.green}`}>
-            <Check className="size-3.5" />Verified domain: {currentUser.email_domain}
-          </span>
-        ) : (
-          <p className="text-sm text-muted-foreground">Use a verified email domain to establish trust.</p>
-        )}
-      </div>
-
-      {api.isAdminUser(currentUser) && (
+        </section>
+        {api.isAdminUser(currentUser) && (
         <button
           type="button" onClick={onOpenAdmin}
-          className="w-full flex items-center justify-between gap-3 rounded-2xl bg-card border border-border p-5 text-left hover:border-primary/40 transition-colors"
+          className="w-full flex items-center justify-between gap-3 rounded-3xl bg-card border border-border p-5 text-left hover:border-primary/30 transition-colors"
         >
           <span className="flex items-center gap-3">
-            <span className="rounded-xl bg-secondary p-2.5 text-secondary-foreground"><Shield className="size-4" /></span>
+            <span className="rounded-2xl bg-primary/10 p-2.5 text-primary"><Shield className="size-4" /></span>
             <span>
               <span className="block text-sm font-semibold text-foreground">Admin Panel</span>
               <span className="block text-xs text-muted-foreground mt-0.5">Analytics, moderation, and audit logs</span>
@@ -2121,28 +2650,32 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
           <ChevronRight className="size-4 text-muted-foreground" />
         </button>
       )}
+      </div>
 
-      <button
-        type="button" onClick={onSignOut}
-        className="w-full flex items-center justify-center gap-2 rounded-xl bg-input-background border border-border py-3 text-sm font-semibold text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
-      >
-        <LogOut className="size-4" />Sign out
-      </button>
+      {/* One save action for the whole page, kept in reach while scrolling. */}
+      <div className="sticky bottom-20 xl:bottom-4 z-30 flex items-center justify-end gap-3 rounded-2xl border border-border bg-card/95 backdrop-blur px-4 py-3 shadow-lg">
+        {saveMsg
+          ? <p role="status" className={`text-sm mr-auto ${saveMsg.ok ? 'text-green-700 dark:text-green-400' : 'text-red-500'}`}>{saveMsg.text}</p>
+          : <p className="text-sm mr-auto text-muted-foreground">{dirty ? 'You have unsaved changes' : 'All changes saved'}</p>}
+        <button onClick={saveChanges} disabled={saving || !dirty} className="px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-50 transition-colors">
+          {saving ? 'Saving…' : 'Save Changes'}
+        </button>
+      </div>
+
     </div>
   )
 }
 
-// ─── Neon ↔ Backend session sync ─────────────────────────────────────────────
+// ─── Auth ↔ Backend session sync ─────────────────────────────────────────────
 
 const AUTH_TOKEN_RETRY_LIMIT = 3
 
-function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
-  onAuthenticated: (neonToken: string) => Promise<void>
+function AuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
+  onAuthenticated: (token: string) => Promise<void>
   onUnauthenticated: () => void
   onAuthError: (message: string) => void
 }) {
-  const ctx = useContext(AuthUIContext)
-  const { data: session, isPending } = ctx.hooks.useSession()
+  const { session, isPending } = useAuthSession()
   const lastSyncedId = useRef<string | null | undefined>(undefined)
 
   useEffect(() => {
@@ -2159,16 +2692,16 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
     // The backend verifies this token's signature itself — it never trusts a
     // client-supplied email/name (that would let anyone authenticate as anyone).
-    // fetchNeonJWT can reject or resolve null (e.g. the Neon Auth server is
+    // getAccessToken can reject or resolve null (e.g. the auth server is
     // briefly unreachable) — retry a few times with backoff, and surface an
     // error instead of hanging on "Loading…" forever if it never recovers.
     let cancelled = false
 
     const attempt = async (attemptNumber: number): Promise<void> => {
       try {
-        const token = await fetchNeonJWT()
+        const token = await getAccessToken()
         if (cancelled) return
-        if (!token) throw new Error('Neon Auth returned no token')
+        if (!token) throw new Error('No access token for the current session')
         lastSyncedId.current = uid
         await onAuthenticated(token)
       } catch {
@@ -2190,6 +2723,46 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
+// Account actions (Profile, Admin, Sign out) live only here — not duplicated
+// in the page bodies — so there's exactly one place to find them.
+function AccountMenu({ currentUser, initials, setView, onSignOut, onOpenAdmin }: {
+  currentUser: ApiUser; initials: string; setView: (v: View) => void; onSignOut: () => void; onOpenAdmin: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey) }
+  }, [open])
+
+  const item = 'w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm text-foreground hover:bg-muted transition-colors'
+  const photo = currentUser.profile.photo_url
+  return (
+    <div ref={ref} className="relative">
+      <button onClick={() => setOpen(v => !v)} aria-haspopup="menu" aria-expanded={open} aria-label="Account" className="size-8 rounded-full bg-sidebar-accent text-sidebar-foreground text-xs font-semibold flex items-center justify-center overflow-hidden hover:ring-2 hover:ring-sidebar-primary/40 transition-all" style={MONO}>
+        {photo ? <img src={photo} alt="" className="size-full object-cover" /> : initials}
+      </button>
+      {open && (
+        <div role="menu" className="absolute right-0 top-10 z-50 w-60 rounded-2xl border border-border bg-card text-foreground shadow-xl p-2">
+          <div className="px-3 py-2 mb-1 border-b border-border">
+            <p className="text-sm font-semibold truncate">{currentUser.profile.display_name}</p>
+            <p className="text-xs text-muted-foreground truncate">{currentUser.email}</p>
+          </div>
+          <button role="menuitem" className={item} onClick={() => { setOpen(false); setView('profile') }}><UserIcon className="size-4 text-muted-foreground" />Profile & vehicle</button>
+          {api.isAdminUser(currentUser) && (
+            <button role="menuitem" className={item} onClick={() => { setOpen(false); onOpenAdmin() }}><ShieldCheck className="size-4 text-muted-foreground" />Admin Panel</button>
+          )}
+          <button role="menuitem" className={`${item} text-destructive`} onClick={() => { setOpen(false); onSignOut() }}><LogOut className="size-4" />Sign out</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function BrandMark({ size = 'md' }: { size?: 'sm' | 'md' }) {
   return (
     <span className={`${size === 'sm' ? 'size-7 rounded-lg' : 'size-8 rounded-lg'} bg-primary text-primary-foreground flex items-center justify-center shrink-0`}>
@@ -2198,9 +2771,9 @@ function BrandMark({ size = 'md' }: { size?: 'sm' | 'md' }) {
   )
 }
 
-function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMode, onToggleDark, mode }: {
+function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, initials, darkMode, onToggleDark, mode }: {
   setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
-  onSignOut: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
+  onSignOut: () => void; onOpenAdmin: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
 }) {
   const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
   return (
@@ -2223,8 +2796,7 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
               <Bell className="size-4" />
               {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
-            <button onClick={() => setView('profile')} className="size-8 rounded-full bg-primary text-primary-foreground text-xs font-bold flex items-center justify-center hover:ring-2 hover:ring-primary/30 transition-all" aria-label="Account" style={MONO}>{initials}</button>
-            <button onClick={onSignOut} className={iconBtn} aria-label="Sign out"><LogOut className="size-4" /></button>
+            <AccountMenu currentUser={currentUser} initials={initials} setView={setView} onSignOut={onSignOut} onOpenAdmin={onOpenAdmin} />
           </div>
         ) : (
           <div className="flex items-center gap-2">
@@ -2240,27 +2812,27 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, initials, darkMo
 }
 
 function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v: View) => void; unreadMessages: number }) {
-  // Trimmed to 4 core tabs — Map is now a toggle inside Discover, Pools lives
-  // inside My Rides, and ride creation moved to the Discover FAB.
-  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
-    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
-    { id: 'my-listings', label: 'My Rides', icon: <Car className="size-5" /> },
-    { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
-    { id: 'profile', label: 'Profile', icon: <Shield className="size-5" /> },
+  // Home / Trips / Messages / Profile. Searching, posting and the map all
+  // start from Home; Pools lives inside Trips.
+  const items: Array<{ id: View; label: string; icon: React.ReactNode; also: View[] }> = [
+    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post'] },
+    { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools'] },
+    { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
+    { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin'] },
   ]
   return (
-    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
-      <div className="flex items-center justify-around px-2 h-16">
-        {items.map(({ id, label, icon }) => {
-          const active = view === id
+    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-sidebar border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
+      <div className="grid grid-cols-4 px-2 h-[4.25rem] pt-2">
+        {items.map(({ id, label, icon, also }) => {
+          const active = view === id || also.includes(view)
           const badge = id === 'connections' ? unreadMessages : 0
           return (
-            <button key={id} onClick={() => setView(id)} aria-label={label} className={`relative flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+            <button key={id} onClick={() => setView(id)} aria-label={label} aria-current={active ? 'page' : undefined} className={`relative flex flex-col items-center gap-1 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
               {icon}
               {badge > 0 && (
                 <span className="absolute -top-0.5 right-1.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{badge > 9 ? '9+' : badge}</span>
               )}
-              <span className="text-[10px] font-medium">{label}</span>
+              <span className="text-[11px] font-semibold">{label}</span>
             </button>
           )
         })}
@@ -2269,14 +2841,14 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   )
 }
 
-function Sidebar({ view, setView, onSignOut, unreadCount }: { view: View; setView: (v: View) => void; onSignOut: () => void; unreadCount: number }) {
+function Sidebar({ view, setView, unreadCount }: { view: View; setView: (v: View) => void; unreadCount: number }) {
   const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
     { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
     { id: 'map', label: 'Live Map', icon: <MapPin className="size-5" /> },
     { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
     { id: 'post', label: 'Post', icon: <PlusCircle className="size-5" /> },
     { id: 'my-listings', label: 'My Rides', icon: <Calendar className="size-5" /> },
-    { id: 'connections', label: 'Connections', icon: <MessageCircle className="size-5" /> },
+    { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
     { id: 'notifications', label: 'Notifications', icon: <Bell className="size-5" /> },
     { id: 'profile', label: 'Profile', icon: <User className="size-5" /> },
   ]
@@ -2309,11 +2881,6 @@ function Sidebar({ view, setView, onSignOut, unreadCount }: { view: View; setVie
           New here?{' '}
           <button type="button" className="text-xs underline text-sidebar-foreground/80" onClick={() => setView('post')}>Post your first listing →</button>
         </div>
-      </div>
-      <div className="px-3 pb-4">
-        <button type="button" onClick={onSignOut} className="flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm w-full text-sidebar-foreground/40 hover:bg-sidebar-accent hover:text-sidebar-foreground/70 transition-colors">
-          <LogOut className="size-4" />Sign out
-        </button>
       </div>
     </aside>
   )
@@ -2363,8 +2930,23 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 
 // ─── Home (carpool app) ───────────────────────────────────────────────────────
 
+// Each app view has its own URL so tabs are linkable, survive a refresh and
+// work with the browser's back button.
+const VIEW_PATHS: Record<View, string> = {
+  home: '/discover', feed: '/discover', admin: '/admin',
+  results: '/rides', ride: '/rides/detail', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
+  'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
+}
+const PATH_VIEWS: Record<string, View> = {
+  '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
+  '/my-rides': 'my-listings', '/connections': 'connections', '/inbox': 'connections',
+  '/notifications': 'notifications', '/profile': 'profile', '/admin': 'admin',
+  '/rides': 'results', '/rides/detail': 'ride', '/trip': 'trip', '/offer': 'offer',
+}
+
 export function Home() {
   const navigate = useNavigate()
+  const location = useLocation()
   const isMobile = useIsMobile()
 
   // ── Auth ──
@@ -2374,11 +2956,11 @@ export function Home() {
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
-  // Driven by next-themes (via NeonAuthUIProvider in App.tsx), not a separate
+  // Driven by next-themes (via ThemeProvider in App.tsx), not a separate
   // mechanism of our own — it already owns the `class` on <html>, persists to
   // localStorage, and is active on every route (Home never having mounted was
   // exactly why the old carpool_dark-based toggle didn't survive across pages:
-  // NeonAuthUIProvider wraps every route and would silently overwrite it).
+  // ThemeProvider in App.tsx wraps every route and would silently overwrite it).
   const { resolvedTheme, setTheme } = useTheme()
   const darkMode = resolvedTheme === 'dark'
 
@@ -2394,7 +2976,13 @@ export function Home() {
   }, [])
 
   // ── Navigation ──
-  const [view, setView] = useState<View>('feed')
+  const view: View = PATH_VIEWS[location.pathname.replace(/\/+$/, '') || '/'] ?? 'feed'
+  const pathnameRef = useRef(location.pathname)
+  pathnameRef.current = location.pathname
+  const setView = useCallback((v: View) => {
+    const path = VIEW_PATHS[v]
+    if (pathnameRef.current !== path) navigate(path)
+  }, [navigate])
 
   // ── Passenger/Driver mode ── persists per session; switches primary actions/views
   const [mode, setMode] = useState<ListingType>(() => (sessionStorage.getItem('carpool_mode') as ListingType) || 'rider')
@@ -2424,11 +3012,21 @@ export function Home() {
 
   // ── My Listings ──
   const [myListings, setMyListings] = useState<MyListing[]>([])
+  const [postPrefill, setPostPrefill] = useState<PostPrefill | null>(null)
+
+  // ── Ride flow (Home → Results → Ride details; Trip day; Offer a ride) ──
+  const [rideSearch, setRideSearch] = useState<RideSearch>(defaultRideSearch)
+  const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
+  const [tripDayId, setTripDayId] = useState<string | null>(null)
+  const [savedRoutes, setSavedRoutes] = useState<api.SavedRoute[]>([])
+  useEffect(() => { if (view !== 'post') setPostPrefill(null) }, [view])
 
   // ── Connections ──
   const [connections, setConnections] = useState<Connection[]>([])
   const connectionsRef = useRef<Connection[]>([])
   useEffect(() => { connectionsRef.current = connections }, [connections])
+  const [incomingMessage, setIncomingMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
+  const [inboxListingFilter, setInboxListingFilter] = useState<{ id: string; label: string } | null>(null)
 
   // ── Trip route (for Map view) ──
   const [tripRoute, setTripRoute] = useState<TripRoute | null>(null)
@@ -2438,50 +3036,10 @@ export function Home() {
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
-  const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'gassplit' } | null>(null)
+  const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'chat' | 'gassplit' } | null>(null)
 
-  // ── Full-screen chat ──
-  const [openChatConnectionId, setOpenChatConnectionId] = useState<string | null>(null)
-  const openChatConnectionIdRef = useRef<string | null>(null)
-  useEffect(() => { openChatConnectionIdRef.current = openChatConnectionId }, [openChatConnectionId])
-  const [incomingChatMessage, setIncomingChatMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
-
-  // ── Back-button history sync ──────────────────────────────────────────────
-  // The app switches between "pages" (view, plus the full-screen chat overlay
-  // above) via plain React state rather than routes, so none of that ever
-  // touched browser history — on mobile (especially installed as a PWA), the
-  // phone's back button would then immediately exit the app instead of
-  // stepping back to the previous in-app screen, since there was no history
-  // entry to pop first. Fixed by pushing one history entry per navigation and
-  // restoring (view, chatId) from it on `popstate`, so back walks the app's
-  // own screen stack before it ever reaches the browser/OS boundary.
-  const skipNextHistoryPushRef = useRef(true)
-  const isPoppingHistoryRef = useRef(false)
-
-  useEffect(() => {
-    window.history.replaceState({ carpoolView: view, carpoolChatId: openChatConnectionId }, '')
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  useEffect(() => {
-    if (skipNextHistoryPushRef.current) { skipNextHistoryPushRef.current = false; return }
-    if (isPoppingHistoryRef.current) { isPoppingHistoryRef.current = false; return }
-    window.history.pushState({ carpoolView: view, carpoolChatId: openChatConnectionId }, '')
-  }, [view, openChatConnectionId])
-
-  useEffect(() => {
-    const onPopState = (e: PopStateEvent) => {
-      const state = e.state as { carpoolView?: View; carpoolChatId?: string | null } | null
-      isPoppingHistoryRef.current = true
-      setView(state?.carpoolView ?? 'feed')
-      setOpenChatConnectionId(state?.carpoolChatId ?? null)
-    }
-    window.addEventListener('popstate', onPopState)
-    return () => window.removeEventListener('popstate', onPopState)
-  }, [])
-
-  // ── WebSocket ──
-  const wsRef = useRef<WebSocket | null>(null)
+  // ── Real-time (WebSocket locally, polling in production — see api.createRealtime) ──
+  const wsRef = useRef<{ close: () => void } | null>(null)
   const showToastRef = useRef<(msg: string, type: 'success' | 'error') => void>(() => {})
 
   // ── Toast ──
@@ -2496,40 +3054,39 @@ export function Home() {
 
   useEffect(() => {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
-    const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
+    const ws = api.createRealtime(currentUser.id, (msg: WsMessage) => {
       if (msg.type === 'chat_message') {
-        const chatIsOpenForThis = openChatConnectionIdRef.current === msg.connection_id
-        if (chatIsOpenForThis) {
-          // Already looking at this conversation — live-append instead of
-          // bumping an unread badge and popping a toast over its own screen.
-          setIncomingChatMessage({ connectionId: msg.connection_id, message: msg.message })
-        } else {
-          setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, unreadMessages: c.unreadMessages + 1 } : c))
-          const conn = connectionsRef.current.find(c => c.id === msg.connection_id)
-          const senderName = conn?.withUser.name ?? 'Someone'
-          const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
-          showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
-          setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
-        }
+        const m = msg.message
+        setConnections(prev => prev.map(c => c.id === msg.connection_id
+          ? { ...c, unreadMessages: c.unreadMessages + 1, lastMessage: { content: m.content, createdAt: m.created_at, senderId: m.sender_id } }
+          : c))
+        setIncomingMessage({ connectionId: msg.connection_id, message: m })
+        const conn = connectionsRef.current.find(c => c.id === msg.connection_id)
+        const senderName = conn?.withUser.name ?? 'Someone'
+        const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
+        showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
+        setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
+      } else if (msg.type === 'pickup_updated') {
+        loadConnections(currentUser.id)
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
     })
     wsRef.current = ws
-    return () => { ws?.close(); wsRef.current = null }
+    return () => { ws.close(); wsRef.current = null }
   }, [currentUser])
 
-  // ── Neon session → backend sync ──
-  const handleAuthenticated = useCallback(async (neonToken: string) => {
+  // ── Auth session → backend sync ──
+  const handleAuthenticated = useCallback(async (token: string) => {
     try {
       const existingToken = localStorage.getItem('carpool_token')
       if (existingToken) {
         try { const user = await api.getMe(); setCurrentUser(user); requestLocation(); return }
         catch { localStorage.removeItem('carpool_token') }
       }
-      const user = await api.login(neonToken)
+      const user = await api.login(token)
       setCurrentUser(user); requestLocation()
       setAuthError(null)
     } finally { setAuthLoading(false) }
@@ -2539,7 +3096,7 @@ export function Home() {
     api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
   }, [])
 
-  // Fires only after NeonAuthSync exhausts its retries — e.g. the Neon Auth
+  // Fires only after AuthSync exhausts its retries — e.g. the auth
   // server is unreachable — so the UI never hangs on "Loading…" forever.
   const handleAuthError = useCallback((message: string) => {
     setAuthError(message); setAuthLoading(false)
@@ -2577,13 +3134,23 @@ export function Home() {
     try {
       const conns = await api.getMyConnections()
       setConnections(prev => {
-        const unreadMap: Record<string, number> = Object.fromEntries(prev.map(c => [c.id, c.unreadMessages]))
+        const prevMap = Object.fromEntries(prev.map(c => [c.id, c]))
         return conns.map(c => {
           const mapped = apiConnectionToConnection(c, userId)
-          mapped.unreadMessages = unreadMap[mapped.id] ?? 0
+          mapped.unreadMessages = prevMap[mapped.id]?.unreadMessages ?? 0
+          mapped.lastMessage = prevMap[mapped.id]?.lastMessage ?? null
           return mapped
         })
       })
+      // Inbox list previews: the last message of each still-relevant thread.
+      const live = conns.filter(c => c.status === 'pending' || c.status === 'accepted' || c.status === 'completed').slice(0, 30)
+      const lasts = await Promise.all(live.map(c => api.getMessages(c.id).then(ms => ms[ms.length - 1] ?? null).catch(() => null)))
+      const lastById: Record<string, api.ApiMessage> = {}
+      live.forEach((c, i) => { const m = lasts[i]; if (m) lastById[c.id] = m })
+      setConnections(prev => prev.map(c => {
+        const m = lastById[c.id]
+        return m ? { ...c, lastMessage: { content: m.content, createdAt: m.created_at, senderId: m.sender_id } } : c
+      }))
     } catch { /* ignore */ }
   }, [])
 
@@ -2602,6 +3169,7 @@ export function Home() {
   }, [])
 
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
+  useEffect(() => { if (currentUser) api.getSavedRoutes().then(setSavedRoutes).catch(() => {}) }, [currentUser])
 
   // ── Feed ──
   // Deliberately no pickup-radius pre-filter: Discover should show every
@@ -2609,16 +3177,34 @@ export function Home() {
   // already enforced server-side) so the destination search bar and filter
   // sheet are what narrow the list, not a silent, invisible GPS distance
   // cutoff a listing could fall just outside of with no indication why.
+  //
+  // The one exception to "no pre-filter": when the rider has an open request, a
+  // second, corridor-filtered search supplies per-trip detour minutes. It only
+  // annotates the unfiltered feed above — it never removes anything from it.
+  const reqKey = myListings.find(l => l.type === 'rider' && l.status === 'open' && l.pickupLat != null && l.destLat != null)
+  const corridorQuery = useMemo<api.SearchQuery | null>(() => reqKey ? {
+    pickup_latitude: reqKey.pickupLat, pickup_longitude: reqKey.pickupLng,
+    destination_latitude: reqKey.destLat, destination_longitude: reqKey.destLng,
+  } : null, [reqKey?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const [trips, requests] = await Promise.all([api.searchDriverTrips({}), api.searchRideRequests({})])
-      const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
+      const [trips, requests, corridorTrips] = await Promise.all([
+        api.searchDriverTrips({}), api.searchRideRequests({}),
+        corridorQuery ? api.searchDriverTrips(corridorQuery).catch(() => []) : Promise.resolve([]),
+      ])
+      // (`Map` is the lucide icon in this file, hence a plain record.)
+      const detourByTrip: Record<string, number | null> = Object.fromEntries(corridorTrips.map(t => [t.id, t.detour_minutes ?? null]))
+      const combined = [
+        ...trips.map(t => ({ ...tripToListing(t), detourMinutes: detourByTrip[t.id] ?? undefined })),
+        ...requests.map(requestToListing),
+      ]
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
       setAllListings(deduped)
     } catch { } finally { setFeedLoading(false) }
-  }, [])
+  }, [corridorQuery])
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
@@ -2633,8 +3219,7 @@ export function Home() {
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
   const filteredListings = useMemo(() => {
-    const now = new Date()
-    const todayLocal = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+    const todayLocal = todayLocalISO()
     return allListings.filter(listing => {
       const matchType = filterType === 'all' || listing.type === filterType
       const matchTag = filterTag === '' || listing.tags.includes(filterTag)
@@ -2665,14 +3250,21 @@ export function Home() {
   }, [connections])
 
   // ── Handlers ──
-  const onConnect = useCallback(async (listing: Listing) => {
+  // `opts` comes from the Home → Results → Ride details flow, which knows the
+  // rider's real start, destination, seats and time; the plain feed falls back
+  // to the current location for both ends.
+  const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }) => {
     try {
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
-      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      const from = opts?.from && Number.isFinite(opts.from.lat) ? opts.from : null
+      const pickupLabel = from ? from.label : userCoords ? await reverseGeocode(lat, lng) : 'My location'
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
+        const [p, d] = await Promise.all([
+          api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
+          opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
+        ])
+        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null })
         conn = await api.createConnection(rr.id, listing.apiId)
       } else {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
@@ -2680,13 +3272,49 @@ export function Home() {
         conn = await api.createConnection(listing.apiId, trip.id)
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
-      setConnections(prev => [newConn, ...prev]); showToast('Connection created!', 'success'); setView('connections')
-    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
-  }, [currentUser, userCoords, showToast])
+      const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
+      setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
+      if (opts?.quiet) return
+      setInboxListingFilter(null); setConnDeepLink({ connectionId: newConn.id, section: 'chat' }); setView('connections')
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error'); if (opts?.quiet) throw e }
+  }, [currentUser, userCoords, showToast, setView])
 
   const onPost = useCallback((listing: MyListing) => {
-    setMyListings(prev => [listing, ...prev]); loadListings(); loadMyListings(); setView('my-listings'); showToast('Listing posted!', 'success')
-  }, [loadListings, loadMyListings, showToast])
+    setMyListings(prev => [listing, ...prev]); setPostPrefill(null); loadListings(); loadMyListings(); setView('my-listings'); showToast('Listing posted!', 'success')
+  }, [loadListings, loadMyListings, showToast, setView, userCoords])
+
+  // ── My Rides card actions ──
+  const onManageListing = useCallback((listing: MyListing) => {
+    setInboxListingFilter({ id: listing.id, label: `${listing.from} ➔ ${listing.to}` })
+    setConnDeepLink(null)
+    setView('connections')
+  }, [setView])
+
+  // Opens Discover pre-searched for the listing's destination, showing the
+  // opposite side of the marketplace (riders for a trip, drivers for a request).
+  const onViewMatches = useCallback((listing: MyListing) => {
+    setSearchQuery(listing.to.split(',')[0])
+    setFilterType(listing.type === 'driver' ? 'rider' : 'driver')
+    setQuickDateFilter('any')
+    setView('feed')
+  }, [setView])
+
+  const onCloneListing = useCallback((listing: MyListing) => {
+    const loc = (label: string, lat?: number, lng?: number): LocationValue | null =>
+      lat != null && lng != null ? { label, lat, lng } : null
+    setPostPrefill({
+      key: `${listing.id}_${Date.now()}`, type: listing.type,
+      from: loc(listing.from, listing.pickupLat, listing.pickupLng),
+      to: loc(listing.to, listing.destLat, listing.destLng),
+      flexibility: listing.flexibility, seats: listing.seats, passengers: listing.passengers,
+      tags: listing.tags, carType: listing.carType, luggage: listing.luggage,
+    })
+    setView('post')
+  }, [setView])
+
+  const onMessageSent = useCallback((connectionId: string, m: api.ApiMessage) => {
+    setConnections(prev => prev.map(c => c.id === connectionId ? { ...c, lastMessage: { content: m.content, createdAt: m.created_at, senderId: m.sender_id } } : c))
+  }, [])
 
   const onCancelListing = useCallback(async (listing: MyListing) => {
     if (listing.type === 'driver') await api.cancelDriverTrip(listing.id)
@@ -2705,16 +3333,17 @@ export function Home() {
   const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
   const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
 
+  const onUpdatePickup = useCallback(async (connectionId: string, rideRequestId: string, pickup: LocationValue) => {
+    const location = await api.createLocation(pickup.label, pickup.lat, pickup.lng)
+    await api.updateRideRequestPickup(rideRequestId, location.id)
+    setConnections(prev => prev.map(c => c.id === connectionId
+      ? { ...c, riderPickupLat: pickup.lat, riderPickupLng: pickup.lng, riderPickupLabel: pickup.label }
+      : c))
+  }, [])
+
   const onMarkRead = useCallback((id: string) => {
     setConnections(prev => prev.map(c => c.id === id ? { ...c, unreadMessages: 0 } : c))
   }, [])
-
-  const onOpenChat = useCallback((conn: Connection) => {
-    setOpenChatConnectionId(conn.id)
-    onMarkRead(conn.id)
-  }, [onMarkRead])
-
-  const onCloseChat = useCallback(() => setOpenChatConnectionId(null), [])
 
   const onViewRoute = useCallback((conn: Connection) => {
     if (!conn.pickupLat || !conn.pickupLng || !conn.destLat || !conn.destLng) return
@@ -2725,7 +3354,7 @@ export function Home() {
       partnerName: conn.withUser.name, date: conn.date,
     })
     setView('map')
-  }, [])
+  }, [setView])
 
   const onStartDriving = useCallback((conn: Connection) => {
     if (!conn.riderPickupLat || !conn.riderPickupLng) return
@@ -2735,7 +3364,7 @@ export function Home() {
       pickupLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
     })
     setView('map')
-  }, [])
+  }, [setView])
 
   const onStopDriving = useCallback(() => {
     setDrivingTo(null)
@@ -2754,31 +3383,28 @@ export function Home() {
 
   const onNotifNavigate = useCallback((n: api.ApiNotification) => {
     setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
+    setInboxListingFilter(null)
     if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
-      setConnDeepLink(null)
-      setOpenChatConnectionId(n.related_id)
+      setConnDeepLink({ connectionId: n.related_id, section: 'chat' })
       setView('connections')
     } else if (n.related_id && n.type === 'gas_split_confirmed') {
-      setOpenChatConnectionId(null)
       setConnDeepLink({ connectionId: n.related_id, section: 'gassplit' })
       setView('connections')
     } else if (n.type === 'pool_joined') {
-      setOpenChatConnectionId(null)
       setConnDeepLink(null)
       setView('pools')
     } else {
-      setOpenChatConnectionId(null)
       setConnDeepLink(null)
       setView('connections')
     }
-  }, [])
+  }, [setView])
 
   const unreadCount = notifications.filter(n => !n.read).length
   const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
-    authClient.signOut().catch(() => {})
-    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null); setOpenChatConnectionId(null)
+    supabase.auth.signOut().catch(() => {})
+    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 
@@ -2788,13 +3414,21 @@ export function Home() {
   const handleSetMode = useCallback((m: ListingType) => {
     setMode(m)
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
-  }, [currentUser?.vehicle])
+  }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer']
+  const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
     : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
+    // Screens that need in-memory context fall back after a reload.
+    : view === 'ride' && !selectedTrip ? 'results'
+    : view === 'trip' && !tripDayConnection ? 'my-listings'
     : view
+  // Full-screen flow steps bring their own back/close controls and sticky
+  // action bar, so the app chrome steps aside on phones (as on the map).
+  const immersive = guardedView === 'map' || guardedView === 'results' || guardedView === 'ride' || guardedView === 'trip' || guardedView === 'offer'
+  const hideTopBarOnMobile = immersive || guardedView === 'feed'
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
 
@@ -2816,7 +3450,7 @@ export function Home() {
   if (authLoading) {
     return (
       <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
       </div>
     )
@@ -2824,7 +3458,7 @@ export function Home() {
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
@@ -2836,33 +3470,119 @@ export function Home() {
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
-      <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
-
-      {(() => {
-        const openChatConnection = connections.find(c => c.id === openChatConnectionId)
-        return openChatConnection ? (
-          <FullScreenChatView connection={openChatConnection} currentUserId={currentUser.id} onClose={onCloseChat} showToast={showToast} incomingMessage={incomingChatMessage} />
-        ) : null
-      })()}
 
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
-      <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
-        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
+      <div className={hideTopBarOnMobile ? 'hidden xl:block' : ''}>
+        <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} onOpenAdmin={() => setView('admin')} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
-      {!isMobile && <Sidebar view={guardedView} setView={setView} onSignOut={onSignOut} unreadCount={unreadCount} />}
+      {!isMobile && <Sidebar view={guardedView} setView={setView} unreadCount={unreadCount} />}
 
-      <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
+      <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
-            {guardedView === 'feed' && (
+            {guardedView === 'feed' && isMobile && (
+              <HomeScreen
+                mode={mode} currentUser={currentUser} hasLocation={!!userCoords}
+                search={rideSearch} setSearch={setRideSearch}
+                savedRoutes={savedRoutes}
+                onSaveRoute={async label => {
+                  const to = rideSearch.to; if (!to) return
+                  const from = rideSearch.from && Number.isFinite(rideSearch.from.lat) ? rideSearch.from
+                    : userCoords ? { label: await reverseGeocode(userCoords.lat, userCoords.lng), lat: userCoords.lat, lng: userCoords.lng } : null
+                  if (!from) { showToast('Turn on location or pick a start point first', 'error'); return }
+                  try {
+                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng), api.createLocation(to.label, to.lat, to.lng)])
+                    const route = await api.createSavedRoute({ label, pickup_location_id: p.id, destination_location_id: d.id, departure_time: rideSearch.time || null })
+                    setSavedRoutes(prev => [...prev, route]); showToast('Route saved', 'success')
+                  } catch (e) { showToast(e instanceof Error ? e.message : 'Could not save route', 'error') }
+                }}
+                onDeleteRoute={async id => {
+                  try { await api.deleteSavedRoute(id); setSavedRoutes(prev => prev.filter(r => r.id !== id)) }
+                  catch (e) { showToast(e instanceof Error ? e.message : 'Could not delete route', 'error') }
+                }}
+                nextTrip={pickNextTrip(connections, mode)}
+                onPrimary={() => setView(mode === 'driver' ? 'offer' : 'results')}
+                onOpenTrip={c => { setTripDayId(c.id); setView('trip') }}
+                onOpenProfile={() => setView('profile')}
+                onOpenMap={() => setView('map')}
+                onOpenNotifications={() => setView('notifications')}
+                unreadNotifications={unreadCount}
+              >
+                {mode === 'driver' && (() => {
+                  const requests = filteredListings.filter(l => l.type === 'rider' && l.ownerId !== currentUser.id).slice(0, 5)
+                  return requests.length > 0 ? (
+                    <section className="flex flex-col gap-2.5">
+                      <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Riders looking for a ride</h2>
+                      {requests.map(l => (
+                        <MobileListingCard key={l.id} listing={l} currentUserId={currentUser.id} onEditOwn={() => setView('my-listings')}
+                          alreadyConnected={connectedListingIds.has(l.apiId)}
+                          onConnect={l2 => { onConnect(l2).catch(() => {}) }} />
+                      ))}
+                    </section>
+                  ) : null
+                })()}
+              </HomeScreen>
+            )}
+            {guardedView === 'results' && (
+              <ResultsScreen
+                search={rideSearch} userCoords={userCoords} currentUserId={currentUser.id}
+                requestedTripIds={connectedListingIds}
+                onBack={() => setView('feed')}
+                onOpenTrip={t => { setSelectedTrip(t); setView('ride') }}
+                onNotify={async () => {
+                  const to = rideSearch.to; if (!to) return
+                  const d = await api.createLocation(to.label, to.lat, to.lng)
+                  await api.createRideAlert(d.id, rideSearch.date)
+                  showToast("We'll notify you when a ride is posted", 'success')
+                }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'ride' && selectedTrip && (
+              <RideDetailScreen
+                trip={selectedTrip} seats={rideSearch.seats}
+                requested={connectedListingIds.has(selectedTrip.id)}
+                onBack={() => setView('results')}
+                onRequest={async () => {
+                  await onConnect(tripToListing(selectedTrip), {
+                    from: rideSearch.from, to: rideSearch.to, seats: rideSearch.seats, time: rideSearch.time, quiet: true,
+                  })
+                  setInboxListingFilter(null); setConnDeepLink(null); setView('connections')
+                }}
+              />
+            )}
+            {guardedView === 'trip' && tripDayConnection && (
+              <TripDayScreen
+                connection={tripDayConnection} currentUserId={currentUser.id}
+                onClose={() => setView('my-listings')}
+                onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
+                onStartDriving={onStartDriving}
+                onComplete={async id => { await onComplete(id); showToast('Ride completed!', 'success') }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'offer' && (
+              <OfferRideScreen
+                initial={rideSearch} userCoords={userCoords} vehicle={currentUser.vehicle}
+                onBack={() => setView('feed')}
+                onPosted={() => { loadListings(); loadMyListings(); setView('my-listings') }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'feed' && !isMobile && (
               mode === 'driver' ? (
                 <DriverHomeView
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
+                  onProposalAccepted={conn => {
+                    setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                    showToast('Ride offered!', 'success'); setView('connections')
+                  }}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
                   filterType={filterType} setFilterType={setFilterType}
                   filterTag={filterTag} setFilterTag={setFilterTag}
@@ -2871,41 +3591,67 @@ export function Home() {
                   quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter}
                   seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded}
                   filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen}
+                  hasLocation={!!userCoords}
                 />
               ) : (
-                <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
-                  // Its own desktop-styled MatchCard would clash with the new mobile
-                  // card design, and isn't part of the mobile redesign's scope.
-                  !isMobile && (
+                <FeedView hasLocation={!!userCoords} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                  <>
+                    {(() => {
+                      const openRequest = myListings.find(l => l.type === 'rider' && l.status === 'open')
+                      return openRequest ? (
+                        <ProposedMatch
+                          key={openRequest.id} rideRequest={openRequest} showToast={showToast}
+                          onAccepted={conn => {
+                            setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                            showToast('Ride requested!', 'success'); setView('connections')
+                          }}
+                        />
+                      ) : null
+                    })()}
+                    {/* Its own desktop-styled MatchCard would clash with the new mobile
+                        card design, and isn't part of the mobile redesign's scope. */}
+                    {!isMobile && (
                     <BestMatches
                       listings={allListings}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                       onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
                     />
-                  )
+                    )}
+                  </>
                 } />
               )
             )}
-            {guardedView === 'feed' && isMobile && (
-              <>
-                <ViewToggleFab onClick={() => setView('map')} />
-                <OfferRideFab mode={mode} onClick={() => setView('post')} />
-              </>
-            )}
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
-            {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
-            {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
+            {guardedView === 'post' && <PostView key={postPrefill?.key ?? 'new'} onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} prefill={postPrefill} onClearPrefill={() => setPostPrefill(null)} />}
+            {guardedView === 'my-listings' && (
+              <MyListingsView
+                myListings={myListings} connections={connections} onCancel={onCancelListing}
+                onManage={onManageListing} onViewMatches={onViewMatches} onClone={onCloneListing} onPostNew={() => setView('post')}
+                userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode}
+                onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
+              />
+            )}
+            {guardedView === 'connections' && (
+              <InboxView
+                connections={connections} currentUserId={currentUser.id}
+                onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
+                showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
+                deepLink={connDeepLink} onDeepLinkHandled={() => setConnDeepLink(null)}
+                listingFilter={inboxListingFilter} onClearListingFilter={() => setInboxListingFilter(null)}
+                incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup}
+                onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
+              />
+            )}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
+            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} />}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}
           </main>
         </div>
       </div>
 
-      <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} />
+      {!immersive || guardedView === 'map' ? <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} /> : null}
     </div>
   )
 }

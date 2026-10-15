@@ -2,11 +2,10 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import * as maplibregl from "maplibre-gl"
 import "maplibre-gl/dist/maplibre-gl.css"
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url"
-import { useTheme } from "@neondatabase/auth-ui"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
 import {
-  MapPin, Navigation, Clock, Ruler, DollarSign, X, Car, Search, Crosshair, ChevronUp, ChevronDown,
+  MapPin, Navigation, X, Car, Search, Crosshair, ChevronUp, ChevronDown,
 } from "lucide-react"
 
 // Bundlers don't reliably auto-detect the `new Worker(new URL(...))` call
@@ -49,18 +48,17 @@ const CAR_EMOJIS: Record<string, string> = {
   suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", sedan: "🚗", other: "🚗",
 }
 
-// ── Theme-aware vector basemap ──────────────────────────────────────────────
-// CARTO's hosted GL styles give a real vector basemap (rotatable/pitchable,
-// unlike flat raster tiles) with a light + dark pair that tracks the app
-// theme. Same API key convention as the raster tiles this replaced — Vite
-// only exposes VITE_-prefixed vars to the client, which is expected for a
-// browser map key restricted by domain in the CARTO dashboard.
+// ── Dark vector basemap ─────────────────────────────────────────────────────
+// CARTO's hosted Dark Matter GL style: a real vector basemap (rotatable and
+// pitchable, unlike flat raster tiles) whose high-contrast street network and
+// labels read well under the app's dark, Uber-style map chrome. The map stays
+// dark regardless of the app's light/dark theme, since every overlay on it is
+// styled for a dark canvas. Vite only exposes VITE_-prefixed vars to the
+// client, which is expected for a browser map key restricted by domain.
 const CARTO_API_KEY = import.meta.env.VITE_CARTO_API_KEY as string | undefined
 const CARTO_KEY_PARAM = CARTO_API_KEY ? `?key=${CARTO_API_KEY}` : ""
-const STYLE_URL_LIGHT = `https://basemaps.cartocdn.com/gl/positron-gl-style/style.json${CARTO_KEY_PARAM}`
-const STYLE_URL_DARK = `https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json${CARTO_KEY_PARAM}`
-const ACCENT_LIGHT = "#0284c7"
-const ACCENT_DARK = "#38bdf8"
+const STYLE_URL = `https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json${CARTO_KEY_PARAM}`
+const ACCENT = "#38bdf8"
 
 // ── Marker motion interpolation (pure, unit-testable) ──────────────────────────
 // Smoothly glides a marker between successive polled positions instead of
@@ -142,21 +140,29 @@ const DRIVING_ROUTE_REFRESH_METERS = 40
 const DRIVING_ROUTE_REFRESH_MS = 20000
 
 // ── Marker DOM factories ─────────────────────────────────────────────────────
-// A live-tracking car marker in the spirit of Uber's driver dot: an emoji badge
-// with a small compass wedge that rotates to the driver's heading, plus a
-// pulsing halo while it's actively "en route" toward the selected rider.
+// A top-down SVG car (nose pointing north at 0deg) that rotates to the
+// driver's heading, Uber-style, plus a pulsing halo while it's actively
+// "en route" toward the selected rider. The rotating wrapper must stay the
+// marker element's first child — stepMarkerAnimations() rotates that node.
+const CAR_SVG = `<svg viewBox="0 0 24 40" width="22" height="36" aria-hidden="true">
+  <rect x="2" y="1.5" width="20" height="37" rx="7" fill="var(--carpool-accent)" stroke="#0b1220" stroke-width="1.5"/>
+  <path d="M5.5 10.5 Q12 7 18.5 10.5 L17.5 15 Q12 13.5 6.5 15 Z" fill="#0b1220" opacity=".85"/>
+  <path d="M6.5 29 Q12 30.5 17.5 29 L18.5 33 Q12 35.5 5.5 33 Z" fill="#0b1220" opacity=".7"/>
+  <rect x="6.5" y="16.5" width="11" height="11" rx="2.5" fill="#ffffff" opacity=".22"/>
+  <rect x="3.5" y="3" width="4" height="2.2" rx="1" fill="#fef9c3"/>
+  <rect x="16.5" y="3" width="4" height="2.2" rx="1" fill="#fef9c3"/>
+</svg>`
+
 function makeCarEl(heading: number | null, opts: { tracking?: boolean; accent?: string } = {}): HTMLDivElement {
   const el = document.createElement("div")
   const rotate = heading ?? 0
-  const accent = opts.accent ?? ACCENT_LIGHT
   el.className = `carpool-car-icon${opts.tracking ? " tracking" : ""}`
-  el.style.setProperty("--carpool-accent", accent)
-  el.innerHTML = `<div class="carpool-car-heading" style="transform:rotate(${rotate}deg)"></div>
-    <div class="carpool-car-emoji">🚗</div>`
+  el.style.setProperty("--carpool-accent", opts.accent ?? ACCENT)
+  el.innerHTML = `<div class="carpool-car-body" style="transform:rotate(${rotate}deg)">${CAR_SVG}</div>`
   return el
 }
 
-function makeUserEl(accent: string = ACCENT_LIGHT): HTMLDivElement {
+function makeUserEl(accent: string = ACCENT): HTMLDivElement {
   const el = document.createElement("div")
   el.innerHTML = `<div style="width:14px;height:14px;border-radius:50%;background:${accent};border:3px solid #fff;box-shadow:0 0 0 3px ${accent}80;animation:userPulse 2s ease-in-out infinite"></div>`
   return el.firstElementChild as HTMLDivElement
@@ -206,8 +212,7 @@ function formatDistance(meters: number): string {
   return `${(meters / 1000).toFixed(1)} km`
 }
 
-const MONO: React.CSSProperties = { fontFamily: "'DM Mono', monospace" }
-const SERIF: React.CSSProperties = { fontFamily: "'DM Serif Display', serif" }
+const MONO: React.CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ── Lightweight "Where to?" search (Nominatim) ──────────────────────────────
 interface NominatimResult {
@@ -229,9 +234,7 @@ interface Props {
 }
 
 export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
-  const { resolvedTheme } = useTheme()
-  const isDark = resolvedTheme === "dark"
-  const accentColor = isDark ? ACCENT_DARK : ACCENT_LIGHT
+  const accentColor = ACCENT
 
   const mapRef = useRef<maplibregl.Map | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -321,26 +324,23 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
     const center: [number, number] = userCoords ? [userCoords.lng, userCoords.lat] : [-122.4194, 37.7749]
+    // No +/- zoom buttons: pinch/scroll zoom, drag pan and two-finger
+    // pitch/rotate are all on by default. The OSM/CARTO credit is legally
+    // required, so it stays — but only as a collapsed "i" button, not a bar.
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: isDark ? STYLE_URL_DARK : STYLE_URL_LIGHT,
+      style: STYLE_URL,
       center, zoom: 14, pitch: 45,
       attributionControl: false,
     })
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right")
-    map.on("load", () => { mapReadyRef.current = true; setMapReady(true) })
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "top-left")
+    map.on("load", () => {
+      mapReadyRef.current = true; setMapReady(true)
+      containerRef.current?.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show")
+    })
     mapRef.current = map
     return () => { map.remove(); mapRef.current = null; mapReadyRef.current = false; setMapReady(false) }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Swap basemap style when the app's light/dark mode changes ──────────────
-  // Sources/layers we add (the route line) don't survive setStyle, so they're
-  // re-added by the "route" effect below once the new style finishes loading.
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReadyRef.current) return
-    map.setStyle(isDark ? STYLE_URL_DARK : STYLE_URL_LIGHT)
-  }, [isDark])
 
   // ── Shared route line source/layer (used by trip-route + driving modes) ────
   const ensureRouteLayer = useCallback((map: maplibregl.Map) => {
@@ -516,7 +516,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           .setLngLat(toLngLat([d.latitude, d.longitude]))
           .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`))
           .addTo(map)
-        m.getElement().addEventListener("click", () => setSelected(d))
+        m.getElement().addEventListener("click", () => { setSelected(d); setSheetExpanded(true) })
         markersRef.current[d.user_id] = m
       }
     }
@@ -729,133 +729,28 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const nearbyCount = drivers.length
 
   return (
-    <div className="space-y-4">
-      {/* ══════════════════════════ Desktop header + mode cards (xl and up) — above the map ══════════════════════════ */}
-      <div className="hidden xl:block xl:space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">
-              {mode === "driving" ? "Driving to pickup" : mode === "trip" ? "Trip Route" : "Live Map"}
-            </h1>
-            <p className="text-muted-foreground mt-1">
-              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? `${tripRoute?.partnerName} · ${tripRoute?.date}` : "See nearby drivers in real time."}
-            </p>
-          </div>
-          {mode === "driving" ? (
-            <button onClick={onStopDriving} className="flex items-center gap-2 px-4 py-2 rounded-2xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
-              <X className="size-4" /> End
-            </button>
-          ) : mode === "trip" ? (
-            <button onClick={onClearRoute} className="flex items-center gap-2 px-4 py-2 rounded-2xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
-              <X className="size-4" /> Back to Map
-            </button>
-          ) : userMode === "driver" ? (
-            <button onClick={toggleSharing} className={`px-4 py-2 rounded-2xl text-sm font-semibold transition-colors ${sharing ? "bg-green-600 text-white" : "bg-primary text-primary-foreground hover:bg-primary/90"}`}>
-              {sharing ? "📡 Sharing location" : "Share my location"}
-            </button>
-          ) : null}
-        </div>
+    <div>
+      {/* Full-bleed map canvas on every screen size — no card, border or
+          rounding. Mobile: fills the viewport above the bottom nav. Desktop:
+          fills the content column below the top bar. Everything else floats
+          over it. */}
+      <div className="fixed inset-x-0 top-0 bottom-16 z-0 xl:relative xl:inset-auto xl:bottom-auto xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden bg-[#0e1626]">
+        <div ref={containerRef} className="absolute inset-0 w-full h-full z-0" />
 
-        {mode === "driving" && drivingTo && (
-          <div className="rounded-3xl border border-border bg-card p-5 space-y-4">
-            <div className="flex items-center gap-3">
-              <div className="size-9 rounded-full bg-primary/10 flex items-center justify-center shrink-0"><Car className="size-4 text-primary" /></div>
-              <div className="min-w-0">
-                <p className="text-xs text-muted-foreground font-medium">PICKING UP</p>
-                <p className="text-sm font-semibold text-foreground truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
-              </div>
-            </div>
-            {drivingGeoError && <p className="text-sm text-destructive text-center">Couldn't access your location. Enable location access to navigate.</p>}
-            {!drivingGeoError && drivingLoadingRoute && !drivingRoute && <p className="text-sm text-muted-foreground animate-pulse text-center">Calculating route…</p>}
-            {drivingRoute && (
-              <div className="grid grid-cols-2 gap-3">
-                {[{ Icon: Clock, label: "ETA", value: formatDuration(drivingRoute.durationSeconds) }, { Icon: Ruler, label: "Distance", value: formatDistance(drivingRoute.distanceMeters) }].map(({ Icon, label, value }) => (
-                  <div key={label} className="bg-muted rounded-2xl p-3 text-center">
-                    <Icon className="size-4 text-primary mx-auto mb-1" />
-                    <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide">{label}</p>
-                    <p style={MONO} className="text-base font-semibold text-foreground mt-0.5">{value}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-            <button onClick={onStopDriving} className="w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">I've arrived</button>
-          </div>
-        )}
-
-        {mode === "trip" && tripRoute && (
-          <div className="rounded-3xl border border-border bg-card p-5 space-y-4">
-            <div className="flex items-stretch gap-3">
-              <div className="flex flex-col items-center gap-0">
-                <div className="size-3 rounded-full bg-green-500 mt-0.5 shrink-0" />
-                <div className="w-0.5 flex-1 bg-border my-1" />
-                <div className="size-3 rounded-full bg-red-500 mb-0.5 shrink-0" />
-              </div>
-              <div className="flex flex-col justify-between gap-2 min-w-0">
-                <div><p className="text-xs text-muted-foreground font-medium">PICKUP</p><p className="text-sm font-semibold text-foreground truncate">{tripRoute.pickupLabel}</p></div>
-                <div><p className="text-xs text-muted-foreground font-medium">DESTINATION</p><p className="text-sm font-semibold text-foreground truncate">{tripRoute.destLabel}</p></div>
-              </div>
-            </div>
-            {loadingRoute && <p className="text-sm text-muted-foreground animate-pulse text-center">Calculating route…</p>}
-            {osrmResult && (
-              <div className="grid grid-cols-3 gap-3">
-                {[{ Icon: Clock, label: "Est. time", value: formatDuration(osrmResult.durationSeconds) }, { Icon: Ruler, label: "Distance", value: formatDistance(osrmResult.distanceMeters) }, { Icon: DollarSign, label: "Fare / person", value: fareEstimate != null ? `$${(fareEstimate / 100).toFixed(2)}` : "—" }].map(({ Icon, label, value }) => (
-                  <div key={label} className="bg-muted rounded-2xl p-3 text-center">
-                    <Icon className="size-4 text-primary mx-auto mb-1" />
-                    <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide">{label}</p>
-                    <p style={MONO} className="text-base font-semibold text-foreground mt-0.5">{value}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="flex items-center gap-5 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1.5"><span className="size-2.5 rounded-full bg-green-500 inline-block" />Pickup</span>
-              <span className="flex items-center gap-1.5"><span className="size-2.5 rounded-full bg-red-500 inline-block" />Destination</span>
-              <span className="flex items-center gap-1.5"><span className="inline-block w-6 h-0.5 bg-primary rounded" />Route</span>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ══════════════════════════ Map box: full-viewport on mobile, boxed card on desktop ══════════════════════════ */}
-      {/* This single wrapper is the positioned ancestor for the canvas plus every overlay (mobile pill/sheet, desktop refresh/recenter buttons) — its own position/size is what actually differs by breakpoint. */}
-      <div className={`fixed inset-0 z-0 xl:relative xl:inset-auto xl:z-auto xl:rounded-3xl xl:overflow-hidden xl:border xl:border-border xl:shadow-lg ${mode !== "browse" ? "xl:h-[380px]" : "xl:h-[420px]"}`}>
-        <div ref={containerRef} className="absolute inset-0" style={{ width: "100%", height: "100%" }} />
-
-        {/* Desktop floating buttons over the boxed map */}
-        <div className="hidden xl:contents">
-          {mode === "browse" && (
-            <button onClick={fetchDrivers} className="absolute top-3 right-3 z-[5] bg-card border border-border rounded-xl px-3 py-1.5 text-xs font-medium shadow hover:bg-muted transition-colors">
-              Refresh
-            </button>
-          )}
-          {mode === "trip" && loadingRoute && (
-            <div className="absolute inset-0 flex items-center justify-center bg-background/30 backdrop-blur-sm z-[5]">
-              <div className="bg-card rounded-2xl px-5 py-3 shadow-lg text-sm text-muted-foreground animate-pulse flex items-center gap-2">
-                <Navigation className="size-4 text-primary animate-spin" /> Finding best route…
-              </div>
-            </div>
-          )}
-          <button onClick={recenter} aria-label="Re-center map" className="absolute bottom-3 right-3 z-[5] size-9 rounded-full bg-card border border-border shadow flex items-center justify-center hover:bg-muted transition-colors">
-            <Crosshair className="size-4 text-foreground" />
-          </button>
-        </div>
-
-        {/* ══════════════════════════ Mobile immersive chrome (< xl) ══════════════════════════ */}
-        <div className="xl:hidden">
-          {/* Floating top pill */}
-        <div className="absolute top-4 left-4 right-4 z-10 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-slate-900/80 text-white backdrop-blur-md shadow-lg">
-            {mode === "driving" ? <Car className="size-4" /> : mode === "trip" ? <Navigation className="size-4" /> : <MapPin className="size-4" />}
-            <span className="text-sm font-medium">
-              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? "Trip Route" : "Live Map"}
+        {/* ── Floating header ── */}
+        <div className="absolute top-4 left-4 right-4 z-10 flex items-center justify-between gap-3 pointer-events-none">
+          <div className="pointer-events-auto flex items-center gap-2 px-4 py-2 rounded-full bg-slate-900/75 text-white backdrop-blur-md shadow-lg min-w-0">
+            {mode === "driving" ? <Car className="size-4 shrink-0" /> : mode === "trip" ? <Navigation className="size-4 shrink-0" /> : <MapPin className="size-4 shrink-0" />}
+            <span className="text-sm font-medium truncate">
+              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? `Trip with ${tripRoute?.partnerName}` : "Live Map"}
             </span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="pointer-events-auto flex items-center gap-2 shrink-0">
             {(mode === "trip" || mode === "driving") && (
               <button
                 onClick={mode === "trip" ? onClearRoute : onStopDriving}
-                aria-label="Close"
-                className="size-10 rounded-full bg-slate-900/80 text-white backdrop-blur-md shadow-lg flex items-center justify-center"
+                aria-label={mode === "trip" ? "Close trip route" : "End navigation"}
+                className="size-10 rounded-full bg-slate-900/75 text-white backdrop-blur-md shadow-lg flex items-center justify-center hover:bg-slate-900"
               >
                 <X className="size-4" />
               </button>
@@ -863,16 +758,25 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
             <button
               onClick={recenter}
               aria-label="Re-center map"
-              className="size-10 rounded-full bg-slate-900/80 text-white backdrop-blur-md shadow-lg flex items-center justify-center"
+              title="Re-center"
+              className="size-10 rounded-full bg-slate-900/75 text-white backdrop-blur-md shadow-lg flex items-center justify-center hover:bg-slate-900"
             >
               <Crosshair className="size-4" />
             </button>
           </div>
         </div>
 
-        {/* Bottom sheet drawer */}
+        {mode === "trip" && loadingRoute && (
+          <div className="absolute inset-0 z-[5] flex items-center justify-center pointer-events-none">
+            <div className="bg-slate-900/85 text-white rounded-2xl px-5 py-3 shadow-lg text-sm animate-pulse flex items-center gap-2 backdrop-blur-md">
+              <Navigation className="size-4 animate-spin" /> Finding best route…
+            </div>
+          </div>
+        )}
+
+        {/* ── Bottom sheet drawer (a floating card on desktop) ── */}
         <div
-          className={`absolute left-0 right-0 bottom-0 z-10 rounded-t-3xl border-t border-white/10 bg-slate-900/90 text-white backdrop-blur-md shadow-[0_-8px_30px_rgba(0,0,0,.3)] overflow-hidden ${sheetDragPx == null ? "transition-[max-height] duration-300" : ""} ${sheetExpanded ? "max-h-[70vh]" : "max-h-[220px]"}`}
+          className={`absolute left-0 right-0 bottom-0 z-10 rounded-t-3xl border-t border-white/10 bg-slate-900/90 text-white backdrop-blur-md shadow-[0_-8px_30px_rgba(0,0,0,.3)] overflow-hidden xl:left-4 xl:right-auto xl:bottom-4 xl:w-[400px] xl:rounded-3xl xl:border ${sheetDragPx == null ? "transition-[max-height] duration-300" : ""} ${sheetExpanded ? "max-h-[70vh]" : "max-h-[220px]"}`}
           style={sheetDragPx != null ? { maxHeight: sheetDragPx } : undefined}
         >
           <button
@@ -896,6 +800,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                     onChange={e => { setSearchText(e.target.value); runSearch(e.target.value) }}
                     onFocus={() => setSheetExpanded(true)}
                     placeholder="Where to?"
+                    aria-label="Where to?"
                     className="w-full pl-10 pr-4 py-3 rounded-2xl bg-white/10 text-white placeholder:text-white/50 text-sm focus:outline-none focus:ring-2 focus:ring-white/30"
                   />
                 </div>
@@ -919,7 +824,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                           <span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-60" />
                           <span className="relative rounded-full size-2.5 bg-green-400" />
                         </span>
-                        {nearbyCount} driver{nearbyCount !== 1 ? "s" : ""} nearby
+                        {userCoords ? `${nearbyCount} driver${nearbyCount !== 1 ? "s" : ""} nearby` : "Enable location to see nearby drivers"}
                       </span>
                       {sheetExpanded ? <ChevronDown className="size-4 text-white/60" /> : <ChevronUp className="size-4 text-white/60" />}
                     </button>
@@ -934,26 +839,42 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                             {sharing ? "📡 Sharing your location" : "Share my location as a driver"}
                           </button>
                         )}
+                        {selected && (
+                          <div className="rounded-2xl bg-white/10 p-3.5 space-y-2.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Selected driver</p>
+                                <p className="text-sm font-semibold truncate">{selected.display_name} · {selected.vehicle ?? selected.car_type ?? "Driver"}</p>
+                              </div>
+                              <button onClick={() => { setSelected(null); setNearbyRoute(null) }} aria-label="Clear selected driver" className="p-1 rounded-lg text-white/60 hover:text-white hover:bg-white/10"><X className="size-4" /></button>
+                            </div>
+                            {loadingRoute && !nearbyRoute && <p className="text-xs text-white/60 animate-pulse">Calculating route…</p>}
+                            {nearbyRoute && (
+                              <div className="grid grid-cols-3 gap-2">
+                                {[["Distance", `${nearbyRoute.distance_km} km`], ["ETA", `${nearbyRoute.duration_minutes} min`], ["Fare", `$${(nearbyRoute.fare_suggestion_cents / 100).toFixed(2)}`]].map(([label, value]) => (
+                                  <div key={label} className="bg-white/10 rounded-xl p-2 text-center">
+                                    <p className="text-[10px] text-white/50">{label}</p>
+                                    <p style={MONO} className="text-sm font-semibold mt-0.5">{value}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
                         {drivers.map(d => (
-                          <button key={d.user_id} onClick={() => setSelected(d)} className={`w-full text-left rounded-2xl p-3.5 flex items-center gap-3 transition-colors ${selected?.user_id === d.user_id ? "bg-white/15" : "bg-white/5 hover:bg-white/10"}`}>
+                          <button key={d.user_id} onClick={() => setSelected(d)} className={`w-full text-left rounded-2xl p-3.5 flex items-center gap-3 transition-colors ${selected?.user_id === d.user_id ? "bg-white/15 ring-1 ring-sky-400/60" : "bg-white/5 hover:bg-white/10"}`}>
                             <span className="text-xl">{CAR_EMOJIS[d.car_type ?? ""] ?? "🚗"}</span>
                             <div className="flex-1 min-w-0">
                               <p className="text-sm font-semibold">{d.display_name}</p>
                               <p className="text-xs text-white/60">{d.vehicle ?? d.car_type ?? "Driver"}</p>
                             </div>
-                            <span style={MONO} className="text-xs text-white/60 shrink-0">{d.distance_meters}m</span>
+                            <span style={MONO} className="text-xs text-white/60 shrink-0">{formatDistance(d.distance_meters)}</span>
                           </button>
                         ))}
-                        {drivers.length === 0 && <p className="text-xs text-white/50 text-center py-3">No drivers nearby right now.</p>}
-                        {selected && nearbyRoute && (
-                          <div className="grid grid-cols-3 gap-2 pt-1">
-                            {[["Distance", `${nearbyRoute.distance_km} km`], ["ETA", `${nearbyRoute.duration_minutes} min`], ["Fare", `$${(nearbyRoute.fare_suggestion_cents / 100).toFixed(2)}`]].map(([label, value]) => (
-                              <div key={label} className="bg-white/10 rounded-xl p-2 text-center">
-                                <p className="text-[10px] text-white/50">{label}</p>
-                                <p style={MONO} className="text-sm font-semibold mt-0.5">{value}</p>
-                              </div>
-                            ))}
-                          </div>
+                        {drivers.length === 0 && (
+                          <p className="text-xs text-white/50 text-center py-3">
+                            {userCoords ? "No drivers nearby right now. Drivers appear when they share their location." : "Location access is off, so nearby drivers can't be shown."}
+                          </p>
                         )}
                       </div>
                     )}
@@ -964,14 +885,24 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
             {mode === "trip" && tripRoute && (
               <div className="space-y-3">
-                <div>
-                  <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Pickup</p>
-                  <p className="text-sm font-semibold truncate">{tripRoute.pickupLabel}</p>
+                <div className="flex items-stretch gap-3">
+                  <div className="flex flex-col items-center pt-1 pb-1">
+                    <span className="size-2.5 rounded-full bg-green-400" />
+                    <span className="w-px flex-1 bg-white/20 my-1" />
+                    <span className="size-2.5 rounded-full bg-red-400" />
+                  </div>
+                  <div className="min-w-0 space-y-2">
+                    <div>
+                      <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Pickup</p>
+                      <p className="text-sm font-semibold truncate">{tripRoute.pickupLabel}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Destination</p>
+                      <p className="text-sm font-semibold truncate">{tripRoute.destLabel}</p>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Destination</p>
-                  <p className="text-sm font-semibold truncate">{tripRoute.destLabel}</p>
-                </div>
+                <p className="text-xs text-white/50">{tripRoute.partnerName} · {tripRoute.date}</p>
                 {loadingRoute && <p className="text-sm text-white/60 animate-pulse">Calculating route…</p>}
                 {osrmResult && (
                   <div className="grid grid-cols-3 gap-2">
@@ -988,8 +919,11 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
             {mode === "driving" && drivingTo && (
               <div className="space-y-3">
-                <p className="text-sm font-semibold truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
-                {drivingGeoError && <p className="text-sm text-red-300">Couldn't access your location.</p>}
+                <div>
+                  <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Picking up</p>
+                  <p className="text-sm font-semibold truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
+                </div>
+                {drivingGeoError && <p className="text-sm text-red-300">Couldn't access your location. Enable location access to navigate.</p>}
                 {!drivingGeoError && drivingLoadingRoute && !drivingRoute && <p className="text-sm text-white/60 animate-pulse">Calculating route…</p>}
                 {drivingRoute && (
                   <div className="grid grid-cols-2 gap-2">
@@ -1007,100 +941,31 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           </div>
         </div>
       </div>
-      </div>
-
-      {/* ══════════════════════════ Desktop below-map lists (xl and up) ══════════════════════════ */}
-      <div className="hidden xl:block xl:space-y-4">
-        {mode === "browse" && selected && (
-          <div className="bg-card border border-border rounded-3xl p-5 space-y-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs text-muted-foreground">Nearby driver</p>
-                <h3 className="text-lg font-semibold">{selected.display_name}</h3>
-                <p className="text-sm text-muted-foreground">{selected.vehicle ?? selected.car_type ?? "Unknown vehicle"} · {selected.distance_meters}m away</p>
-              </div>
-              <button onClick={() => { setSelected(null); setRouteLine(null) }} className="text-muted-foreground hover:text-foreground text-sm">✕</button>
-            </div>
-            {loadingRoute && <p className="text-sm text-muted-foreground animate-pulse">Calculating route…</p>}
-            {nearbyRoute && (
-              <div className="grid grid-cols-3 gap-3">
-                {[["Distance", `${nearbyRoute.distance_km} km`], ["Est. time", `${nearbyRoute.duration_minutes} min`], ["Your fare", `$${(nearbyRoute.fare_suggestion_cents / 100).toFixed(2)}`]].map(([label, value]) => (
-                  <div key={label} className="bg-muted rounded-2xl p-3 text-center">
-                    <p className="text-xs text-muted-foreground">{label}</p>
-                    <p style={MONO} className="text-base font-semibold text-foreground mt-1">{value}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {mode === "browse" && drivers.length > 0 && (
-          <div className="space-y-2">
-            <p className="text-sm font-medium text-muted-foreground">{drivers.length} driver{drivers.length !== 1 ? "s" : ""} nearby</p>
-            {drivers.map(d => (
-              <button key={d.user_id} onClick={() => setSelected(d)} className={`w-full text-left bg-card border rounded-2xl p-4 flex items-center gap-4 hover:shadow-md transition-all ${selected?.user_id === d.user_id ? "border-primary/40 bg-primary/5" : "border-border"}`}>
-                <span className="text-2xl">{CAR_EMOJIS[d.car_type ?? ""] ?? "🚗"}</span>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-semibold">{d.display_name}</p>
-                  <p className="text-xs text-muted-foreground">{d.vehicle ?? d.car_type ?? "Driver"}</p>
-                </div>
-                <span style={MONO} className="text-xs text-muted-foreground shrink-0">{d.distance_meters}m</span>
-              </button>
-            ))}
-          </div>
-        )}
-
-        {mode === "browse" && drivers.length === 0 && !userCoords && (
-          <div className="text-center py-12 text-muted-foreground">
-            <MapPin className="size-10 mx-auto mb-3 opacity-20" />
-            <p className="font-medium">Location not available</p>
-            <p className="text-sm mt-1">Enable location access to see nearby drivers.</p>
-          </div>
-        )}
-
-        {mode === "browse" && drivers.length === 0 && userCoords && (
-          <div className="text-center py-12 text-muted-foreground">
-            <p className="text-4xl mb-3">🚗</p>
-            <p className="font-medium">No drivers nearby right now</p>
-            <p className="text-sm mt-1">Drivers appear when they share their location.</p>
-          </div>
-        )}
-      </div>
 
       <style>{`
         @keyframes userPulse { 0%,100%{box-shadow:0 0 0 3px ${accentColor}80} 50%{box-shadow:0 0 0 6px ${accentColor}40} }
 
-        /* Car marker: emoji badge + rotating heading wedge, Uber-style */
-        .carpool-car-icon { position:relative; width:38px; height:38px; }
+        /* Car marker: top-down SVG car rotated to the driver's heading, Uber-style */
+        .carpool-car-icon { position:relative; width:40px; height:40px; cursor:pointer; }
         .carpool-car-icon::before {
-          content:""; position:absolute; inset:0; border-radius:50%; background:var(--carpool-accent); opacity:0;
+          content:""; position:absolute; inset:2px; border-radius:50%; background:var(--carpool-accent); opacity:0;
         }
         .carpool-car-icon.tracking::before { animation: carpoolTrackPulse 1.6s ease-out infinite; }
-        .carpool-car-heading { position:absolute; inset:0; transform-origin:50% 50%; }
-        .carpool-car-heading::after {
-          content:""; position:absolute; top:-2px; left:50%; margin-left:-5px;
-          width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent;
-          border-bottom:9px solid var(--carpool-accent); filter:drop-shadow(0 1px 1px rgba(0,0,0,.4));
+        .carpool-car-body {
+          position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          transform-origin:50% 50%; filter:drop-shadow(0 2px 4px rgba(0,0,0,.55));
         }
-        .carpool-car-emoji {
-          position:absolute; inset:0; margin:auto; width:30px; height:30px; font-size:18px; line-height:1;
-          display:flex; align-items:center; justify-content:center; border-radius:50%; background:#fff;
-          box-shadow:0 2px 8px rgba(0,0,0,.35), 0 0 0 2px var(--carpool-accent);
-        }
-        .carpool-car-icon.tracking .carpool-car-emoji { box-shadow:0 2px 10px rgba(0,0,0,.4), 0 0 0 3px var(--carpool-accent); }
-        .dark .carpool-car-emoji { background:#111a2e; }
         @keyframes carpoolTrackPulse {
           0% { opacity:.35; transform:scale(1); }
-          100% { opacity:0; transform:scale(2.6); }
+          100% { opacity:0; transform:scale(2.4); }
         }
 
         /* Minimize the MapLibre attribution control to a small floating icon */
         .maplibregl-ctrl-attrib { background: rgba(15,23,42,.55) !important; border-radius: 8px; }
         .maplibregl-ctrl-attrib a { color: #cbd5e1 !important; }
-        .maplibregl-popup-content { background:#fff; color:#0f172a; border-radius:10px; font-size:12px; padding:8px 10px; }
-        .dark .maplibregl-popup-content { background:#111a2e; color:#e2e8f0; }
-        .dark .maplibregl-popup-tip { border-top-color:#111a2e !important; border-bottom-color:#111a2e !important; }
+        .maplibregl-ctrl-top-left { top: 64px; }
+        .maplibregl-popup-content { background:#111a2e; color:#e2e8f0; border-radius:10px; font-size:12px; padding:8px 10px; }
+        .maplibregl-popup-tip { border-top-color:#111a2e !important; border-bottom-color:#111a2e !important; }
       `}</style>
     </div>
   )

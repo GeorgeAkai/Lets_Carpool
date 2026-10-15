@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from math import asin, cos, radians, sin, sqrt
@@ -10,6 +12,7 @@ from uuid import uuid4
 import psycopg2.extras
 
 from backend.app.db import close_pool, get_conn, init_pool, run_migrations
+from backend.app.routing import OSRMClient
 
 
 ListingStatus = Literal["open", "expired", "matched", "cancelled", "completed"]
@@ -26,11 +29,23 @@ _GAS_PRICE_PER_GALLON_USD = 3.50
 _MPG_DEFAULT = 28.0
 _KM_PER_MILE = 1.60934
 
+# Corridor matching: how far a rider's pickup/destination may be from the
+# driver's route, and how many corridor survivors get a (routed) detour estimate.
+ROUTE_BUFFER_METERS = 1000
+MAX_DETOUR_CANDIDATES = 10
+
 PENDING_CANNED_MESSAGES = {
     "timing": "Can we coordinate the exact timing?",
     "pickup": "Can we confirm the pickup area?",
     "luggage": "I have a luggage question.",
 }
+
+
+# Sentinel for "field not sent — keep the stored value" on partial updates.
+_KEEP: Any = object()
+
+_PHONE_RE = re.compile(r"^\+?[0-9 ()\-]{7,20}$")
+_PLATE_RE = re.compile(r"^[A-Za-z0-9 \-]{2,10}$")
 
 
 class DomainError(ValueError):
@@ -83,6 +98,7 @@ class User:
     status: str = "active"
     suspended_at: datetime | None = None
     suspended_reason: str | None = None
+    id_verified: bool = False
 
 
 @dataclass
@@ -94,6 +110,7 @@ class Profile:
     photo_verified: bool = False
     interests: list[str] = field(default_factory=list)
     nationality: str | None = None
+    phone: str | None = None
 
 
 @dataclass
@@ -107,6 +124,7 @@ class Vehicle:
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
+    plate: str | None = None
 
 
 @dataclass
@@ -141,6 +159,9 @@ class RideRequest:
     luggage_size: str = "none"
     preferred_car_type: str | None = None
     notes: str | None = None
+    departure_time: time | None = None
+    # Minutes this rider would add to a driver's trip; only set on driver-side proposals.
+    detour_minutes: float | None = None
 
 
 @dataclass
@@ -159,6 +180,15 @@ class DriverTrip:
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = None
+    departure_time: time | None = None
+    price_per_seat_cents: int | None = None
+    auto_accept_verified: bool = False
+    series_id: str | None = None
+    route_distance_m: float | None = None
+    route_duration_s: float | None = None
+    # Minutes added to this trip if the searching rider is picked up. Only set
+    # on corridor-search results (needs the rider's pickup + destination).
+    detour_minutes: float | None = None
 
 
 @dataclass
@@ -171,6 +201,7 @@ class Connection:
     created_at: datetime
     updated_at: datetime
     completed_confirmed_by: list[str] = field(default_factory=list)
+    rider_at_pickup_at: datetime | None = None
 
 
 @dataclass
@@ -279,6 +310,7 @@ def _row_to_user(r: dict) -> User:
         provider=r["provider"], provider_subject=r["provider_subject"],
         created_at=r["created_at"], status=r.get("status", "active"),
         suspended_at=r.get("suspended_at"), suspended_reason=r.get("suspended_reason"),
+        id_verified=bool(r.get("id_verified") or False),
     )
 
 def _row_to_report(r: dict) -> Report:
@@ -303,6 +335,7 @@ def _row_to_profile(r: dict) -> Profile:
         photo_url=r["photo_url"], bio=r["bio"],
         photo_verified=r["photo_verified"],
         interests=list(r["interests"] or []), nationality=r["nationality"],
+        phone=r.get("phone"),
     )
 
 def _row_to_vehicle(r: dict) -> Vehicle:
@@ -311,6 +344,7 @@ def _row_to_vehicle(r: dict) -> Vehicle:
         color=r["color"], seats=r["seats"], car_type=r["car_type"],
         has_license=r["has_license"], has_insurance=r["has_insurance"],
         has_good_driving_record=r["has_good_driving_record"],
+        plate=r.get("plate"),
     )
 
 def _row_to_location(r: dict) -> Location:
@@ -336,8 +370,24 @@ def _row_to_ride_request(r: dict) -> RideRequest:
         status=r["status"], created_at=r["created_at"],
         luggage_size=r["luggage_size"] or "none",
         preferred_car_type=r["preferred_car_type"],
-        notes=r["notes"],
+        notes=r["notes"], departure_time=r.get("departure_time"),
     )
+
+def _proposal_score(detour_minutes: float | None, trip: DriverTrip, rr: RideRequest) -> float:
+    """0..1: 70% detour (0 min = 1, 15+ min or unknown = 0), 30% date/flexibility
+    closeness. Mirrors the frontend's Best Matches weighting minus the
+    profile-based terms, which a proposal doesn't have."""
+    detour = 0.0 if detour_minutes is None else max(0.0, 1 - detour_minutes / 15)
+    days = abs((trip.target_date - rr.target_date).days)
+    date_score = 1.0 if days == 0 else 0.7
+    if trip.flexibility == rr.flexibility:
+        flex_score = 1.0
+    elif "flexible" in (trip.flexibility, rr.flexibility):
+        flex_score = 0.6
+    else:
+        flex_score = 0.2
+    return 0.7 * detour + 0.3 * (0.6 * date_score + 0.4 * flex_score)
+
 
 def _row_to_driver_trip(r: dict) -> DriverTrip:
     return DriverTrip(
@@ -350,7 +400,11 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         status=r["status"], created_at=r["created_at"],
         luggage_capacity=r["luggage_capacity"] or "medium",
         car_type=r["car_type"],
-        notes=r["notes"],
+        notes=r["notes"], departure_time=r.get("departure_time"),
+        price_per_seat_cents=r.get("price_per_seat_cents"),
+        auto_accept_verified=bool(r.get("auto_accept_verified") or False),
+        series_id=r.get("series_id"),
+        route_distance_m=r.get("route_distance_m"), route_duration_s=r.get("route_duration_s"),
     )
 
 def _row_to_connection(r: dict) -> Connection:
@@ -361,6 +415,7 @@ def _row_to_connection(r: dict) -> Connection:
         status=r["status"], created_at=r["created_at"],
         updated_at=r["updated_at"],
         completed_confirmed_by=list(r["completed_confirmed_by"] or []),
+        rider_at_pickup_at=r.get("rider_at_pickup_at"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -416,7 +471,10 @@ def _row_to_pool_message(r: dict) -> PoolMessage:
 # ─── Store ────────────────────────────────────────────────────────────────────
 
 class Store:
-    def __init__(self, database_url: str) -> None:
+    def __init__(self, database_url: str, router: OSRMClient | None = None) -> None:
+        # Optional: with no router, trips are stored without a route and search
+        # falls back to endpoint-radius matching.
+        self.router = router
         run_migrations(database_url)
         # Closes any pool from a previous Store instance in this process before
         # opening a new one — otherwise each new Store() (every test's client())
@@ -474,7 +532,12 @@ class Store:
     def update_profile(
         self, user_id: str, display_name: str, photo_url: str | None, bio: str | None,
         interests: list[str] | None = None, nationality: str | None = None,
+        phone: Any = _KEEP,
     ) -> Profile:
+        if phone is not _KEEP:
+            phone = (phone or "").strip() or None
+            if phone and not _PHONE_RE.match(phone):
+                raise DomainError("Enter a valid phone number")
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
@@ -488,6 +551,8 @@ class Store:
                        nationality  = EXCLUDED.nationality""",
                 (user_id, display_name, photo_url, bio, interests or [], nationality),
             )
+            if phone is not _KEEP:
+                cur.execute("UPDATE profiles SET phone = %s WHERE user_id = %s", (phone, user_id))
             cur.execute("SELECT * FROM profiles WHERE user_id = %s", (user_id,))
             return _row_to_profile(cur.fetchone())
 
@@ -519,6 +584,11 @@ class Store:
     def update_vehicle(self, user_id: str, data: dict[str, Any]) -> Vehicle:
         if data.get("car_type") and data["car_type"] not in ALLOWED_CAR_TYPES:
             raise DomainError(f"Invalid car type: {data['car_type']}")
+        if data.get("plate") is not None:
+            plate = data["plate"].strip().upper()
+            if plate and not _PLATE_RE.match(plate):
+                raise DomainError("Enter a valid license plate")
+            data = {**data, "plate": plate or None}
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute("SELECT * FROM vehicles WHERE user_id = %s", (user_id,))
@@ -528,6 +598,8 @@ class Store:
                       "has_license", "has_insurance", "has_good_driving_record"):
                 if f in data and data[f] is not None:
                     setattr(v, f, data[f])
+            if "plate" in data:
+                v.plate = data["plate"]
             cur.execute(
                 """INSERT INTO vehicles (user_id, make, model, color, seats, car_type,
                        has_license, has_insurance, has_good_driving_record)
@@ -542,6 +614,7 @@ class Store:
                 (v.user_id, v.make, v.model, v.color, v.seats, v.car_type,
                  v.has_license, v.has_insurance, v.has_good_driving_record),
             )
+            cur.execute("UPDATE vehicles SET plate = %s WHERE user_id = %s", (v.plate, v.user_id))
             return v
 
     def get_vehicle(self, user_id: str) -> Vehicle | None:
@@ -609,7 +682,7 @@ class Store:
             passenger_count=passenger_count, tags=tags,
             status="open", created_at=now_utc(),
             luggage_size=luggage_size, preferred_car_type=preferred_car_type,
-            notes=notes,
+            notes=notes, departure_time=data.get("departure_time"),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -617,12 +690,12 @@ class Store:
                 """INSERT INTO ride_requests (id, rider_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        passenger_count, tags, status, created_at, luggage_size,
-                       preferred_car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       preferred_car_type, notes, departure_time)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (rr.id, rr.rider_id, rr.pickup_location_id,
                  rr.destination_location_id, rr.target_date, rr.flexibility,
                  rr.passenger_count, rr.tags, rr.status, rr.created_at,
-                 rr.luggage_size, rr.preferred_car_type, rr.notes),
+                 rr.luggage_size, rr.preferred_car_type, rr.notes, rr.departure_time),
             )
         return rr
 
@@ -639,6 +712,20 @@ class Store:
             cur.execute("UPDATE ride_requests SET status = 'cancelled' WHERE id = %s", (request_id,))
             rr.status = "cancelled"
             return rr
+
+    def update_ride_request_pickup(self, user_id: str, request_id: str, pickup_location_id: str) -> RideRequest:
+        rr = self.get_ride_request(request_id)
+        if rr.rider_id != user_id:
+            raise DomainError("Only the rider can update this request's pickup", 403)
+        self.get_location(pickup_location_id)  # 404s if it doesn't exist
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE ride_requests SET pickup_location_id = %s WHERE id = %s",
+                (pickup_location_id, request_id),
+            )
+        rr.pickup_location_id = pickup_location_id
+        return rr
 
     def get_ride_request(self, request_id: str) -> RideRequest:
         with get_conn() as conn:
@@ -673,6 +760,9 @@ class Store:
         if car_type and car_type not in ALLOWED_CAR_TYPES:
             raise DomainError(f"Invalid car type: {car_type}")
         notes = (data.get("notes") or "").strip() or None
+        price = data.get("price_per_seat_cents")
+        if price is not None and not (0 <= int(price) <= 100_000):
+            raise DomainError("Price per seat must be between $0 and $1,000")
 
         trip = DriverTrip(
             id=new_id("trp"), driver_id=driver_id,
@@ -682,23 +772,111 @@ class Store:
             seats_available=seats_available, seats_reserved=0,
             tags=tags, status="open", created_at=now_utc(),
             luggage_capacity=luggage_capacity, car_type=car_type,
-            notes=notes,
+            notes=notes, departure_time=data.get("departure_time"),
+            price_per_seat_cents=None if price is None else int(price),
+            auto_accept_verified=bool(data.get("auto_accept_verified")),
+            series_id=data.get("series_id"),
         )
+        # One routing call per trip creation (not per search). Done before
+        # opening the DB connection so a slow OSRM doesn't hold a pooled one.
+        route_wkt, route_distance_m, route_duration_s = data.get("_route") or self._compute_trip_route(trip)
+        trip.route_distance_m, trip.route_duration_s = route_distance_m, route_duration_s
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
                 """INSERT INTO driver_trips (id, driver_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        seats_available, seats_reserved, tags, status, created_at,
-                       luggage_capacity, car_type, notes)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       luggage_capacity, car_type, notes,
+                       route_geog, route_distance_m, route_duration_s,
+                       departure_time, price_per_seat_cents, auto_accept_verified, series_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           ST_GeogFromText(%s), %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
                  trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
-                 trip.notes),
+                 trip.notes, route_wkt, route_distance_m, route_duration_s,
+                 trip.departure_time, trip.price_per_seat_cents, trip.auto_accept_verified,
+                 trip.series_id),
             )
+        self._fulfil_ride_alerts(trip)
         return trip
+
+    def create_driver_trip_series(self, driver_id: str, data: dict[str, Any], weekdays: list[int]) -> list[DriverTrip]:
+        """'Repeat on weekdays': one trip per matching day in the 7 days starting
+        at target_date (target_date itself always included), linked by series_id
+        so riders can book any day of the week. Each day stays an ordinary
+        one-off trip for search, seats and expiry."""
+        if any(d not in range(7) for d in weekdays):
+            raise DomainError("Weekdays must be 0 (Mon) to 6 (Sun)")
+        start: date = data["target_date"]
+        days = [start] + [start + timedelta(days=i) for i in range(1, 7)
+                          if (start + timedelta(days=i)).weekday() in set(weekdays)]
+        series_id = new_id("ser")
+        first = self.create_driver_trip(driver_id, {**data, "series_id": series_id})
+        # Same route for every day: reuse the first day's routing result.
+        route = (None, first.route_distance_m, first.route_duration_s)
+        if first.route_distance_m is not None:
+            with get_conn() as conn:
+                cur = self._cur(conn)
+                cur.execute("SELECT ST_AsText(route_geog) AS wkt FROM driver_trips WHERE id = %s", (first.id,))
+                row = cur.fetchone()
+                route = (row["wkt"] if row else None, first.route_distance_m, first.route_duration_s)
+        trips = [first]
+        for day in days[1:]:
+            trips.append(self.create_driver_trip(
+                driver_id, {**data, "target_date": day, "series_id": series_id, "_route": route}))
+        return trips
+
+    # ─── Pricing / timing ─────────────────────────────────────────────────────
+
+    def trip_distance_km(self, trip: DriverTrip) -> float:
+        if trip.route_distance_m:
+            return trip.route_distance_m / 1000
+        pickup = self.get_location(trip.pickup_location_id)
+        destination = self.get_location(trip.destination_location_id)
+        # Straight-line distance understates roads; 1.25 is a typical detour index.
+        return haversine_meters(pickup.latitude, pickup.longitude,
+                                destination.latitude, destination.longitude) / 1000 * 1.25
+
+    def trip_duration_minutes(self, trip: DriverTrip) -> float:
+        if trip.route_duration_s:
+            return trip.route_duration_s / 60
+        return self.trip_distance_km(trip) / 50 * 60  # ~50 km/h mixed driving
+
+    def trip_pricing(self, trip: DriverTrip) -> dict[str, Any]:
+        """Gas cost for the whole trip, split evenly between the driver and every
+        offered seat — cost-neutral for the driver. A driver-set price wins."""
+        distance_km = self.trip_distance_km(trip)
+        gas_cents = calculate_fare_cents(distance_km, 1)
+        suggested = max(100, round(gas_cents / (trip.seats_available + 1)))
+        return {
+            "distance_km": round(distance_km, 1),
+            "gas_cost_cents": gas_cents,
+            "split_between": trip.seats_available + 1,
+            "suggested_price_cents": suggested,
+            "price_per_seat_cents": trip.price_per_seat_cents if trip.price_per_seat_cents is not None else suggested,
+        }
+
+    def trip_arrival_time(self, trip: DriverTrip) -> time | None:
+        if trip.departure_time is None:
+            return None
+        start = datetime.combine(trip.target_date, trip.departure_time)
+        return (start + timedelta(minutes=round(self.trip_duration_minutes(trip)))).time()
+
+    def _compute_trip_route(self, trip: DriverTrip) -> tuple[str | None, float | None, float | None]:
+        if self.router is None:
+            return None, None, None
+        pickup = self.get_location(trip.pickup_location_id)
+        destination = self.get_location(trip.destination_location_id)
+        route = self.router.route([
+            (pickup.latitude, pickup.longitude), (destination.latitude, destination.longitude),
+        ])
+        wkt = route.to_wkt() if route else None
+        if route is None or wkt is None:
+            return None, None, None
+        return wkt, route.distance_m, route.duration_s
 
     def cancel_driver_trip(self, user_id: str, trip_id: str) -> DriverTrip:
         with get_conn() as conn:
@@ -762,13 +940,22 @@ class Store:
         # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
         # once a listing has already been archived once.
         self.expire_listings(now_utc().date())
-        joins, geo_conditions, geo_params = self._geo_search_clauses(
-            query, "dt.destination_location_id", "dt.pickup_location_id",
-        )
+        corridor = self._corridor_search(query)
+        if corridor:
+            joins, geo_conditions, geo_params = corridor
+        else:
+            joins, geo_conditions, geo_params = self._geo_search_clauses(
+                query, "dt.destination_location_id", "dt.pickup_location_id",
+            )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                f"""SELECT DISTINCT dt.* FROM driver_trips dt
+                f"""SELECT DISTINCT dt.*,
+                          tp.latitude AS trip_pickup_lat, tp.longitude AS trip_pickup_lng,
+                          td.latitude AS trip_dest_lat, td.longitude AS trip_dest_lng
+                   FROM driver_trips dt
+                   JOIN locations tp ON tp.id = dt.pickup_location_id
+                   JOIN locations td ON td.id = dt.destination_location_id
                    {joins}
                    WHERE dt.status IN ('open', 'matched')
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
@@ -783,9 +970,224 @@ class Store:
                    ORDER BY dt.created_at DESC""",
                 (user_id, *geo_params, user_id, user_id),
             )
-            trips = [_row_to_driver_trip(r) for r in cur.fetchall()]
+            rows = cur.fetchall()
 
+        trips = [_row_to_driver_trip(r) for r in rows]
+        if corridor:
+            self._attach_detours(trips, rows, query)
         return [t for t in trips if self._listing_matches_query(t, query)]
+
+    # ─── Proposed matches (Empower-style) ─────────────────────────────────────
+
+    def propose_match(self, user_id: str, ride_request_id: str) -> dict[str, Any]:
+        """The system's single best driver trip for a rider's open request.
+
+        Not a new connection state: a proposal is just a ranked search the rider
+        answers by accepting (POST /connections, as before) or skipping
+        (skip_match). Candidates are the corridor search over the request's own
+        pickup/destination, minus trips already skipped or connected to this
+        request, trips without enough free seats, and dates more than a day
+        apart. Ranked mostly by detour, with date/flexibility closeness second."""
+        rr = self.get_ride_request(ride_request_id)
+        if rr.rider_id != user_id:
+            raise DomainError("Only the rider can get proposals for this request", 403)
+        if rr.status != "open":
+            return {"trip": None, "remaining": 0}
+        pickup = self.get_location(rr.pickup_location_id)
+        destination = self.get_location(rr.destination_location_id)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT driver_trip_id FROM match_skips WHERE ride_request_id = %s", (rr.id,))
+            excluded = {r["driver_trip_id"] for r in cur.fetchall()}
+            cur.execute("SELECT driver_trip_id FROM connections WHERE ride_request_id = %s", (rr.id,))
+            excluded |= {r["driver_trip_id"] for r in cur.fetchall()}
+
+        candidates = self.search_driver_trips(user_id, {
+            "pickup_latitude": pickup.latitude, "pickup_longitude": pickup.longitude,
+            "destination_latitude": destination.latitude, "destination_longitude": destination.longitude,
+        })
+        eligible = [
+            t for t in candidates
+            if t.status == "open" and t.id not in excluded
+            and t.seats_available - t.seats_reserved >= rr.passenger_count
+            and abs((t.target_date - rr.target_date).days) <= 1
+        ]
+        eligible.sort(key=lambda t: -_proposal_score(t.detour_minutes, t, rr))
+        return {"trip": eligible[0] if eligible else None, "remaining": max(len(eligible) - 1, 0)}
+
+    def propose_rider(self, user_id: str, driver_trip_id: str) -> dict[str, Any]:
+        """Driver-side mirror of propose_match: the best open ride request along
+        a driver's own trip. Same corridor rules (both of the rider's points
+        within the buffer of the trip's route, destination ahead of pickup);
+        trips with no stored route fall back to endpoint radii. Accepting is a
+        driver-initiated POST /connections; skipping is remembered per trip."""
+        trip = self.get_driver_trip(driver_trip_id)
+        if trip.driver_id != user_id:
+            raise DomainError("Only the driver can get proposals for this trip", 403)
+        if trip.status != "open":
+            return {"request": None, "remaining": 0}
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT ride_request_id FROM driver_match_skips WHERE driver_trip_id = %s", (trip.id,))
+            excluded = {r["ride_request_id"] for r in cur.fetchall()}
+            cur.execute("SELECT ride_request_id FROM connections WHERE driver_trip_id = %s", (trip.id,))
+            excluded |= {r["ride_request_id"] for r in cur.fetchall()}
+            cur.execute(
+                """SELECT rr.*,
+                          rp.latitude AS rider_pickup_lat, rp.longitude AS rider_pickup_lng,
+                          rd.latitude AS rider_dest_lat, rd.longitude AS rider_dest_lng,
+                          tp.latitude AS trip_pickup_lat, tp.longitude AS trip_pickup_lng,
+                          td.latitude AS trip_dest_lat, td.longitude AS trip_dest_lng,
+                          t.route_duration_s
+                   FROM ride_requests rr
+                   JOIN locations rp ON rp.id = rr.pickup_location_id
+                   JOIN locations rd ON rd.id = rr.destination_location_id
+                   JOIN driver_trips t ON t.id = %s
+                   JOIN locations tp ON tp.id = t.pickup_location_id
+                   JOIN locations td ON td.id = t.destination_location_id
+                   WHERE rr.status = 'open'
+                   AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
+                   AND rr.rider_id != %s
+                   AND rr.passenger_count <= %s
+                   AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM blocks
+                       WHERE (blocker_id = %s AND blocked_id = rr.rider_id)
+                          OR (blocker_id = rr.rider_id AND blocked_id = %s)
+                   )
+                   AND (
+                       (t.route_geog IS NOT NULL
+                        AND ST_DWithin(t.route_geog, rp.geog, %s)
+                        AND ST_DWithin(t.route_geog, rd.geog, %s)
+                        AND ST_LineLocatePoint(t.route_geog::geometry, rp.geog::geometry)
+                            < ST_LineLocatePoint(t.route_geog::geometry, rd.geog::geometry))
+                       OR
+                       (t.route_geog IS NULL
+                        AND ST_DWithin(tp.geog, rp.geog, 5000)
+                        AND ST_DWithin(td.geog, rd.geog, 1000))
+                   )
+                   ORDER BY rr.created_at DESC""",
+                (trip.id, user_id, trip.seats_available - trip.seats_reserved,
+                 user_id, user_id, ROUTE_BUFFER_METERS, ROUTE_BUFFER_METERS),
+            )
+            rows = [r for r in cur.fetchall() if r["id"] not in excluded]
+
+        rows = [r for r in rows if abs((r["target_date"] - trip.target_date).days) <= 1]
+        requests = [_row_to_ride_request(r) for r in rows]
+        self._attach_request_detours(requests, rows)
+        requests.sort(key=lambda rr: -_proposal_score(rr.detour_minutes, trip, rr))
+        return {"request": requests[0] if requests else None, "remaining": max(len(requests) - 1, 0)}
+
+    def _attach_request_detours(self, requests: list[RideRequest], rows: list[dict]) -> None:
+        """Per-request insertion detour against the trip's stored route duration
+        (same definition as _attach_detours, other direction), capped, parallel."""
+        if self.router is None:
+            return
+        candidates = [
+            (rr, r) for rr, r in zip(requests, rows) if r.get("route_duration_s") is not None
+        ][:MAX_DETOUR_CANDIDATES]
+        if not candidates:
+            return
+
+        def detour(pair: tuple[RideRequest, dict]) -> float | None:
+            _, r = pair
+            with_rider = self.router.route([
+                (r["trip_pickup_lat"], r["trip_pickup_lng"]),
+                (r["rider_pickup_lat"], r["rider_pickup_lng"]),
+                (r["rider_dest_lat"], r["rider_dest_lng"]),
+                (r["trip_dest_lat"], r["trip_dest_lng"]),
+            ])
+            if with_rider is None:
+                return None
+            return round(max(0.0, (with_rider.duration_s - r["route_duration_s"]) / 60), 1)
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            for (rr, _), minutes in zip(candidates, pool.map(detour, candidates)):
+                rr.detour_minutes = minutes
+
+    def skip_rider(self, user_id: str, driver_trip_id: str, ride_request_id: str) -> None:
+        trip = self.get_driver_trip(driver_trip_id)
+        if trip.driver_id != user_id:
+            raise DomainError("Only the driver can skip proposals for this trip", 403)
+        self.get_ride_request(ride_request_id)  # 404s if it doesn't exist
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO driver_match_skips (driver_trip_id, ride_request_id) VALUES (%s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (driver_trip_id, ride_request_id),
+            )
+
+    def skip_match(self, user_id: str, ride_request_id: str, driver_trip_id: str) -> None:
+        rr = self.get_ride_request(ride_request_id)
+        if rr.rider_id != user_id:
+            raise DomainError("Only the rider can skip proposals for this request", 403)
+        self.get_driver_trip(driver_trip_id)  # 404s if it doesn't exist
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO match_skips (ride_request_id, driver_trip_id) VALUES (%s, %s)
+                   ON CONFLICT DO NOTHING""",
+                (ride_request_id, driver_trip_id),
+            )
+
+    @staticmethod
+    def _corridor_search(query: dict[str, Any]) -> tuple[str, str, list[Any]] | None:
+        """Route-corridor filter, used when the search carries both the rider's
+        pickup and destination: the driver's stored route must pass within the
+        buffer of both points, with the destination *ahead* of the pickup along
+        the route (ST_LineLocatePoint fractions) so an opposite-direction driver
+        on the same road doesn't match. Trips with no stored route (legacy rows,
+        or OSRM was down at creation) fall back to the endpoint-radius rules."""
+        keys = ("pickup_latitude", "pickup_longitude", "destination_latitude", "destination_longitude")
+        if any(query.get(k) is None for k in keys):
+            return None
+        buffer_m = query.get("route_buffer_meters", ROUTE_BUFFER_METERS)
+        pickup_pt = "ST_SetSRID(ST_MakePoint(%s, %s), 4326)"
+        corridor = f"""(dt.route_geog IS NOT NULL
+                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, %s)
+                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, %s)
+                AND ST_LineLocatePoint(dt.route_geog::geometry, {pickup_pt})
+                    < ST_LineLocatePoint(dt.route_geog::geometry, {pickup_pt}))"""
+        fallback = """(dt.route_geog IS NULL
+                AND ST_DWithin(tp.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+                AND ST_DWithin(td.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s))"""
+        plng, plat = query["pickup_longitude"], query["pickup_latitude"]
+        dlng, dlat = query["destination_longitude"], query["destination_latitude"]
+        params = [
+            plng, plat, buffer_m, dlng, dlat, buffer_m, plng, plat, dlng, dlat,
+            plng, plat, query.get("pickup_radius_meters", 5000),
+            dlng, dlat, query.get("destination_radius_meters", 1000),
+        ]
+        return "", f"AND ({corridor} OR {fallback})", params
+
+    def _attach_detours(self, trips: list[DriverTrip], rows: list[dict], query: dict[str, Any]) -> None:
+        """Minutes each candidate's trip grows by if the rider is inserted
+        (driver pickup → rider pickup → rider dest → driver dest, vs. the stored
+        direct route). Only runs on corridor survivors, capped, in parallel."""
+        if self.router is None:
+            return
+        rider_pickup = (query["pickup_latitude"], query["pickup_longitude"])
+        rider_dest = (query["destination_latitude"], query["destination_longitude"])
+        candidates = [
+            (t, r) for t, r in zip(trips, rows) if r.get("route_duration_s") is not None
+        ][:MAX_DETOUR_CANDIDATES]
+        if not candidates:
+            return
+
+        def detour(pair: tuple[DriverTrip, dict]) -> float | None:
+            _, r = pair
+            with_rider = self.router.route([
+                (r["trip_pickup_lat"], r["trip_pickup_lng"]), rider_pickup, rider_dest,
+                (r["trip_dest_lat"], r["trip_dest_lng"]),
+            ])
+            if with_rider is None:
+                return None
+            return round(max(0.0, (with_rider.duration_s - r["route_duration_s"]) / 60), 1)
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            for (trip, _), minutes in zip(candidates, pool.map(detour, candidates)):
+                trip.detour_minutes = minutes
 
     def search_ride_requests(self, user_id: str, query: dict[str, Any]) -> list[RideRequest]:
         self.expire_listings(now_utc().date())
@@ -872,6 +1274,10 @@ class Store:
                  conn_obj.created_at, conn_obj.updated_at, []),
             )
         recipient = trip.driver_id if user_id == rr.rider_id else rr.rider_id
+        # Driver opted in to auto-accepting ID-verified riders: skip the wait.
+        if (user_id == rr.rider_id and trip.auto_accept_verified
+                and self.user_for_id(rr.rider_id).id_verified):
+            return self.transition_connection(trip.driver_id, conn_obj.id, "accept")
         self.notify(recipient, "connection_received", "New carpool interest",
                     "You have a new pending connection.", related_id=conn_obj.id)
         return conn_obj
@@ -1394,6 +1800,218 @@ class Store:
             if cur.rowcount == 0:
                 raise DomainError("Notification not found", 404)
 
+    # ─── Ratings & trust ──────────────────────────────────────────────────────
+
+    def rate_connection(self, user_id: str, connection_id: str, stars: int, comment: str | None) -> dict[str, Any]:
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id not in {rr.rider_id, trip.driver_id}:
+            raise DomainError("Only participants can rate this ride", 403)
+        if connection.status != "completed":
+            raise DomainError("You can rate a ride once it's completed")
+        if not 1 <= stars <= 5:
+            raise DomainError("Rating must be 1 to 5 stars")
+        ratee = trip.driver_id if user_id == rr.rider_id else rr.rider_id
+        rating = {
+            "id": new_id("rtg"), "connection_id": connection_id, "rater_id": user_id,
+            "ratee_id": ratee, "stars": stars, "comment": (comment or "").strip() or None,
+            "created_at": now_utc(),
+        }
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO ratings (id, connection_id, rater_id, ratee_id, stars, comment, created_at)
+                   VALUES (%(id)s, %(connection_id)s, %(rater_id)s, %(ratee_id)s, %(stars)s, %(comment)s, %(created_at)s)
+                   ON CONFLICT (connection_id, rater_id) DO UPDATE
+                   SET stars = EXCLUDED.stars, comment = EXCLUDED.comment, created_at = EXCLUDED.created_at""",
+                rating,
+            )
+        return rating
+
+    def my_rating_for(self, user_id: str, connection_id: str) -> int | None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT stars FROM ratings WHERE connection_id = %s AND rater_id = %s",
+                        (connection_id, user_id))
+            row = cur.fetchone()
+            return row["stars"] if row else None
+
+    def user_stats(self, user_id: str) -> dict[str, Any]:
+        """Public trust signals: average stars, number of ratings, completed rides
+        (as driver or rider) and the admin-set ID check."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT
+                     (SELECT AVG(stars) FROM ratings WHERE ratee_id = %(u)s) AS rating_avg,
+                     (SELECT COUNT(*) FROM ratings WHERE ratee_id = %(u)s) AS rating_count,
+                     (SELECT COUNT(*) FROM connections c
+                        JOIN ride_requests rr ON rr.id = c.ride_request_id
+                        JOIN driver_trips dt ON dt.id = c.driver_trip_id
+                       WHERE c.status = 'completed' AND (rr.rider_id = %(u)s OR dt.driver_id = %(u)s)) AS completed_trips,
+                     (SELECT id_verified FROM users WHERE id = %(u)s) AS id_verified""",
+                {"u": user_id},
+            )
+            r = cur.fetchone()
+        avg = r["rating_avg"]
+        return {
+            "rating_avg": round(float(avg), 1) if avg is not None else None,
+            "rating_count": int(r["rating_count"]),
+            "completed_trips": int(r["completed_trips"]),
+            "id_verified": bool(r["id_verified"]),
+        }
+
+    def set_id_verified(self, target_user_id: str, verified: bool) -> User:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE users SET id_verified = %s WHERE id = %s RETURNING *", (verified, target_user_id))
+            row = cur.fetchone()
+            if not row:
+                raise DomainError("User not found", 404)
+            return _row_to_user(row)
+
+    # ─── Saved routes ("Your routes") ─────────────────────────────────────────
+
+    def create_saved_route(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        self._validate_location_ids(data["pickup_location_id"], data["destination_location_id"])
+        label = (data.get("label") or "").strip()
+        if not label:
+            raise DomainError("Give the route a name")
+        weekdays = sorted(set(data.get("weekdays") or []))
+        if any(d not in range(7) for d in weekdays):
+            raise DomainError("Weekdays must be 0 (Mon) to 6 (Sun)")
+        route = {
+            "id": new_id("rte"), "user_id": user_id, "label": label[:60],
+            "pickup_location_id": data["pickup_location_id"],
+            "destination_location_id": data["destination_location_id"],
+            "departure_time": data.get("departure_time"), "weekdays": weekdays, "created_at": now_utc(),
+        }
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT COUNT(*) AS n FROM saved_routes WHERE user_id = %s", (user_id,))
+            if cur.fetchone()["n"] >= 10:
+                raise DomainError("You can save up to 10 routes")
+            cur.execute(
+                """INSERT INTO saved_routes (id, user_id, label, pickup_location_id, destination_location_id,
+                       departure_time, weekdays, created_at)
+                   VALUES (%(id)s, %(user_id)s, %(label)s, %(pickup_location_id)s, %(destination_location_id)s,
+                           %(departure_time)s, %(weekdays)s, %(created_at)s)""",
+                route,
+            )
+        return route
+
+    def list_saved_routes(self, user_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT * FROM saved_routes WHERE user_id = %s ORDER BY created_at", (user_id,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def delete_saved_route(self, user_id: str, route_id: str) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("DELETE FROM saved_routes WHERE id = %s AND user_id = %s", (route_id, user_id))
+            if cur.rowcount == 0:
+                raise DomainError("Route not found", 404)
+
+    # ─── Ride alerts ("Get notified when a ride is posted") ───────────────────
+
+    def create_ride_alert(self, user_id: str, destination_location_id: str, target_date: date,
+                          radius_meters: int = 5000) -> dict[str, Any]:
+        self.get_location(destination_location_id)
+        alert = {
+            "id": new_id("alr"), "user_id": user_id, "destination_location_id": destination_location_id,
+            "target_date": target_date, "radius_meters": max(500, min(radius_meters, 50_000)),
+            "created_at": now_utc(), "fulfilled_at": None,
+        }
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO ride_alerts (id, user_id, destination_location_id, target_date, radius_meters, created_at)
+                   VALUES (%(id)s, %(user_id)s, %(destination_location_id)s, %(target_date)s, %(radius_meters)s, %(created_at)s)""",
+                alert,
+            )
+        return alert
+
+    def _fulfil_ride_alerts(self, trip: DriverTrip) -> None:
+        """Notify riders waiting on a ride to near this trip's destination that day.
+        Each alert fires once."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """UPDATE ride_alerts a SET fulfilled_at = %s
+                   FROM locations al, locations td
+                   WHERE a.fulfilled_at IS NULL AND a.target_date = %s AND a.user_id <> %s
+                     AND al.id = a.destination_location_id AND td.id = %s
+                     AND ST_DWithin(al.geog, td.geog, a.radius_meters)
+                   RETURNING a.user_id""",
+                (now_utc(), trip.target_date, trip.driver_id, trip.destination_location_id),
+            )
+            user_ids = [r["user_id"] for r in cur.fetchall()]
+        for uid in user_ids:
+            self.notify(uid, "ride_alert", "A ride you wanted was posted",
+                        f"A driver is heading your way on {trip.target_date:%a %b} {trip.target_date.day}.", related_id=trip.id)
+
+    # ─── Trip day ─────────────────────────────────────────────────────────────
+
+    def trip_day_status(self, user_id: str, connection_id: str) -> dict[str, Any]:
+        """Live pickup status for an accepted ride: the driver's last shared
+        position (if fresh), straight-line distance to the rider's pickup and a
+        rough ETA. Participants only."""
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id not in {rr.rider_id, trip.driver_id}:
+            raise DomainError("Only participants can see trip status", 403)
+        if connection.status != "accepted":
+            raise DomainError("Live status is only available for accepted rides")
+        pickup = self.get_location(rr.pickup_location_id)
+        stale_before = now_utc() - timedelta(minutes=self.DRIVER_LOCATION_TTL_MINUTES)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT ST_Y(geog::geometry) AS lat, ST_X(geog::geometry) AS lng, speed_kmh, updated_at
+                   FROM driver_locations WHERE user_id = %s AND updated_at > %s""",
+                (trip.driver_id, stale_before),
+            )
+            loc = cur.fetchone()
+        driver: dict[str, Any] | None = None
+        if loc:
+            meters = haversine_meters(loc["lat"], loc["lng"], pickup.latitude, pickup.longitude)
+            speed = loc["speed_kmh"] if loc["speed_kmh"] and loc["speed_kmh"] > 5 else 30.0
+            driver = {
+                "latitude": loc["lat"], "longitude": loc["lng"], "updated_at": loc["updated_at"],
+                "distance_to_pickup_m": round(meters),
+                # Straight line × 1.3 road factor at current (or city) speed.
+                "eta_minutes": max(0, round(meters * 1.3 / 1000 / speed * 60)),
+            }
+        return {
+            "connection_id": connection_id,
+            "pickup": {"label": pickup.label, "latitude": pickup.latitude, "longitude": pickup.longitude},
+            "departure_time": trip.departure_time,
+            "driver": driver,
+            "rider_at_pickup_at": connection.rider_at_pickup_at,
+        }
+
+    def mark_rider_at_pickup(self, user_id: str, connection_id: str) -> Connection:
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id != rr.rider_id:
+            raise DomainError("Only the rider can check in at the pickup", 403)
+        if connection.status != "accepted":
+            raise DomainError("Only accepted rides have a pickup")
+        at = now_utc()
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE connections SET rider_at_pickup_at = %s WHERE id = %s", (at, connection_id))
+        connection.rider_at_pickup_at = at
+        rider = self.get_profile(rr.rider_id)
+        self.notify(trip.driver_id, "rider_at_pickup", "Your rider is at the pickup",
+                    f"{rider.display_name if rider else 'Your rider'} is waiting at the pickup spot.",
+                    related_id=connection_id)
+        return connection
+
     # ─── Blocks / Reports ─────────────────────────────────────────────────────
 
     def block_user(self, blocker_id: str, blocked_id: str) -> None:
@@ -1453,7 +2071,7 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 f"""SELECT u.id, u.email, u.email_domain, u.created_at, u.status,
-                           u.suspended_at, u.suspended_reason,
+                           u.suspended_at, u.suspended_reason, u.id_verified,
                            p.display_name, p.photo_url,
                            EXISTS(SELECT 1 FROM driver_trips dt WHERE dt.driver_id = u.id) AS is_driver,
                            EXISTS(SELECT 1 FROM ride_requests rr WHERE rr.rider_id = u.id) AS is_rider,

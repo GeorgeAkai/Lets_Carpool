@@ -12,3 +12,15 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # Self-hosted OSRM routing, used server-side for route-corridor matching.
+  # Needs the dataset built first: scripts/osrm-prepare.sh. Serves on :5001
+  # (matches Settings.osrm_base_url's default).
+  osrm:
+    image: osrm/osrm-backend:v5.25.0
+    command: osrm-routed --algorithm mld /data/region.osrm
+    volumes:
+      - ./osrm-data:/data:ro
+    ports:
+      - "5001:5000"
+    restart: unless-stopped

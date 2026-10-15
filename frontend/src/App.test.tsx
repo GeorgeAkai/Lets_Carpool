@@ -4,10 +4,10 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "./App";
 import { login, BASE } from "./api";
-import { setMockNeonSession } from "./test-support/neonAuthMock";
-import { fetchNeonJWT } from "./lib/auth";
+import { setMockAuthSession } from "./test-support/authMock";
+import { getAccessToken } from "./lib/auth";
 
-// Simulates a user who already has a live Neon session — required for NeonAuthSync
+// Simulates a user who already has a live auth session — required for AuthSync
 // to not treat the app as signed-out and clear the pre-seeded backend token below.
 // Also pre-seeds the mode-choice gate's sessionStorage flag as already-answered
 // (Passenger), so tests that aren't specifically about the gate itself land
@@ -16,7 +16,7 @@ import { fetchNeonJWT } from "./lib/auth";
 // gate first.
 function signInWithExistingToken() {
   localStorage.setItem("carpool_token", LOGIN_RESPONSE.access_token);
-  setMockNeonSession({ user: { id: "usr_test", email: ME_RESPONSE.email, name: ME_RESPONSE.profile.display_name } });
+  setMockAuthSession({ user: { id: "usr_test", email: ME_RESPONSE.email, name: ME_RESPONSE.profile.display_name } });
   sessionStorage.setItem("carpool_mode", "rider");
 }
 
@@ -93,7 +93,7 @@ describe("API configuration", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await login("mock.neon.jwt");
+    await login("mock.supabase.jwt");
 
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/auth/login`, expect.any(Object));
   });
@@ -106,7 +106,7 @@ describe("Auth gate", () => {
     // mock into every later test if it ever fails before reaching its own
     // cleanup line — vi.restoreAllMocks() doesn't reset plain vi.fn() mocks
     // created inside vi.mock(), only ones made with vi.spyOn().
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   });
 
   afterEach(() => {
@@ -116,7 +116,7 @@ describe("Auth gate", () => {
   it("shows sign-in screen when no token is stored", () => {
     mockFetch({});
     render(<MemoryRouter><App /></MemoryRouter>);
-    expect(screen.getByRole("button", { name: /sign in \/ sign up/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^sign in$/i })).toBeTruthy();
   });
 
   it("calls POST /auth/login and stores token on sign-in", async () => {
@@ -129,9 +129,9 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/^password$/i), "password123");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() =>
       expect(localStorage.getItem("carpool_token")).toBe(LOGIN_RESPONSE.access_token)
@@ -148,17 +148,17 @@ describe("Auth gate", () => {
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
-    await user.type(screen.getByPlaceholderText(/ada rider/i), "Ada Rider");
     await user.type(screen.getByPlaceholderText(/you@example\.com/i), "ada@example.com");
-    await user.click(screen.getByRole("button", { name: /sign in \/ sign up/i }));
+    await user.type(screen.getByPlaceholderText(/^password$/i), "password123");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
 
     await waitFor(() => screen.getByText(/find your ride/i));
   });
 
-  it("shows a retryable error instead of hanging forever when the Neon Auth token can't be fetched", async () => {
-    // Regression test: fetchNeonJWT() rejecting or resolving null used to
+  it("shows a retryable error instead of hanging forever when the access token can't be fetched", async () => {
+    // Regression test: getAccessToken() rejecting or resolving null used to
     // leave the app stuck on "Loading…" forever with no way forward.
-    vi.mocked(fetchNeonJWT).mockRejectedValue(new Error("network down"));
+    vi.mocked(getAccessToken).mockRejectedValue(new Error("network down"));
     mockFetch({});
     signInWithExistingToken();
 
@@ -171,7 +171,7 @@ describe("Auth gate", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /sign out/i })).toBeTruthy();
 
-    vi.mocked(fetchNeonJWT).mockResolvedValue("mock.neon.jwt");
+    vi.mocked(getAccessToken).mockResolvedValue("mock.supabase.jwt");
   }, 10000);
 });
 
@@ -542,7 +542,7 @@ describe("Connections view", () => {
     });
   });
 
-  it("keeps only one connection's chat open at a time, to avoid inbox clutter", async () => {
+  it("shows a master-detail inbox where selecting a conversation swaps the chat pane", async () => {
     const user = userEvent.setup();
 
     const makeConnection = (id: string, driverId: string, driverName: string) => ({
@@ -572,17 +572,98 @@ describe("Connections view", () => {
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
 
-    await user.click(screen.getByRole("button", { name: /inbox/i }));
-    await waitFor(() => screen.getByText("Driver Alpha"));
-    expect(screen.getByText("Driver Beta")).toBeTruthy();
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
 
-    const chatButtons = screen.getAllByRole("button", { name: /^chat$/i });
-    await user.click(chatButtons[0]);
-    await waitFor(() => screen.getByText("Message from Alpha"));
+    // Desktop auto-opens the first conversation in the detail pane, and each
+    // list row previews its thread's last message.
+    await waitFor(() => expect(screen.getByRole("region", { name: /conversation/i })).toHaveTextContent("Message from Alpha"));
+    const pane = () => screen.getByRole("region", { name: /conversation/i });
+    expect(pane()).toHaveTextContent("Driver Alpha");
+    expect(pane()).not.toHaveTextContent("Message from Beta");
+    // Trip controls live in the pane header for accepted rides.
+    expect(screen.getByRole("button", { name: /gas split/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /complete/i })).toBeTruthy();
 
-    await user.click(chatButtons[1]);
-    await waitFor(() => screen.getByText("Message from Beta"));
-    expect(screen.queryByText("Message from Alpha")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /driver beta/i }));
+    await waitFor(() => expect(pane()).toHaveTextContent("Message from Beta"));
+    expect(pane()).not.toHaveTextContent("Message from Alpha");
+  });
+
+  it("files declined and cancelled conversations under Archived", async () => {
+    const user = userEvent.setup();
+    const base = {
+      ride_request_id: "rrq_1", driver_trip_id: "trp_1", initiator_user_id: "usr_abc",
+      created_at: "2026-05-24T00:00:00Z", updated_at: "2026-05-24T00:00:00Z",
+      ride_request: { ...RIDE_REQUEST_1, rider_id: "usr_abc" }, driver_trip: DRIVER_TRIP_1,
+    };
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/connections": [
+        { ...base, id: "con_live", status: "accepted", driver_profile: { user_id: "usr_driver", display_name: "Live Driver", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null } },
+        { ...base, id: "con_dead", status: "declined", driver_profile: { user_id: "usr_driver", display_name: "Declined Driver", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null } },
+      ],
+    });
+
+    render(<MemoryRouter initialEntries={["/connections"]}><App /></MemoryRouter>);
+
+    await waitFor(() => expect(screen.getAllByText("Live Driver").length).toBeGreaterThan(0));
+    expect(screen.queryByText("Declined Driver")).toBeNull();
+
+    await user.click(screen.getByRole("tab", { name: /archived/i }));
+    await waitFor(() => expect(screen.getAllByText("Declined Driver").length).toBeGreaterThan(0));
+    expect(screen.queryByText("Live Driver")).toBeNull();
+  });
+});
+
+describe("My Rides view", () => {
+  beforeEach(() => {
+    signInWithExistingToken();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("defaults to active trips, keeps past ones under Past / Archive, and cleans up location labels", async () => {
+    const user = userEvent.setup();
+    const future = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    const trip = (id: string, status: string, target_date: string, dest: string) => ({
+      ...DRIVER_TRIP_1, id, driver_id: "usr_abc", status, target_date,
+      pickup: { id: `p_${id}`, label: "Chico, Chico, California", exact: true, latitude: 39.7, longitude: -121.8 },
+      destination: { id: `d_${id}`, label: dest, exact: true, latitude: 38.6, longitude: -121.5 },
+    });
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [
+        trip("trp_up", "open", future, "Sacramento, Sacramento County, California, United States"),
+        trip("trp_old", "cancelled", "2026-01-02", "Reno, Nevada"),
+      ],
+      "GET /me/ride-requests": [],
+    });
+
+    sessionStorage.setItem("carpool_mode", "driver");
+    render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
+
+    await waitFor(() => screen.getByText("Sacramento, CA"));
+    expect(screen.getByText("Chico, CA")).toBeTruthy();
+    expect(screen.queryByText("Reno, NV")).toBeNull();
+    expect(screen.getByRole("button", { name: /manage ride/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /view matches/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /cancel listing/i })).toBeTruthy();
+
+    await user.click(screen.getByRole("tab", { name: /past \/ archive/i }));
+    await waitFor(() => screen.getByText("Reno, NV"));
+    expect(screen.queryByText("Sacramento, CA")).toBeNull();
+
+    // Re-book pre-fills the post form with the old route.
+    await user.click(screen.getByRole("button", { name: /re-book/i }));
+    await waitFor(() => screen.getByText(/re-book this ride/i));
+    expect((screen.getByPlaceholderText(/destination/i) as HTMLInputElement).value).toBe("Reno, NV");
   });
 });
 
@@ -637,24 +718,70 @@ describe("Profile view", () => {
     expect(screen.getByRole("button", { name: /switch to driver mode/i })).toBeTruthy();
   });
 
-  it("My Rides only shows the tab matching the current mode", async () => {
+  it("saves profile + vehicle with one Save Changes button", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const path = String(url).replace(BASE, "");
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
+      if (path.startsWith("/driver-trips/search") || path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
+      if (method === "PATCH" && path === "/me/profile") return { ok: true, json: async () => ({ ...ME_RESPONSE.profile, bio: "Hi there" }) };
+      if (method === "PUT" && path === "/me/driver-readiness") return { ok: true, json: async () => ({ make: "Honda" }) };
+      return { ok: false, json: async () => ({ detail: "not found" }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/driver readiness/i));
+
+    expect(screen.queryByRole("button", { name: /save profile/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /save vehicle/i })).toBeNull();
+    const save = screen.getByRole("button", { name: /save changes/i });
+    expect(save).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/^bio$/i), "Hi there");
+    await user.type(screen.getByLabelText(/^make$/i), "Honda");
+    await user.click(save);
+
+    await waitFor(() => screen.getByText(/changes saved/i));
+    const calls = fetchMock.mock.calls.map(([url, init]) => `${((init as RequestInit | undefined)?.method ?? "GET").toUpperCase()} ${String(url).replace(BASE, "")}`);
+    expect(calls).toContain("PATCH /me/profile");
+    expect(calls).toContain("PUT /me/driver-readiness");
+  });
+
+  it("keeps Sign out in the account menu only", async () => {
     const user = userEvent.setup();
     mockFetch({
       "GET /me": ME_RESPONSE,
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
-      "GET /me/driver-trips": [],
-      "GET /me/ride-requests": [],
     });
 
-    render(<MemoryRouter><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/find your ride/i));
+    render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
+    await waitFor(() => screen.getByText(/driver readiness/i));
 
-    await user.click(screen.getAllByRole("button", { name: /^my rides$/i })[0]);
+    expect(screen.queryByRole("button", { name: /sign out/i })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /account/i }));
+    expect(screen.getByRole("menuitem", { name: /sign out/i })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: /admin/i })).toBeNull();
+  });
+
+  it("My Rides only shows listings matching the current mode", async () => {
+    const future = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    mockFetch({
+      "GET /me": ME_RESPONSE,
+      "GET /driver-trips/search": [],
+      "GET /ride-requests/search": [],
+      "GET /me/driver-trips": [{ ...DRIVER_TRIP_1, driver_id: "usr_abc", target_date: future, destination: { id: "loc_d", label: "Driver Destination", exact: true } }],
+      "GET /me/ride-requests": [{ ...RIDE_REQUEST_1, rider_id: "usr_abc", target_date: future, destination: { id: "loc_r", label: "Rider Destination", exact: true } }],
+    });
+
+    render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
     await waitFor(() => screen.getByRole("heading", { name: /^my rides$/i }));
 
-    // Passenger mode (pre-seeded) — only the Ride Requests tab, never Driver Trips.
-    expect(screen.getByRole("button", { name: /ride requests/i })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /driver trips/i })).toBeNull();
+    // Passenger mode (pre-seeded) — only ride requests, never driver trips.
+    await waitFor(() => screen.getByText("Rider Destination"));
+    expect(screen.getByText("Your ride requests")).toBeTruthy();
+    expect(screen.queryByText("Driver Destination")).toBeNull();
   });
 });

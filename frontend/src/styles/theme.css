@@ -6,87 +6,94 @@
      this instead of guessing their own "nav height + buffer" constant, so a
      change to the nav's own height/inset can't silently drift out of sync
      with what's clearing it. */
-  --bottom-nav-h: calc(4rem + env(safe-area-inset-bottom));
+  --bottom-nav-h: calc(4.25rem + env(safe-area-inset-bottom));
   --font-size: 16px;
-  --background: #f5f7fa;
-  --foreground: #1a2035;
+  /* Let's Carpool palette: navy ink, warm amber for the primary action, sky
+     blue for live/route information. Light is the daytime counterpart of the
+     dark (default) theme. */
+  --background: #f4f6fa;
+  --foreground: #0b1220;
   --card: #ffffff;
-  --card-foreground: #1a2035;
+  --card-foreground: #0b1220;
   --popover: #ffffff;
-  --popover-foreground: #1a2035;
-  --primary: #1a6fce;
-  --primary-foreground: #ffffff;
-  --secondary: #e8f1fb;
-  --secondary-foreground: #1a6fce;
-  --muted: #edf0f5;
-  --muted-foreground: #6b7488;
-  --accent: #e8971c;
-  --accent-foreground: #0f172a;
-  --destructive: #d93025;
+  --popover-foreground: #0b1220;
+  --primary: #f5b544;
+  --primary-foreground: #1a1204;
+  --secondary: #e7ecf4;
+  --secondary-foreground: #26324a;
+  --muted: #eceff5;
+  --muted-foreground: #5b6a86;
+  --accent: #1f7fd1;
+  --accent-foreground: #ffffff;
+  --info: #1f7fd1;
+  --destructive: #c62d3f;
   --destructive-foreground: #ffffff;
-  --border: #e8ebf2;
+  --border: #dde3ee;
   --input: transparent;
-  --input-background: #edf0f5;
+  --input-background: #eef1f6;
   --switch-background: #a9b4c6;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
-  --ring: #1a6fce;
+  --ring: #d99a24;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
-  --radius: 0.75rem;
-  --sidebar: #0e1726;
-  --sidebar-foreground: #ffffff;
-  --sidebar-primary: #1a6fce;
-  --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #162035;
-  --sidebar-accent-foreground: #ffffff;
-  --sidebar-border: rgba(255, 255, 255, 0.07);
-  --sidebar-ring: #1a6fce;
+  --radius: 0.875rem;
+  --sidebar: #0e1626;
+  --sidebar-foreground: #eef2f8;
+  --sidebar-primary: #f5b544;
+  --sidebar-primary-foreground: #1a1204;
+  --sidebar-accent: #141d2f;
+  --sidebar-accent-foreground: #eef2f8;
+  --sidebar-border: #26324a;
+  --sidebar-ring: #f5b544;
 }
 
 .dark {
-  --background: #0b101e;
-  --foreground: #e8edf5;
-  --card: #151e30;
-  --card-foreground: #e8edf5;
-  --popover: #151e30;
-  --popover-foreground: #e8edf5;
-  --primary: #3d8ae0;
-  --primary-foreground: #ffffff;
-  --secondary: #0d2042;
-  --secondary-foreground: #8cbcf0;
-  --muted: #1a2540;
-  --muted-foreground: #8a94a6;
-  --accent: #f59e0b;
+  --background: #0b1220;
+  --foreground: #eef2f8;
+  --card: #141d2f;
+  --card-foreground: #eef2f8;
+  --popover: #141d2f;
+  --popover-foreground: #eef2f8;
+  --primary: #f5b544;
+  --primary-foreground: #1a1204;
+  --secondary: #1c2740;
+  --secondary-foreground: #c3cde0;
+  --muted: #1c2740;
+  --muted-foreground: #9aa7bd;
+  --accent: #7cc4ff;
   --accent-foreground: #0b1220;
-  --destructive: #dc2626;
-  --destructive-foreground: #fee2e2;
-  --border: #232f47;
+  --info: #7cc4ff;
+  --destructive: #ff6b7a;
+  --destructive-foreground: #1a0508;
+  --border: #26324a;
   --input: transparent;
-  --input-background: #1a2540;
-  --switch-background: #33415c;
+  --input-background: #1c2740;
+  --switch-background: #33415e;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
-  --ring: #3d8ae0;
+  --ring: #f5b544;
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: #070d18;
-  --sidebar-foreground: #e8edf5;
-  --sidebar-primary: #1a6fce;
-  --sidebar-primary-foreground: #ffffff;
-  --sidebar-accent: #0e1726;
-  --sidebar-accent-foreground: #e2e8f0;
-  --sidebar-border: rgba(255, 255, 255, 0.07);
-  --sidebar-ring: #3d8ae0;
+  --sidebar: #0e1626;
+  --sidebar-foreground: #eef2f8;
+  --sidebar-primary: #f5b544;
+  --sidebar-primary-foreground: #1a1204;
+  --sidebar-accent: #141d2f;
+  --sidebar-accent-foreground: #eef2f8;
+  --sidebar-border: #26324a;
+  --sidebar-ring: #f5b544;
 }
 
 @theme inline {
+  --font-display: 'Bricolage Grotesque', 'Figtree', system-ui, sans-serif;
+  --font-sans: 'Figtree', system-ui, sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -101,6 +108,7 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
+  --color-info: var(--info);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
@@ -134,7 +142,7 @@
 
   body {
     @apply bg-background text-foreground;
-    font-family: 'Outfit', sans-serif;
+    font-family: 'Figtree', system-ui, sans-serif;
   }
 
   html {

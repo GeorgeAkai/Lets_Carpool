@@ -1,7 +1,7 @@
-import { useEffect } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import {
   Search, SlidersHorizontal, X, MapPin, ArrowRight, Users, Package,
-  Pencil, Map as MapIcon, Plus, Check,
+  Pencil, Map as MapIcon, Plus, Calendar, ChevronDown, Check, LocateFixed,
 } from 'lucide-react'
 import {
   Avatar, FLEX_LABEL, FLEX_DOT, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
@@ -12,56 +12,136 @@ import type { Listing, RideTag, CarType, LuggageSize } from './home'
 // Shared by both mode branches (rider's FeedView and driver's DriverHomeView) so
 // neither duplicates the search/filter/card logic the other already has.
 
-export function MobileSearchBar({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+// Uber-style two-stop search: the origin is always the rider's current
+// location (the feed is already sorted around it), so only the destination is
+// editable — one prominent "Where to?" field instead of a page header.
+export function MobileSearchBar({ value, onChange, hasLocation }: {
+  value: string; onChange: (v: string) => void; hasLocation: boolean
+}) {
   return (
-    <div className="flex items-center gap-2.5 rounded-xl bg-card border border-border px-4 py-3 focus-within:ring-3 focus-within:ring-primary/15 focus-within:border-primary transition-colors">
-      <Search className="size-4 shrink-0 text-muted-foreground" />
-      <input
-        type="text"
-        value={value}
-        onChange={e => onChange(e.target.value)}
-        placeholder="Where to? (e.g. San Francisco, Airport)"
-        className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-      />
+    <div className="rounded-2xl bg-card border border-border shadow-sm focus-within:ring-2 focus-within:ring-ring/25 focus-within:border-primary/30 transition-colors">
+      <div className="flex items-center gap-2.5 px-4 pt-3 pb-2 text-xs text-muted-foreground">
+        <LocateFixed className={`size-3.5 shrink-0 ${hasLocation ? 'text-primary' : ''}`} />
+        <span className="truncate">{hasLocation ? 'Current Location' : 'Current Location · location off, showing all areas'}</span>
+      </div>
+      <div className="mx-4 border-t border-border" />
+      <label className="flex items-center gap-2.5 px-4 py-3">
+        <Search className="size-5 shrink-0 text-foreground" />
+        <input
+          type="text"
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          placeholder="Where to?"
+          aria-label="Where to?"
+          className="flex-1 min-w-0 bg-transparent text-base font-medium text-foreground placeholder:text-muted-foreground focus:outline-none"
+        />
+        {value && (
+          <button type="button" onClick={() => onChange('')} aria-label="Clear destination" className="p-1 -mr-1 rounded-full text-muted-foreground hover:text-foreground">
+            <X className="size-4" />
+          </button>
+        )}
+      </label>
+    </div>
+  )
+}
+
+// Shared bottom-sheet shell for every mobile selector (full filters and the
+// single-choice quick filters), so none of them expand inline and push the
+// feed down.
+export function BottomSheet({ open, onClose, title, children }: {
+  open: boolean; onClose: () => void; title: string; children: ReactNode
+}) {
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center" role="dialog" aria-modal="true" aria-label={title}>
+      <div className="absolute inset-0 bg-foreground/40 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl px-5 pt-2.5 pb-[calc(env(safe-area-inset-bottom)+2rem)] space-y-5 max-h-[80vh] overflow-y-auto">
+        <div className="flex justify-center"><span className="block w-9 h-1 rounded-full bg-border" /></div>
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-foreground">{title}</h2>
+          <button onClick={onClose} aria-label={`Close ${title.toLowerCase()}`} className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-colors">
+            <X className="size-5" />
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function OptionList<T extends string | number | null>({ options, value, onSelect }: {
+  options: { value: T; label: string }[]; value: T; onSelect: (v: T) => void
+}) {
+  return (
+    <div className="space-y-1" role="radiogroup">
+      {options.map(o => (
+        <button
+          key={String(o.value)} role="radio" aria-checked={value === o.value} onClick={() => onSelect(o.value)}
+          className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-medium transition-colors ${value === o.value ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-muted'}`}
+        >
+          {o.label}
+          {value === o.value && <Check className="size-4" />}
+        </button>
+      ))}
     </div>
   )
 }
 
 export function MobileFilterBar({
-  onOpenFilters, activeCount, quickDate, onQuickDate, seatsNeeded, onSeatsNeeded,
+  onOpenFilters, activeCount, quickDate, onQuickDate, seatsNeeded, onSeatsNeeded, showSeats = true,
 }: {
+  showSeats?: boolean
   onOpenFilters: () => void
   activeCount: number
   quickDate: 'today' | 'any'; onQuickDate: (v: 'today' | 'any') => void
   seatsNeeded: number | null; onSeatsNeeded: (v: number | null) => void
 }) {
+  const [openSheet, setOpenSheet] = useState<'date' | 'seats' | null>(null)
+  const pill = (active: boolean) =>
+    `shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-full text-sm font-medium transition-colors ${active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`
+
   return (
-    <div className="flex items-center gap-2 overflow-x-auto pb-1 -mx-4 px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-      <button
-        onClick={onOpenFilters}
-        className="shrink-0 flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-semibold bg-card border border-border text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <SlidersHorizontal className="size-3.5" /> Filters
-        {activeCount > 0 && (
-          <span className="size-4 flex items-center justify-center rounded-full bg-primary text-primary-foreground text-[10px] font-bold">{activeCount}</span>
+    <>
+      <div className="flex items-center gap-2 overflow-x-auto pb-1 -mx-4 px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <button onClick={onOpenFilters} className={pill(activeCount > 0)}>
+          <SlidersHorizontal className="size-3.5" /> Filters
+          {activeCount > 0 && (
+            <span className="size-4 flex items-center justify-center rounded-full bg-primary-foreground text-primary text-[10px] font-bold">{activeCount}</span>
+          )}
+        </button>
+        <button onClick={() => setOpenSheet('date')} className={pill(quickDate === 'today')} aria-haspopup="dialog">
+          <Calendar className="size-3.5" /> Date: {quickDate === 'today' ? 'Today' : 'Any'} <ChevronDown className="size-3.5 opacity-70" />
+        </button>
+        {showSeats && (
+          <button onClick={() => setOpenSheet('seats')} className={pill(seatsNeeded != null)} aria-haspopup="dialog">
+            <Users className="size-3.5" /> {seatsNeeded ? `${seatsNeeded}+ seat${seatsNeeded > 1 ? 's' : ''}` : 'Seats Needed'} <ChevronDown className="size-3.5 opacity-70" />
+          </button>
         )}
-      </button>
-      <button
-        onClick={() => onQuickDate(quickDate === 'today' ? 'any' : 'today')}
-        className={`shrink-0 px-3.5 py-2 rounded-full text-xs font-semibold border transition-colors ${quickDate === 'today' ? 'bg-primary text-primary-foreground border-primary' : 'bg-card border-border text-muted-foreground hover:text-foreground'}`}
-      >
-        Date: {quickDate === 'today' ? 'Today' : 'Any'}
-      </button>
-      <select
-        aria-label="Seats needed"
-        value={seatsNeeded ?? ''}
-        onChange={e => onSeatsNeeded(e.target.value ? Number(e.target.value) : null)}
-        className={`shrink-0 appearance-none px-3.5 py-2 rounded-full text-xs font-semibold border transition-colors cursor-pointer focus:outline-none ${seatsNeeded ? 'bg-primary text-primary-foreground border-primary' : 'bg-card border-border text-muted-foreground'}`}
-      >
-        <option value="">Seats needed</option>
-        {[1, 2, 3, 4].map(n => <option key={n} value={n}>{n}+ seat{n > 1 ? 's' : ''}</option>)}
-      </select>
-    </div>
+      </div>
+
+      <BottomSheet open={openSheet === 'date'} onClose={() => setOpenSheet(null)} title="Date">
+        <OptionList
+          options={[{ value: 'today' as const, label: 'Today' }, { value: 'any' as const, label: 'Any date' }]}
+          value={quickDate}
+          onSelect={v => { onQuickDate(v); setOpenSheet(null) }}
+        />
+      </BottomSheet>
+      <BottomSheet open={openSheet === 'seats'} onClose={() => setOpenSheet(null)} title="Seats needed">
+        <OptionList<number | null>
+          options={[{ value: null, label: 'Any' }, ...[1, 2, 3, 4].map(n => ({ value: n, label: `${n}+ seat${n > 1 ? 's' : ''}` }))]}
+          value={seatsNeeded}
+          onSelect={v => { onSeatsNeeded(v); setOpenSheet(null) }}
+        />
+      </BottomSheet>
+    </>
   )
 }
 
@@ -75,26 +155,8 @@ export function FilterSheet({
   filterCarType: '' | CarType; setFilterCarType: (v: '' | CarType) => void
   filterLuggage: '' | LuggageSize; setFilterLuggage: (v: '' | LuggageSize) => void
 }) {
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open, onClose])
-
-  if (!open) return null
-
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" role="dialog" aria-modal="true" aria-label="Filters">
-      <div className="absolute inset-0 bg-foreground/40 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl p-5 pb-[calc(env(safe-area-inset-bottom)+2rem)] space-y-5 max-h-[80vh] overflow-y-auto">
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-foreground">Filters</h2>
-          <button onClick={onClose} aria-label="Close filters" className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-colors">
-            <X className="size-5" />
-          </button>
-        </div>
-
+    <BottomSheet open={open} onClose={onClose} title="Filters">
         <div className="space-y-1.5">
           <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Showing</p>
           <div className="flex flex-wrap gap-2">
@@ -142,8 +204,7 @@ export function FilterSheet({
         <button onClick={onClose} className="w-full py-3 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
           Show results
         </button>
-      </div>
-    </div>
+    </BottomSheet>
   )
 }
 
@@ -156,9 +217,9 @@ export function SectionHeader({ label, count, noun }: { label: string; count: nu
   )
 }
 
-export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected }: {
+export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected = false }: {
   listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; onEditOwn: () => void
-  alreadyConnected: boolean
+  alreadyConnected?: boolean
 }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -177,7 +238,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
           </div>
         </div>
         {isOwn ? (
-          <button onClick={onEditOwn} className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-muted text-muted-foreground text-xs font-medium hover:text-foreground transition-colors">
+          <button onClick={onEditOwn} title="Manage in My Rides" className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-secondary text-secondary-foreground text-xs font-semibold hover:opacity-90 transition-opacity">
             Your Listing <Pencil className="size-3" />
           </button>
         ) : (
@@ -223,7 +284,9 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
             onClick={() => onConnect(listing)}
             className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all"
           >
-            {isDriver ? 'Request to join' : 'Offer a ride'}
+            {/* Driver listings are seats you can ask for; passenger listings are
+                people you can pick up. */}
+            {isDriver ? 'Request Ride' : 'Offer Ride'}
           </button>
         )
       )}
