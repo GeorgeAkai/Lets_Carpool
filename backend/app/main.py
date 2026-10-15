@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
-from backend.app.domain import DomainError, Store, User
+from backend.app.domain import DomainError, DriverTrip, Store, User
 from backend.app.routing import OSRMClient
 
 
@@ -77,6 +77,8 @@ class ProfileUpdate(BaseModel):
     bio: str | None = None
     interests: list[str] = Field(default_factory=list)
     nationality: str | None = None
+    # Optional; omitted = keep the stored number. Shared only with accepted ride partners.
+    phone: str | None = Field(default=None, max_length=25)
 
 
 class PhotoUpload(BaseModel):
@@ -92,6 +94,8 @@ class VehicleUpdate(BaseModel):
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
+    # Omitted = keep the stored plate. Shown to riders only once accepted.
+    plate: str | None = Field(default=None, max_length=12)
 
 
 class LocationCreate(BaseModel):
@@ -113,6 +117,7 @@ class RideRequestCreate(BaseModel):
     luggage_size: str = "none"
     preferred_car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+    departure_time: time | None = None
 
 
 class DriverTripCreate(BaseModel):
@@ -125,6 +130,36 @@ class DriverTripCreate(BaseModel):
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+    departure_time: time | None = None
+    price_per_seat_cents: int | None = Field(default=None, ge=0, le=100_000)
+    auto_accept_verified: bool = False
+    # 0 = Mon … 6 = Sun. Non-empty posts one trip per matching day this week.
+    repeat_weekdays: list[int] = Field(default_factory=list)
+
+
+class PricePreview(BaseModel):
+    pickup_location_id: str
+    destination_location_id: str
+    seats_available: int = Field(..., ge=1, le=8)
+
+
+class RatingCreate(BaseModel):
+    stars: int = Field(..., ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class SavedRouteCreate(BaseModel):
+    label: str = Field(..., min_length=1, max_length=60)
+    pickup_location_id: str
+    destination_location_id: str
+    departure_time: time | None = None
+    weekdays: list[int] = Field(default_factory=list)
+
+
+class RideAlertCreate(BaseModel):
+    destination_location_id: str
+    target_date: date
+    radius_meters: int = Field(default=5000, ge=500, le=50_000)
 
 
 class RideRequestPickupUpdate(BaseModel):
@@ -310,9 +345,10 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.patch("/me/profile")
     def update_profile(payload: ProfileUpdate, user: CurrentUser) -> dict[str, Any]:
+        extra = {"phone": payload.phone} if "phone" in payload.model_fields_set else {}
         profile = app.state.store.update_profile(
             user.id, payload.display_name, payload.photo_url, payload.bio,
-            payload.interests, payload.nationality,
+            payload.interests, payload.nationality, **extra,
         )
         return serialize(profile)
 
@@ -323,7 +359,10 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.put("/me/driver-readiness")
     def update_driver_readiness(payload: VehicleUpdate, user: CurrentUser) -> dict[str, Any]:
-        vehicle = app.state.store.update_vehicle(user.id, payload.model_dump())
+        data = payload.model_dump()
+        if "plate" not in payload.model_fields_set:
+            data.pop("plate")
+        vehicle = app.state.store.update_vehicle(user.id, data)
         return serialize(vehicle)
 
     @app.put("/me/location")
@@ -417,9 +456,31 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.post("/driver-trips")
     def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
-        trip = app.state.store.create_driver_trip(user.id, payload.model_dump())
-        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": trip.id})
-        return serialize_driver_trip(app.state.store, trip, exact=True)
+        data = payload.model_dump()
+        weekdays = data.pop("repeat_weekdays")
+        if weekdays:
+            trips = app.state.store.create_driver_trip_series(user.id, data, weekdays)
+        else:
+            trips = [app.state.store.create_driver_trip(user.id, data)]
+        for t in trips:
+            app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": t.id})
+        result = serialize_driver_trip(app.state.store, trips[0], exact=True)
+        result["series_trip_ids"] = [t.id for t in trips]
+        return result
+
+    @app.post("/driver-trips/price-preview")
+    def driver_trip_price_preview(payload: PricePreview, user: CurrentUser) -> dict[str, Any]:
+        """'Each rider pays' while a driver is still filling in the post form."""
+        _ = user
+        app.state.store._validate_location_ids(payload.pickup_location_id, payload.destination_location_id)
+        draft = DriverTrip(
+            id="preview", driver_id=user.id, pickup_location_id=payload.pickup_location_id,
+            destination_location_id=payload.destination_location_id, target_date=date.today(),
+            flexibility="flexible", seats_available=payload.seats_available, seats_reserved=0,
+            tags=[], status="open", created_at=datetime.now(),
+        )
+        _, draft.route_distance_m, draft.route_duration_s = app.state.store._compute_trip_route(draft)
+        return {**app.state.store.trip_pricing(draft), "duration_minutes": round(app.state.store.trip_duration_minutes(draft))}
 
     @app.post("/driver-trips/expire")
     def expire_driver_trips(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
@@ -474,7 +535,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/connections")
     def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
         connection = app.state.store.create_connection(user.id, payload.model_dump())
-        return serialize_connection(app.state.store, connection)
+        return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/expire")
     def expire_connections(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
@@ -493,7 +554,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.get("/me/connections")
     def my_connections(user: CurrentUser) -> list[dict[str, Any]]:
         connections = app.state.store.get_user_connections(user.id)
-        return [serialize_connection(app.state.store, c) for c in connections]
+        return [serialize_connection(app.state.store, c, viewer_id=user.id) for c in connections]
 
     @app.post("/connections/{connection_id}/transition")
     async def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser) -> dict[str, Any]:
@@ -505,7 +566,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "connection_id": connection_id,
             "status": connection.status,
         })
-        return serialize_connection(app.state.store, connection)
+        return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/{connection_id}/messages")
     async def add_message(connection_id: str, payload: MessageCreate, user: CurrentUser) -> dict[str, Any]:
@@ -609,9 +670,45 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "photo_verified": profile.photo_verified,
             "interests": profile.interests,
             "nationality": profile.nationality,
+            **app.state.store.user_stats(target_user_id),
         }
 
     # ── User actions ──────────────────────────────────────────────────────────
+
+    # ── Ratings, trip day, saved routes, alerts ───────────────────────────────
+
+    @app.post("/connections/{connection_id}/rating")
+    def rate_connection(connection_id: str, payload: RatingCreate, user: CurrentUser) -> dict[str, Any]:
+        return serialize(app.state.store.rate_connection(user.id, connection_id, payload.stars, payload.comment))
+
+    @app.get("/connections/{connection_id}/live")
+    def connection_live_status(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        return serialize(app.state.store.trip_day_status(user.id, connection_id))
+
+    @app.post("/connections/{connection_id}/at-pickup")
+    async def rider_at_pickup(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        connection = app.state.store.mark_rider_at_pickup(user.id, connection_id)
+        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        await app.state.ws_manager.broadcast([trip.driver_id], {"type": "rider_at_pickup", "connection_id": connection_id})
+        return serialize_connection(app.state.store, connection, viewer_id=user.id)
+
+    @app.get("/me/routes")
+    def my_saved_routes(user: CurrentUser) -> list[dict[str, Any]]:
+        return [serialize_saved_route(app.state.store, r) for r in app.state.store.list_saved_routes(user.id)]
+
+    @app.post("/me/routes")
+    def create_saved_route(payload: SavedRouteCreate, user: CurrentUser) -> dict[str, Any]:
+        return serialize_saved_route(app.state.store, app.state.store.create_saved_route(user.id, payload.model_dump()))
+
+    @app.delete("/me/routes/{route_id}")
+    def delete_saved_route(route_id: str, user: CurrentUser) -> dict[str, str]:
+        app.state.store.delete_saved_route(user.id, route_id)
+        return {"status": "deleted"}
+
+    @app.post("/ride-alerts")
+    def create_ride_alert(payload: RideAlertCreate, user: CurrentUser) -> dict[str, Any]:
+        return serialize(app.state.store.create_ride_alert(
+            user.id, payload.destination_location_id, payload.target_date, payload.radius_meters))
 
     @app.post("/users/{target_user_id}/block")
     def block_user(target_user_id: str, user: CurrentUser) -> dict[str, str]:
@@ -644,6 +741,18 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         user = app.state.store.suspend_user(admin.id, target_user_id, payload.reason)
         app.state.store.log_audit("USER_BLOCKED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id, "reason": payload.reason})
         return serialize(user)
+
+    @app.post("/admin/users/{target_user_id}/verify-id")
+    def admin_verify_id(target_user_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        target = app.state.store.set_id_verified(target_user_id, True)
+        app.state.store.log_audit("ID_VERIFIED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id})
+        return {"id": target.id, "id_verified": target.id_verified}
+
+    @app.post("/admin/users/{target_user_id}/unverify-id")
+    def admin_unverify_id(target_user_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
+        target = app.state.store.set_id_verified(target_user_id, False)
+        app.state.store.log_audit("ID_UNVERIFIED", admin.id, admin.email, client_ip(http_request), {"target_user_id": target_user_id})
+        return {"id": target.id, "id_verified": target.id_verified}
 
     @app.post("/admin/users/{target_user_id}/unsuspend")
     def admin_unsuspend_user(target_user_id: str, admin: AdminUser, http_request: Request) -> dict[str, Any]:
@@ -837,6 +946,16 @@ def serialize_report(store: Store, report: Any) -> dict[str, Any]:
     return data
 
 
+def _public_profile(store: Store, user_id: str) -> dict[str, Any] | None:
+    """A profile as other users may see it: never the phone number."""
+    profile = store.get_profile(user_id)
+    if profile is None:
+        return None
+    data = serialize(profile)
+    data.pop("phone", None)
+    return {**data, **store.user_stats(user_id)}
+
+
 def serialize_ride_request(store: Store, request: Any, exact: bool) -> dict[str, Any]:
     data = serialize(request)
     data["pickup"] = serialize_location(store, request.pickup_location_id, exact)
@@ -844,30 +963,59 @@ def serialize_ride_request(store: Store, request: Any, exact: bool) -> dict[str,
     rider_profile = store.get_profile(request.rider_id)
     data["rider_name"] = rider_profile.display_name if rider_profile else None
     data["rider_photo_url"] = rider_profile.photo_url if rider_profile else None
+    data["rider_stats"] = store.user_stats(request.rider_id)
     return data
 
 
 def serialize_driver_trip(store: Store, trip: Any, exact: bool) -> dict[str, Any]:
     data = serialize(trip)
+    data.pop("route_distance_m", None)
+    data.pop("route_duration_s", None)
     data["pickup"] = serialize_location(store, trip.pickup_location_id, exact)
     data["destination"] = serialize_location(store, trip.destination_location_id, exact)
     driver_profile = store.get_profile(trip.driver_id)
     data["driver_name"] = driver_profile.display_name if driver_profile else None
     data["driver_photo_url"] = driver_profile.photo_url if driver_profile else None
+    data["driver_stats"] = store.user_stats(trip.driver_id)
+    vehicle = store.get_vehicle(trip.driver_id)
+    # Make/model/color help riders spot the car; the plate waits for acceptance.
+    data["vehicle"] = ({"make": vehicle.make, "model": vehicle.model, "color": vehicle.color,
+                        "car_type": vehicle.car_type} if vehicle else None)
+    data["pricing"] = store.trip_pricing(trip)
+    data["duration_minutes"] = round(store.trip_duration_minutes(trip))
+    data["estimated_arrival_time"] = serialize(store.trip_arrival_time(trip))
     return data
 
 
-def serialize_connection(store: Store, connection: Any) -> dict[str, Any]:
+def serialize_connection(store: Store, connection: Any, viewer_id: str | None = None) -> dict[str, Any]:
     data = serialize(connection)
     exact = connection.status == "accepted"
     rr = store.get_ride_request(connection.ride_request_id)
     trip = store.get_driver_trip(connection.driver_trip_id)
     data["ride_request"] = serialize_ride_request(store, rr, exact=exact)
     data["driver_trip"] = serialize_driver_trip(store, trip, exact=exact)
-    rider_profile = store.get_profile(rr.rider_id)
-    driver_profile = store.get_profile(trip.driver_id)
-    data["rider_profile"] = serialize(rider_profile)
-    data["driver_profile"] = serialize(driver_profile)
+    data["rider_profile"] = _public_profile(store, rr.rider_id)
+    data["driver_profile"] = _public_profile(store, trip.driver_id)
+    # Contact details unlock once the ride is accepted: the other party's
+    # phone and, for the rider, the plate to look for at pickup.
+    if exact:
+        rider = store.get_profile(rr.rider_id)
+        driver = store.get_profile(trip.driver_id)
+        vehicle = store.get_vehicle(trip.driver_id)
+        if data["rider_profile"] is not None:
+            data["rider_profile"]["phone"] = rider.phone if rider else None
+        if data["driver_profile"] is not None:
+            data["driver_profile"]["phone"] = driver.phone if driver else None
+        data["driver_trip"]["vehicle"] = {**(data["driver_trip"]["vehicle"] or {}),
+                                          "plate": vehicle.plate if vehicle else None}
+    data["my_rating"] = store.my_rating_for(viewer_id, connection.id) if viewer_id else None
+    return data
+
+
+def serialize_saved_route(store: Store, route: dict[str, Any]) -> dict[str, Any]:
+    data = serialize({k: v for k, v in route.items() if k != "user_id"})
+    data["pickup"] = serialize_location(store, route["pickup_location_id"], True)
+    data["destination"] = serialize_location(store, route["destination_location_id"], True)
     return data
 
 
@@ -899,6 +1047,8 @@ def serialize(value: Any) -> Any:
     if isinstance(value, list):
         return [serialize(item) for item in value]
     if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, time):
         return value.isoformat()
     return value
 

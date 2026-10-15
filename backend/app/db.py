@@ -323,5 +323,63 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
+    # ── Trip-planning, trust and trip-day data (rider/driver redesign) ──────
+    # Optional exact departure time alongside the date + flexibility window;
+    # arrival is derived from the stored route duration, never stored.
+    cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS departure_time TIME")
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS departure_time TIME")
+    # Driver-set price per seat (NULL = use the suggested even gas split).
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS price_per_seat_cents INTEGER")
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS auto_accept_verified BOOLEAN NOT NULL DEFAULT FALSE")
+    # Trips posted together with "Repeat on weekdays" share a series id.
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS series_id TEXT")
+    # Shown to the other party only once a connection is accepted.
+    cur.execute("ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS plate TEXT")
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS phone TEXT")
+    # Set by an admin after checking ID; drives the "Verified" badge/filter
+    # and auto-accept.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_verified BOOLEAN NOT NULL DEFAULT FALSE")
+    # Trip-day: when the rider tapped "I'm at the pickup spot".
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS rider_at_pickup_at TIMESTAMPTZ")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ratings (
+            id            TEXT PRIMARY KEY,
+            connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+            rater_id      TEXT NOT NULL REFERENCES users(id),
+            ratee_id      TEXT NOT NULL REFERENCES users(id),
+            stars         INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+            comment       TEXT,
+            created_at    TIMESTAMPTZ NOT NULL,
+            UNIQUE (connection_id, rater_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ratings_ratee ON ratings (ratee_id)")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS saved_routes (
+            id                      TEXT PRIMARY KEY,
+            user_id                 TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            label                   TEXT NOT NULL,
+            pickup_location_id      TEXT NOT NULL REFERENCES locations(id),
+            destination_location_id TEXT NOT NULL REFERENCES locations(id),
+            departure_time          TIME,
+            weekdays                INTEGER[] NOT NULL DEFAULT '{}',
+            created_at              TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ride_alerts (
+            id                      TEXT PRIMARY KEY,
+            user_id                 TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            destination_location_id TEXT NOT NULL REFERENCES locations(id),
+            target_date             DATE NOT NULL,
+            radius_meters           INTEGER NOT NULL DEFAULT 5000,
+            created_at              TIMESTAMPTZ NOT NULL,
+            fulfilled_at            TIMESTAMPTZ
+        )
+    """)
+
     cur.close()
     conn.close()
