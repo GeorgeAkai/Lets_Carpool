@@ -212,7 +212,7 @@ function formatDistance(meters: number): string {
   return `${(meters / 1000).toFixed(1)} km`
 }
 
-const MONO: React.CSSProperties = { fontFamily: "'DM Mono', monospace" }
+const MONO: React.CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ── Lightweight "Where to?" search (Nominatim) ──────────────────────────────
 interface NominatimResult {

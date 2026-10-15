@@ -6,7 +6,7 @@ import { Account } from './pages/account'
 
 export function App() {
   return (
-    <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+    <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
       <Routes>
         <Route path="/auth/:pathname" element={<Auth />} />
         <Route path="/account/:pathname" element={<Account />} />

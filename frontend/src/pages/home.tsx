@@ -7,7 +7,7 @@ import {
   Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
   ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, Navigation,
-  ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive,
+  ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive, Home as HomeIcon,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useLocation, useNavigate } from 'react-router-dom'
@@ -21,6 +21,10 @@ import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
 import {
+  HomeScreen, ResultsScreen, RideDetailScreen, TripDayScreen, OfferRideScreen, StarRating, fmtTime,
+  defaultRideSearch, pickNextTrip, type RideSearch,
+} from './ride-flow'
+import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
   ViewToggleFab, OfferRideFab,
 } from './discover-mobile'
@@ -29,6 +33,7 @@ import { AdminView } from './admin'
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
+  | 'results' | 'ride' | 'trip' | 'offer'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -67,7 +72,7 @@ export interface PostPrefill {
   carType?: CarType; luggage?: LuggageSize
 }
 
-interface Connection {
+export interface Connection {
   id: string
   withUser: { name: string; initials: string; photoUrl: string | null }
   withUserId: string
@@ -86,9 +91,12 @@ interface Connection {
   destLat?: number; destLng?: number; destLabel?: string
   riderPickupLat?: number; riderPickupLng?: number; riderPickupLabel?: string
   lastMessage?: { content: string; createdAt: string; senderId: string } | null
+  // The full API record, for screens that need more than the inbox summary
+  // (trip-day plate/phone, times, pricing).
+  raw?: api.ApiConnection
 }
 
-interface LocationValue {
+export interface LocationValue {
   label: string
   lat: number
   lng: number
@@ -105,7 +113,7 @@ interface NominatimResult {
   address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
 }
 
-async function reverseGeocode(lat: number, lng: number): Promise<string> {
+export async function reverseGeocode(lat: number, lng: number): Promise<string> {
   try {
     const res = await fetch(
       `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
@@ -125,12 +133,16 @@ function shortLabel(r: NominatimResult): string {
   const city = a.city ?? a.town ?? a.village
   if (city) parts.push(city)
   if (a.state) parts.push(a.state)
-  return parts.filter(Boolean).join(', ')
+  // formatPlace drops the repeat when the place *is* the city ("Sacramento,
+  // Sacramento, California" → "Sacramento, CA").
+  return formatPlace(parts.filter(Boolean).join(', '))
 }
 
-function LocationInput({
-  label, value, onChange, placeholder, required, nearCoords,
+export function LocationInput({
+  label, value, onChange, placeholder, required, nearCoords, variant = 'form',
 }: {
+  // 'bare': borderless field with a small caption, for the Home search card.
+  variant?: 'form' | 'bare'
   label: string
   value: LocationValue | null
   onChange: (v: LocationValue | null) => void
@@ -203,11 +215,12 @@ function LocationInput({
     setSuggestions([])
   }
 
+  const bare = variant === 'bare'
   return (
-    <div ref={containerRef} className="space-y-1.5">
-      <label className="text-sm font-semibold">{label}</label>
+    <div ref={containerRef} className={bare ? 'flex-1 min-w-0' : 'space-y-1.5'}>
+      <label htmlFor={listboxId + '-input'} className={bare ? 'block text-xs text-muted-foreground' : 'text-sm font-semibold'}>{label}</label>
       <div className="relative">
-        <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+        {!bare && <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />}
         <input
           type="text"
           required={required}
@@ -223,7 +236,10 @@ function LocationInput({
             search(e.target.value)
           }}
           onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
-          className="w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground"
+          id={listboxId + '-input'}
+          className={bare
+            ? 'w-full bg-transparent border-0 p-0 pr-6 text-[17px] text-foreground placeholder:text-muted-foreground focus:outline-none'
+            : 'w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground'}
         />
         {loading && (
           <div className="absolute right-3 top-1/2 -translate-y-1/2 size-3.5 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
@@ -285,8 +301,8 @@ export const CAR_TYPE_EMOJI: Record<CarType, string> = {
   sedan: '🚗', suv: '🚙', van: '🚐', minivan: '🚐', truck: '🚚', other: '🚗',
 }
 
-export const SERIF: CSSProperties = { fontFamily: "'DM Serif Display', serif" }
-export const MONO: CSSProperties = { fontFamily: "'DM Mono', monospace" }
+export const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+export const MONO: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -308,7 +324,7 @@ function apiFlexibility(f: string): Flexibility {
 
 const VALID_RIDE_TAGS = new Set(['airport', 'student', 'church', 'college', 'work', 'event'])
 
-function tripToListing(trip: api.ApiDriverTrip): Listing {
+export function tripToListing(trip: api.ApiDriverTrip): Listing {
   const name = trip.driver_name ?? 'Driver'
   return {
     id: trip.id, type: 'driver', apiId: trip.id, ownerId: trip.driver_id,
@@ -340,7 +356,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
   }
 }
 
-function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
+export function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
   return {
     id: trip.id, type: 'driver',
     from: formatPlace(trip.pickup.label), to: formatPlace(trip.destination.label),
@@ -368,7 +384,7 @@ function requestToMyListing(req: api.ApiRideRequest): MyListing {
   }
 }
 
-function todayLocalISO(): string {
+export function todayLocalISO(): string {
   const now = new Date()
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 }
@@ -379,7 +395,7 @@ function isActiveListing(l: MyListing): boolean {
   return (l.status === 'open' || l.status === 'matched') && l.date >= todayLocalISO()
 }
 
-function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
+export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
   const isDriver = conn.driver_trip.driver_id === currentUserId
   const withUserId = isDriver ? conn.ride_request.rider_id : conn.driver_trip.driver_id
   const profile = isDriver ? conn.rider_profile : conn.driver_profile
@@ -388,7 +404,7 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
   const from = formatPlace(trip.pickup.label)
   const to = formatPlace(trip.destination.label)
   return {
-    id: conn.id,
+    id: conn.id, raw: conn,
     withUser: { name: otherName, initials: toInitials(otherName), photoUrl: profile?.photo_url ?? null },
     withUserId,
     initiatorUserId: conn.initiator_user_id ?? null,
@@ -1663,7 +1679,8 @@ function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClo
   )
 }
 
-function MyListingsView({ myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode }: {
+function MyListingsView({ myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay }: {
+  onOpenTripDay: (c: Connection) => void
   myListings: MyListing[]; connections: Connection[]
   onCancel: (listing: MyListing) => Promise<void>
   onManage: (listing: MyListing) => void; onViewMatches: (listing: MyListing) => void
@@ -1721,6 +1738,36 @@ function MyListingsView({ myListings, connections, onCancel, onManage, onViewMat
           </span>
         )}
       </div>
+
+      {tab === 'active' && (() => {
+        const today = todayLocalISO()
+        const booked = connections
+          .filter(c => c.myRole === mode && (c.status === 'accepted' || c.status === 'pending') && c.date >= today)
+          .sort((a, b) => a.date.localeCompare(b.date))
+        return booked.length > 0 ? (
+          <section className="space-y-2.5" aria-label="Upcoming rides">
+            <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Upcoming rides</h2>
+            {booked.map(c => {
+              const d = new Date(`${c.date}T00:00:00`)
+              const time = c.raw?.driver_trip.departure_time
+              return (
+                <button key={c.id} type="button" onClick={() => onOpenTripDay(c)}
+                  className="w-full text-left bg-card border border-border rounded-2xl p-3.5 flex items-center gap-3 hover:bg-muted transition-colors">
+                  <div className="size-12 rounded-xl bg-muted flex flex-col items-center justify-center shrink-0">
+                    <span className="text-[11px] text-muted-foreground font-semibold uppercase">{d.toLocaleDateString([], { weekday: 'short' })}</span>
+                    <span className="text-[17px] font-bold">{d.getDate()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[15px] font-semibold truncate">{time ? `${fmtTime(time)} ` : ''}{c.myRole === 'driver' ? `picking up ${c.withUser.name}` : `with ${c.withUser.name}`}</p>
+                    <p className="text-[13px] text-muted-foreground truncate">{c.from} ➔ {c.to}</p>
+                  </div>
+                  <ConnStatusBadge status={c.status} />
+                </button>
+              )
+            })}
+          </section>
+        ) : null
+      })()}
 
       {tab === 'pools' ? (
         <PoolView userCoords={userCoords} currentUserId={currentUserId} showToast={showToast} />
@@ -1818,9 +1865,10 @@ function ConversationListItem({ connection, selected, currentUserId, onSelect }:
 
 function ConversationPane({
   connection, currentUserId, onBack, onAccept, onDecline, onCancel, onComplete, showToast,
-  onViewRoute, onStartDriving, onMarkRead, initialPanel, incomingMessage, onMessageSent, onUpdatePickup,
+  onViewRoute, onStartDriving, onMarkRead, initialPanel, incomingMessage, onMessageSent, onUpdatePickup, onOpenTripDay,
 }: {
   onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
+  onOpenTripDay: (conn: Connection) => void
   connection: Connection; currentUserId: string; onBack?: () => void
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
@@ -1838,6 +1886,7 @@ function ConversationPane({
       : null,
   )
   const [savingPickup, setSavingPickup] = useState(false)
+  const [myRating, setMyRating] = useState<number | null>(connection.raw?.my_rating ?? null)
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
   const [msgsLoaded, setMsgsLoaded] = useState(false)
   const [msgText, setMsgText] = useState('')
@@ -1982,6 +2031,7 @@ function ConversationPane({
                 {connection.myRole === 'driver' && hasRiderPickupCoords && (
                   <button onClick={() => onStartDriving(connection)} className={`${btn} bg-green-600 text-white font-semibold hover:bg-green-700`}><Car className="size-4" />Start Driving</button>
                 )}
+                <button onClick={() => onOpenTripDay(connection)} className={`${btn} bg-primary text-primary-foreground font-semibold hover:brightness-105`}><Calendar className="size-4" />Trip day</button>
                 {hasRouteCoords && <button onClick={() => onViewRoute(connection)} className={btnOutline}><Map className="size-4" />Route</button>}
                 {connection.myRole === 'rider' && (
                   <button onClick={() => setPanel(panel === 'pickup' ? null : 'pickup')} aria-pressed={panel === 'pickup'} className={btnOutline}><MapPin className="size-4" />Pickup address</button>
@@ -2092,6 +2142,15 @@ function ConversationPane({
             <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} placeholder={`Message ${connection.withUser.name}…`} aria-label="Message" className="flex-1 min-w-0 px-4 py-2.5 rounded-full bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
             <button type="submit" disabled={sending || !msgText.trim()} aria-label="Send message" className="shrink-0 size-10 rounded-full bg-primary text-primary-foreground disabled:opacity-50 flex items-center justify-center transition-colors"><Send className="size-4" /></button>
           </form>
+        ) : status === 'completed' ? (
+          <div className="flex flex-col items-center gap-1">
+            <p className="text-sm text-muted-foreground">{myRating ? 'Your rating' : `Rate your ride with ${connection.withUser.name}`}</p>
+            <StarRating value={myRating} onChange={async n => {
+              setMyRating(n)
+              try { await api.rateConnection(connectionId, n); showToast('Thanks for rating', 'success') }
+              catch (e) { setMyRating(connection.raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+            }} />
+          </div>
         ) : (
           <p className="text-sm text-muted-foreground text-center">This conversation is closed — the ride was {status}.</p>
         )}
@@ -2102,9 +2161,10 @@ function ConversationPane({
 
 function InboxView({
   connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving,
-  onMarkRead, deepLink, onDeepLinkHandled, listingFilter, onClearListingFilter, incomingMessage, onMessageSent, onUpdatePickup,
+  onMarkRead, deepLink, onDeepLinkHandled, listingFilter, onClearListingFilter, incomingMessage, onMessageSent, onUpdatePickup, onOpenTripDay,
 }: {
   onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
+  onOpenTripDay: (conn: Connection) => void
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
@@ -2165,7 +2225,7 @@ function InboxView({
       onBack={isMobile ? () => setSelectedId(null) : undefined}
       onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
       showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
-      initialPanel={initialPanel} incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup}
+      initialPanel={initialPanel} incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup} onOpenTripDay={onOpenTripDay}
     />
   )
 
@@ -2346,9 +2406,11 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   const [interests, setInterests] = useState<string[]>(profile.interests ?? [])
   const [interestDraft, setInterestDraft] = useState('')
   const [nationality, setNationality] = useState(profile.nationality ?? '')
+  const [phone, setPhone] = useState(profile.phone ?? '')
   const [make, setMake] = useState(vehicle?.make ?? '')
   const [model, setModel] = useState(vehicle?.model ?? '')
   const [color, setColor] = useState(vehicle?.color ?? '')
+  const [plate, setPlate] = useState(vehicle?.plate ?? '')
   const [vSeats, setVSeats] = useState(vehicle?.seats != null ? String(vehicle.seats) : '')
   const [vCarType, setVCarType] = useState(vehicle?.car_type ?? '')
   const [hasLicense, setHasLicense] = useState(vehicle?.has_license ?? false)
@@ -2370,9 +2432,11 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   // (which would mark them as "driver ready" and skip vehicle setup later).
   const profileDirty =
     displayName !== profile.display_name || bio !== (profile.bio ?? '') || nationality !== (profile.nationality ?? '') ||
+    phone !== (profile.phone ?? '') ||
     interests.join('\u0000') !== (profile.interests ?? []).join('\u0000')
   const vehicleDirty =
     make !== (vehicle?.make ?? '') || model !== (vehicle?.model ?? '') || color !== (vehicle?.color ?? '') ||
+    plate !== (vehicle?.plate ?? '') ||
     vSeats !== (vehicle?.seats != null ? String(vehicle.seats) : '') || vCarType !== (vehicle?.car_type ?? '') ||
     hasLicense !== (vehicle?.has_license ?? false) || hasInsurance !== (vehicle?.has_insurance ?? false) ||
     hasRecord !== (vehicle?.has_good_driving_record ?? false)
@@ -2387,14 +2451,15 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
     try {
       let next: ApiUser = currentUser
       if (profileDirty || pendingInterest) {
-        const updated = await api.updateProfile(displayName.trim(), profile.photo_url, bio || null, nextInterests, nationality || null)
-        next = { ...next, profile: { ...next.profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality } }
+        const updated = await api.updateProfile(displayName.trim(), profile.photo_url, bio || null, nextInterests, nationality || null, phone.trim() || null)
+        next = { ...next, profile: { ...next.profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality, phone: updated.phone } }
       }
       if (vehicleDirty) {
         const v = await api.updateDriverReadiness({
           make: make || undefined, model: model || undefined, color: color || undefined,
           seats: vSeats ? parseInt(vSeats, 10) : undefined, car_type: vCarType || undefined,
           has_license: hasLicense, has_insurance: hasInsurance, has_good_driving_record: hasRecord,
+          plate: plate.trim() || null,
         })
         next = { ...next, vehicle: v }
       }
@@ -2465,6 +2530,11 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
               <input id="pf-nat" value={nationality} onChange={e => setNationality(e.target.value)} placeholder="e.g. Kenyan" className={inputCls} />
             </div>
             <div className="space-y-1.5">
+              <label htmlFor="pf-phone" className="text-sm font-medium">Phone <span className="text-muted-foreground font-normal">(optional)</span></label>
+              <input id="pf-phone" type="tel" autoComplete="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 123 4567" className={inputCls} />
+              <p className="text-xs text-muted-foreground">Only shared with your ride partner once a ride is accepted, so they can call you on trip day.</p>
+            </div>
+            <div className="space-y-1.5">
               <label htmlFor="pf-int" className="text-sm font-medium">Interests <span className="text-muted-foreground font-normal">(icebreakers, e.g. "Loves Afrobeat")</span></label>
               {interests.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mb-1">
@@ -2504,6 +2574,11 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
               </div>
             ))}
             <div className="space-y-1.5"><label htmlFor="veh-seats" className="text-sm font-medium">Seats</label><input id="veh-seats" type="number" min="1" max="9" value={vSeats} onChange={e => setVSeats(e.target.value)} placeholder="4" className={inputCls} /></div>
+            <div className="space-y-1.5 col-span-2">
+              <label htmlFor="veh-plate" className="text-sm font-medium">License plate</label>
+              <input id="veh-plate" value={plate} onChange={e => setPlate(e.target.value.toUpperCase())} maxLength={10} placeholder="e.g. 8KXR214" className={`${inputCls} uppercase tracking-wider`} />
+              <p className="text-xs text-muted-foreground">Riders see it only after you accept them, so they can find your car at pickup.</p>
+            </div>
           </div>
           <div className="space-y-1.5">
             <p className="text-sm font-medium">Vehicle type</p>
@@ -2737,27 +2812,27 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, ini
 }
 
 function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v: View) => void; unreadMessages: number }) {
-  // Trimmed to 4 core tabs — Map is a toggle inside Discover, Pools lives
-  // inside My Rides, and ride creation moved to the Discover FAB.
-  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
-    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
-    { id: 'my-listings', label: 'My Rides', icon: <Car className="size-5" /> },
-    { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
-    { id: 'profile', label: 'Profile', icon: <Shield className="size-5" /> },
+  // Home / Trips / Messages / Profile. Searching, posting and the map all
+  // start from Home; Pools lives inside Trips.
+  const items: Array<{ id: View; label: string; icon: React.ReactNode; also: View[] }> = [
+    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post'] },
+    { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools'] },
+    { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
+    { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin'] },
   ]
   return (
-    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-background/95 backdrop-blur border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
-      <div className="flex items-center justify-around px-2 h-16">
-        {items.map(({ id, label, icon }) => {
-          const active = view === id || (id === 'feed' && view === 'map')
+    <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-sidebar border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
+      <div className="grid grid-cols-4 px-2 h-[4.25rem] pt-2">
+        {items.map(({ id, label, icon, also }) => {
+          const active = view === id || also.includes(view)
           const badge = id === 'connections' ? unreadMessages : 0
           return (
-            <button key={id} onClick={() => setView(id)} aria-label={label} aria-current={active ? 'page' : undefined} className={`relative flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+            <button key={id} onClick={() => setView(id)} aria-label={label} aria-current={active ? 'page' : undefined} className={`relative flex flex-col items-center gap-1 rounded-xl transition-colors ${active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
               {icon}
               {badge > 0 && (
                 <span className="absolute -top-0.5 right-1.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{badge > 9 ? '9+' : badge}</span>
               )}
-              <span className="text-[10px] font-medium">{label}</span>
+              <span className="text-[11px] font-semibold">{label}</span>
             </button>
           )
         })}
@@ -2858,13 +2933,15 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 // Each app view has its own URL so tabs are linkable, survive a refresh and
 // work with the browser's back button.
 const VIEW_PATHS: Record<View, string> = {
-  home: '/discover', feed: '/discover', admin: '/admin', map: '/map', pools: '/pools', post: '/post',
+  home: '/discover', feed: '/discover', admin: '/admin',
+  results: '/rides', ride: '/rides/detail', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
   'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
 }
 const PATH_VIEWS: Record<string, View> = {
   '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
   '/my-rides': 'my-listings', '/connections': 'connections', '/inbox': 'connections',
   '/notifications': 'notifications', '/profile': 'profile', '/admin': 'admin',
+  '/rides': 'results', '/rides/detail': 'ride', '/trip': 'trip', '/offer': 'offer',
 }
 
 export function Home() {
@@ -2936,6 +3013,12 @@ export function Home() {
   // ── My Listings ──
   const [myListings, setMyListings] = useState<MyListing[]>([])
   const [postPrefill, setPostPrefill] = useState<PostPrefill | null>(null)
+
+  // ── Ride flow (Home → Results → Ride details; Trip day; Offer a ride) ──
+  const [rideSearch, setRideSearch] = useState<RideSearch>(defaultRideSearch)
+  const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
+  const [tripDayId, setTripDayId] = useState<string | null>(null)
+  const [savedRoutes, setSavedRoutes] = useState<api.SavedRoute[]>([])
   useEffect(() => { if (view !== 'post') setPostPrefill(null) }, [view])
 
   // ── Connections ──
@@ -3086,6 +3169,7 @@ export function Home() {
   }, [])
 
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
+  useEffect(() => { if (currentUser) api.getSavedRoutes().then(setSavedRoutes).catch(() => {}) }, [currentUser])
 
   // ── Feed ──
   // Deliberately no pickup-radius pre-filter: Discover should show every
@@ -3166,14 +3250,21 @@ export function Home() {
   }, [connections])
 
   // ── Handlers ──
-  const onConnect = useCallback(async (listing: Listing) => {
+  // `opts` comes from the Home → Results → Ride details flow, which knows the
+  // rider's real start, destination, seats and time; the plain feed falls back
+  // to the current location for both ends.
+  const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }) => {
     try {
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
-      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      const from = opts?.from && Number.isFinite(opts.from.lat) ? opts.from : null
+      const pickupLabel = from ? from.label : userCoords ? await reverseGeocode(lat, lng) : 'My location'
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
+        const [p, d] = await Promise.all([
+          api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
+          opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
+        ])
+        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null })
         conn = await api.createConnection(rr.id, listing.apiId)
       } else {
         const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
@@ -3183,8 +3274,9 @@ export function Home() {
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
       const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
       setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
+      if (opts?.quiet) return
       setInboxListingFilter(null); setConnDeepLink({ connectionId: newConn.id, section: 'chat' }); setView('connections')
-    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error'); if (opts?.quiet) throw e }
   }, [currentUser, userCoords, showToast, setView])
 
   const onPost = useCallback((listing: MyListing) => {
@@ -3324,11 +3416,19 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer']
+  const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
     : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
+    // Screens that need in-memory context fall back after a reload.
+    : view === 'ride' && !selectedTrip ? 'results'
+    : view === 'trip' && !tripDayConnection ? 'my-listings'
     : view
+  // Full-screen flow steps bring their own back/close controls and sticky
+  // action bar, so the app chrome steps aside on phones (as on the map).
+  const immersive = guardedView === 'map' || guardedView === 'results' || guardedView === 'ride' || guardedView === 'trip' || guardedView === 'offer'
+  const hideTopBarOnMobile = immersive || guardedView === 'feed'
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
 
@@ -3375,16 +3475,105 @@ export function Home() {
 
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
-      <div className={guardedView === 'map' ? 'hidden xl:block' : ''}>
+      <div className={hideTopBarOnMobile ? 'hidden xl:block' : ''}>
         <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} onOpenAdmin={() => setView('admin')} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
       {!isMobile && <Sidebar view={guardedView} setView={setView} unreadCount={unreadCount} />}
 
-      <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
+      <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
-            {guardedView === 'feed' && (
+            {guardedView === 'feed' && isMobile && (
+              <HomeScreen
+                mode={mode} currentUser={currentUser} hasLocation={!!userCoords}
+                search={rideSearch} setSearch={setRideSearch}
+                savedRoutes={savedRoutes}
+                onSaveRoute={async label => {
+                  const to = rideSearch.to; if (!to) return
+                  const from = rideSearch.from && Number.isFinite(rideSearch.from.lat) ? rideSearch.from
+                    : userCoords ? { label: await reverseGeocode(userCoords.lat, userCoords.lng), lat: userCoords.lat, lng: userCoords.lng } : null
+                  if (!from) { showToast('Turn on location or pick a start point first', 'error'); return }
+                  try {
+                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng), api.createLocation(to.label, to.lat, to.lng)])
+                    const route = await api.createSavedRoute({ label, pickup_location_id: p.id, destination_location_id: d.id, departure_time: rideSearch.time || null })
+                    setSavedRoutes(prev => [...prev, route]); showToast('Route saved', 'success')
+                  } catch (e) { showToast(e instanceof Error ? e.message : 'Could not save route', 'error') }
+                }}
+                onDeleteRoute={async id => {
+                  try { await api.deleteSavedRoute(id); setSavedRoutes(prev => prev.filter(r => r.id !== id)) }
+                  catch (e) { showToast(e instanceof Error ? e.message : 'Could not delete route', 'error') }
+                }}
+                nextTrip={pickNextTrip(connections, mode)}
+                onPrimary={() => setView(mode === 'driver' ? 'offer' : 'results')}
+                onOpenTrip={c => { setTripDayId(c.id); setView('trip') }}
+                onOpenProfile={() => setView('profile')}
+                onOpenMap={() => setView('map')}
+                onOpenNotifications={() => setView('notifications')}
+                unreadNotifications={unreadCount}
+              >
+                {mode === 'driver' && (() => {
+                  const requests = filteredListings.filter(l => l.type === 'rider' && l.ownerId !== currentUser.id).slice(0, 5)
+                  return requests.length > 0 ? (
+                    <section className="flex flex-col gap-2.5">
+                      <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Riders looking for a ride</h2>
+                      {requests.map(l => (
+                        <MobileListingCard key={l.id} listing={l} currentUserId={currentUser.id} onEditOwn={() => setView('my-listings')}
+                          alreadyConnected={connectedListingIds.has(l.apiId)}
+                          onConnect={l2 => { onConnect(l2).catch(() => {}) }} />
+                      ))}
+                    </section>
+                  ) : null
+                })()}
+              </HomeScreen>
+            )}
+            {guardedView === 'results' && (
+              <ResultsScreen
+                search={rideSearch} userCoords={userCoords} currentUserId={currentUser.id}
+                requestedTripIds={connectedListingIds}
+                onBack={() => setView('feed')}
+                onOpenTrip={t => { setSelectedTrip(t); setView('ride') }}
+                onNotify={async () => {
+                  const to = rideSearch.to; if (!to) return
+                  const d = await api.createLocation(to.label, to.lat, to.lng)
+                  await api.createRideAlert(d.id, rideSearch.date)
+                  showToast("We'll notify you when a ride is posted", 'success')
+                }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'ride' && selectedTrip && (
+              <RideDetailScreen
+                trip={selectedTrip} seats={rideSearch.seats}
+                requested={connectedListingIds.has(selectedTrip.id)}
+                onBack={() => setView('results')}
+                onRequest={async () => {
+                  await onConnect(tripToListing(selectedTrip), {
+                    from: rideSearch.from, to: rideSearch.to, seats: rideSearch.seats, time: rideSearch.time, quiet: true,
+                  })
+                  setInboxListingFilter(null); setConnDeepLink(null); setView('connections')
+                }}
+              />
+            )}
+            {guardedView === 'trip' && tripDayConnection && (
+              <TripDayScreen
+                connection={tripDayConnection} currentUserId={currentUser.id}
+                onClose={() => setView('my-listings')}
+                onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
+                onStartDriving={onStartDriving}
+                onComplete={async id => { await onComplete(id); showToast('Ride completed!', 'success') }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'offer' && (
+              <OfferRideScreen
+                initial={rideSearch} userCoords={userCoords} vehicle={currentUser.vehicle}
+                onBack={() => setView('feed')}
+                onPosted={() => { loadListings(); loadMyListings(); setView('my-listings') }}
+                showToast={showToast}
+              />
+            )}
+            {guardedView === 'feed' && !isMobile && (
               mode === 'driver' ? (
                 <DriverHomeView
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
@@ -3433,12 +3622,6 @@ export function Home() {
                 } />
               )
             )}
-            {guardedView === 'feed' && isMobile && (
-              <>
-                <ViewToggleFab onClick={() => setView('map')} />
-                <OfferRideFab mode={mode} onClick={() => setView('post')} />
-              </>
-            )}
             {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView key={postPrefill?.key ?? 'new'} onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} prefill={postPrefill} onClearPrefill={() => setPostPrefill(null)} />}
@@ -3447,6 +3630,7 @@ export function Home() {
                 myListings={myListings} connections={connections} onCancel={onCancelListing}
                 onManage={onManageListing} onViewMatches={onViewMatches} onClone={onCloneListing} onPostNew={() => setView('post')}
                 userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode}
+                onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
               />
             )}
             {guardedView === 'connections' && (
@@ -3457,6 +3641,7 @@ export function Home() {
                 deepLink={connDeepLink} onDeepLinkHandled={() => setConnDeepLink(null)}
                 listingFilter={inboxListingFilter} onClearListingFilter={() => setInboxListingFilter(null)}
                 incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup}
+                onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
               />
             )}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
@@ -3466,7 +3651,7 @@ export function Home() {
         </div>
       </div>
 
-      <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} />
+      {!immersive || guardedView === 'map' ? <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} /> : null}
     </div>
   )
 }

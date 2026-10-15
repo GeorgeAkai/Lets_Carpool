@@ -160,6 +160,14 @@ function UserDirectory({ showToast }: { showToast: Toast }) {
     } catch (e) { showToast(e instanceof Error ? e.message : 'Action failed', 'error') }
   }
 
+  const toggleIdVerified = async (u: ApiAdminUser) => {
+    try {
+      const res = await api.setUserIdVerified(u.id, !u.id_verified)
+      setUsers(prev => prev.map(x => x.id === u.id ? { ...x, id_verified: res.id_verified } : x))
+      showToast(res.id_verified ? 'ID marked verified' : 'ID verification removed', 'success')
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+
   const warn = async (u: ApiAdminUser) => {
     const message = window.prompt(`Warning message to send to ${u.display_name || u.email}:`)
     if (!message) return
@@ -219,6 +227,14 @@ function UserDirectory({ showToast }: { showToast: Toast }) {
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center justify-end gap-2">
+                    <button
+                      onClick={() => toggleIdVerified(u)}
+                      aria-pressed={u.id_verified}
+                      title={u.id_verified ? 'ID verified — click to remove' : 'Mark ID as verified'}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-colors ${u.id_verified ? 'bg-info/15 text-info hover:bg-info/25' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
+                    >
+                      <ShieldCheck className="size-3.5" />{u.id_verified ? 'ID verified' : 'Verify ID'}
+                    </button>
                     <button onClick={() => warn(u)} title="Send warning" className="p-1.5 rounded-lg text-muted-foreground hover:text-amber-600 hover:bg-amber-500/10 transition-colors"><MessageSquareWarning className="size-4" /></button>
                     <button
                       onClick={() => toggleSuspend(u)}

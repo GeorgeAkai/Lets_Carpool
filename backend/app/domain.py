@@ -2071,7 +2071,7 @@ class Store:
             cur = self._cur(conn)
             cur.execute(
                 f"""SELECT u.id, u.email, u.email_domain, u.created_at, u.status,
-                           u.suspended_at, u.suspended_reason,
+                           u.suspended_at, u.suspended_reason, u.id_verified,
                            p.display_name, p.photo_url,
                            EXISTS(SELECT 1 FROM driver_trips dt WHERE dt.driver_id = u.id) AS is_driver,
                            EXISTS(SELECT 1 FROM ride_requests rr WHERE rr.rider_id = u.id) AS is_rider,
