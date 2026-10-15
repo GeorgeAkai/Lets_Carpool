@@ -667,6 +667,43 @@ def test_connection_chat_gas_split_notifications_completion_and_seat_reservation
     assert by_type["gas_split_confirmed"]["related_id"] == connection["id"]
 
 
+def test_rider_can_update_pickup_address_once_connection_is_accepted() -> None:
+    api = client()
+    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+
+    connection = api.post(
+        "/connections",
+        headers=rider_headers,
+        json={"ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]},
+    ).json()
+    api.post(f"/connections/{connection['id']}/transition", headers=driver_headers, json={"action": "accept"})
+
+    new_pickup = location(api, rider_headers, "123 Telegraph Ave, Berkeley, CA", 37.8691, -122.2585)
+    updated = api.patch(
+        f"/ride-requests/{ride_request['id']}/pickup",
+        headers=rider_headers,
+        json={"pickup_location_id": new_pickup["id"]},
+    )
+    forbidden = api.patch(
+        f"/ride-requests/{ride_request['id']}/pickup",
+        headers=driver_headers,
+        json={"pickup_location_id": new_pickup["id"]},
+    )
+    missing_location = api.patch(
+        f"/ride-requests/{ride_request['id']}/pickup",
+        headers=rider_headers,
+        json={"pickup_location_id": "loc_does_not_exist"},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["pickup"]["label"] == "123 Telegraph Ave, Berkeley, CA"
+    accepted_conn = api.get("/me/connections", headers=driver_headers).json()[0]
+    assert accepted_conn["ride_request"]["pickup"]["label"] == "123 Telegraph Ave, Berkeley, CA"
+    assert forbidden.status_code == 403
+    assert missing_location.status_code == 404
+    assert rider["id"] != driver["id"]
+
+
 def test_notifications_mark_all_read_and_dismiss() -> None:
     api = client()
     rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
@@ -914,3 +951,326 @@ def test_pool_chat_is_off_limits_to_non_members_and_users_who_left() -> None:
     assert outsider_post.status_code == 403
     assert outsider_read.status_code == 403
     assert leaver_post.status_code == 403
+
+
+# ─── Route-corridor matching ──────────────────────────────────────────────────
+
+class FakeRouter:
+    """Straight-line 'road' through the given points at a fixed 60 km/h, so
+    corridor and detour behaviour is testable without a real OSRM."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[tuple[float, float]]] = []
+
+    def route(self, points):
+        from math import asin, cos, radians, sin, sqrt
+
+        from backend.app.routing import RouteResult
+
+        self.calls.append(list(points))
+        total = 0.0
+        for (lat1, lng1), (lat2, lng2) in zip(points, points[1:]):
+            a = sin(radians(lat2 - lat1) / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(radians(lng2 - lng1) / 2) ** 2
+            total += 2 * 6371000 * asin(sqrt(a))
+        # Densify the single-leg route so ST_LineLocatePoint has vertices to use.
+        (lat1, lng1), (lat2, lng2) = points[0], points[-1]
+        coords = [(lng1 + (lng2 - lng1) * i / 20, lat1 + (lat2 - lat1) * i / 20) for i in range(21)]
+        return RouteResult(distance_m=total, duration_s=total / (60 / 3.6), coordinates=coords)
+
+
+def corridor_client(router: FakeRouter) -> TestClient:
+    settings = Settings(
+        database_url=TEST_DATABASE_URL, neon_auth_url=TEST_NEON_AUTH_URL, cron_secret=TEST_CRON_SECRET,
+    )
+    return TestClient(create_app(store=Store(TEST_DATABASE_URL, router=router), settings=settings))
+
+
+def post_trip(api: TestClient, headers: dict, pickup: dict, destination: dict) -> dict:
+    response = api.post(
+        "/driver-trips", headers=headers,
+        json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": date.today().isoformat(), "flexibility": "Friday morning",
+            "seats_available": 2, "tags": [],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_corridor_search_matches_riders_along_the_route_in_the_same_direction() -> None:
+    # Driver goes Oakland → San Jose (roughly south-east along I-880). A rider
+    # in Fremont heading to Milpitas is on the corridor; the opposite-direction
+    # rider (Milpitas → Fremont) and a rider far off the route must not match.
+    router = FakeRouter()
+    api = corridor_client(router)
+    _, rider_headers = auth(api, "corr-rider@example.edu", "Cora Rider")
+    _, driver_headers = auth(api, "corr-driver@example.com", "Cal Driver")
+    oakland = location(api, driver_headers, "Oakland, CA", 37.8044, -122.2712)
+    san_jose = location(api, driver_headers, "San Jose, CA", 37.3382, -121.8863)
+    trip = post_trip(api, driver_headers, oakland, san_jose)
+
+    def search(pickup: tuple[float, float], dest: tuple[float, float]) -> list[dict]:
+        return api.get(
+            "/driver-trips/search", headers=rider_headers,
+            params={
+                "pickup_latitude": pickup[0], "pickup_longitude": pickup[1],
+                "destination_latitude": dest[0], "destination_longitude": dest[1],
+            },
+        ).json()
+
+    # Points exactly on the straight driver line: 40% and 70% of the way.
+    def along(f: float) -> tuple[float, float]:
+        return (37.8044 + (37.3382 - 37.8044) * f, -122.2712 + (-121.8863 + 122.2712) * f)
+
+    forward = search(along(0.4), along(0.7))
+    assert [t["id"] for t in forward] == [trip["id"]]
+    assert forward[0]["detour_minutes"] is not None and forward[0]["detour_minutes"] < 1
+    assert search(along(0.7), along(0.4)) == []  # opposite direction on the same road
+    assert search((37.7749, -122.4194), (37.9, -122.5)) == []  # nowhere near the route
+
+
+def test_corridor_search_reports_detour_minutes_for_off_route_pickups() -> None:
+    router = FakeRouter()
+    api = corridor_client(router)
+    _, rider_headers = auth(api, "det-rider@example.edu", "Dina Rider")
+    _, driver_headers = auth(api, "det-driver@example.com", "Dev Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    post_trip(api, driver_headers, a, b)
+
+    # Rider ~890 m north of the line (inside the 1000 m buffer), mid-route: the
+    # insertion route is longer than the direct one, so detour is > 0.
+    trips = api.get(
+        "/driver-trips/search", headers=rider_headers,
+        params={
+            "pickup_latitude": 37.008, "pickup_longitude": -121.995,
+            "destination_latitude": 37.008, "destination_longitude": -121.985,
+        },
+    ).json()
+    assert len(trips) == 1
+    assert trips[0]["detour_minutes"] > 0
+    # driver pickup → rider pickup → rider destination → driver destination
+    assert len(router.calls[-1]) == 4
+
+
+def test_trips_without_a_stored_route_fall_back_to_endpoint_radius_matching() -> None:
+    # No router configured (or OSRM down at creation): the trip has no
+    # route_geog, and a rider search with both points still finds it through the
+    # old pickup/destination radius rules instead of silently excluding it.
+    api = client()
+    _, rider_headers, _, _, _, driver_trip = make_request_and_trip(api)
+    trips = api.get(
+        "/driver-trips/search", headers=rider_headers,
+        params={
+            "pickup_latitude": 37.8715, "pickup_longitude": -122.2730,
+            "destination_latitude": 37.6213, "destination_longitude": -122.3790,
+        },
+    ).json()
+    assert [t["id"] for t in trips] == [driver_trip["id"]]
+    assert trips[0]["detour_minutes"] is None
+
+
+def test_trip_creation_survives_routing_failure() -> None:
+    class DownRouter:
+        def route(self, points):
+            return None
+
+    api = corridor_client(DownRouter())  # type: ignore[arg-type]
+    _, driver_headers = auth(api, "down-driver@example.com", "Dan Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.0)
+    post_trip(api, driver_headers, a, b)
+
+
+def test_corridor_search_results_never_expose_coordinates_or_route_data() -> None:
+    # Detour/ETA is computed server-side from stored lat/lng; the pre-connection
+    # response must carry only the derived number, not exact pins or the route.
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "priv-rider@example.edu", "Pia Rider")
+    _, driver_headers = auth(api, "priv-driver@example.com", "Pat Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    post_trip(api, driver_headers, a, b)
+
+    trips = api.get(
+        "/driver-trips/search", headers=rider_headers,
+        params={
+            "pickup_latitude": 37.0, "pickup_longitude": -121.995,
+            "destination_latitude": 37.0, "destination_longitude": -121.985,
+        },
+    ).json()
+
+    assert len(trips) == 1 and trips[0]["detour_minutes"] is not None
+    for place in (trips[0]["pickup"], trips[0]["destination"]):
+        assert place["exact"] is False
+        assert "latitude" not in place and "longitude" not in place
+    assert not any(k.startswith("route") for k in trips[0])
+
+
+# ─── Proposed matches (Empower-style) ─────────────────────────────────────────
+
+def make_rider_request(api: TestClient, headers: dict, pickup: tuple[float, float], dest: tuple[float, float]) -> dict:
+    p = location(api, headers, "Rider pickup", *pickup)
+    d = location(api, headers, "Rider dest", *dest)
+    response = api.post(
+        "/ride-requests", headers=headers,
+        json={
+            "pickup_location_id": p["id"], "destination_location_id": d["id"],
+            "target_date": date.today().isoformat(), "flexibility": "Friday morning",
+            "passenger_count": 1, "tags": [],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_proposal_is_the_lowest_detour_trip_and_skipping_advances_to_the_next() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "prop-rider@example.edu", "Pru Rider")
+    _, near_headers = auth(api, "prop-near@example.com", "Near Driver")
+    _, far_headers = auth(api, "prop-far@example.com", "Far Driver")
+
+    # Two trips sharing the corridor; the rider sits on the first one's line and
+    # ~890 m off the second's, so the first has the smaller detour.
+    a1 = location(api, near_headers, "A1", 37.0, -122.0)
+    b1 = location(api, near_headers, "B1", 37.0, -121.98)
+    near_trip = post_trip(api, near_headers, a1, b1)
+    a2 = location(api, far_headers, "A2", 37.008, -122.0)
+    b2 = location(api, far_headers, "B2", 37.008, -121.98)
+    far_trip = post_trip(api, far_headers, a2, b2)
+
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+
+    first = api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()
+    assert first["trip"]["id"] == near_trip["id"]
+    assert first["remaining"] == 1
+    assert first["trip"]["pickup"]["exact"] is False
+
+    skip = api.post(
+        f"/ride-requests/{rr['id']}/proposal/skip", headers=rider_headers,
+        json={"driver_trip_id": near_trip["id"]},
+    )
+    assert skip.status_code == 200
+    second = api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()
+    assert second["trip"]["id"] == far_trip["id"] and second["remaining"] == 0
+
+    api.post(
+        f"/ride-requests/{rr['id']}/proposal/skip", headers=rider_headers,
+        json={"driver_trip_id": far_trip["id"]},
+    )
+    done = api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()
+    assert done == {"trip": None, "remaining": 0}
+
+
+def test_accepting_a_proposal_uses_the_normal_connection_flow_and_stops_reproposing_it() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "acc-rider@example.edu", "Ada Rider")
+    _, driver_headers = auth(api, "acc-driver@example.com", "Abe Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+
+    proposal = api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"]
+    conn = api.post(
+        "/connections", headers=rider_headers,
+        json={"ride_request_id": rr["id"], "driver_trip_id": proposal["id"]},
+    ).json()
+    assert conn["status"] == "pending" and conn["driver_trip_id"] == trip["id"]
+    assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"] is None
+
+
+def test_only_the_rider_can_get_or_skip_proposals_for_their_request() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "own-rider@example.edu", "Olga Rider")
+    _, other_headers = auth(api, "own-other@example.com", "Otto Other")
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=other_headers).status_code == 403
+    assert api.post(
+        f"/ride-requests/{rr['id']}/proposal/skip", headers=other_headers, json={"driver_trip_id": "x"},
+    ).status_code == 403
+
+
+def test_proposals_skip_trips_without_enough_free_seats() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "seat-rider@example.edu", "Sia Rider")
+    _, driver_headers = auth(api, "seat-driver@example.com", "Sam Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    post_trip(api, driver_headers, a, b)  # 2 seats
+    p = location(api, rider_headers, "P", 37.0, -121.995)
+    d = location(api, rider_headers, "D", 37.0, -121.985)
+    rr = api.post(
+        "/ride-requests", headers=rider_headers,
+        json={
+            "pickup_location_id": p["id"], "destination_location_id": d["id"],
+            "target_date": date.today().isoformat(), "flexibility": "Friday morning",
+            "passenger_count": 3, "tags": [],
+        },
+    ).json()
+    assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"] is None
+
+
+# ─── Proposed riders (driver side) ────────────────────────────────────────────
+
+def test_driver_is_proposed_the_lowest_detour_rider_and_skipping_advances() -> None:
+    api = corridor_client(FakeRouter())
+    _, driver_headers = auth(api, "dp-driver@example.com", "Dora Driver")
+    _, near_headers = auth(api, "dp-near@example.edu", "Near Rider")
+    _, far_headers = auth(api, "dp-far@example.edu", "Far Rider")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+
+    near = make_rider_request(api, near_headers, (37.0, -121.995), (37.0, -121.985))      # on the line
+    far = make_rider_request(api, far_headers, (37.008, -121.995), (37.008, -121.985))    # ~890 m off
+    # Opposite direction on the same road: never proposed.
+    _, back_headers = auth(api, "dp-back@example.edu", "Back Rider")
+    make_rider_request(api, back_headers, (37.0, -121.985), (37.0, -121.995))
+
+    first = api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()
+    assert first["request"]["id"] == near["id"]
+    assert first["remaining"] == 1
+    assert first["request"]["detour_minutes"] is not None
+    assert first["request"]["pickup"]["exact"] is False
+    assert "latitude" not in first["request"]["pickup"]
+
+    api.post(f"/driver-trips/{trip['id']}/proposal/skip", headers=driver_headers, json={"ride_request_id": near["id"]})
+    second = api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()
+    assert second["request"]["id"] == far["id"] and second["remaining"] == 0
+
+    # A driver's skip must not hide the trip from the rider's own proposals.
+    rider_view = api.get(f"/ride-requests/{near['id']}/proposal", headers=near_headers).json()
+    assert rider_view["trip"]["id"] == trip["id"]
+
+
+def test_driver_accepting_a_proposed_rider_creates_a_pending_connection() -> None:
+    api = corridor_client(FakeRouter())
+    _, driver_headers = auth(api, "da-driver@example.com", "Dan Driver")
+    _, rider_headers = auth(api, "da-rider@example.edu", "Rae Rider")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+
+    proposed = api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()["request"]
+    conn = api.post(
+        "/connections", headers=driver_headers,
+        json={"ride_request_id": proposed["id"], "driver_trip_id": trip["id"]},
+    ).json()
+    assert conn["status"] == "pending" and conn["ride_request_id"] == rr["id"]
+    assert api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()["request"] is None
+
+
+def test_only_the_driver_can_get_or_skip_proposals_for_their_trip() -> None:
+    api = corridor_client(FakeRouter())
+    _, driver_headers = auth(api, "do-driver@example.com", "Dee Driver")
+    _, other_headers = auth(api, "do-other@example.com", "Otis Other")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    assert api.get(f"/driver-trips/{trip['id']}/proposal", headers=other_headers).status_code == 403
+    assert api.post(
+        f"/driver-trips/{trip['id']}/proposal/skip", headers=other_headers, json={"ride_request_id": "x"},
+    ).status_code == 403

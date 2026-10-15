@@ -45,6 +45,9 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
+  // Minutes this rider would add to the trip; only set on corridor searches
+  // (search with both pickup and destination coordinates).
+  detour_minutes?: number | null;
 };
 
 export type ApiRideRequest = {
@@ -63,6 +66,8 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
+  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  detour_minutes?: number | null;
 };
 
 export type ApiConnection = {
@@ -132,6 +137,7 @@ export type SearchQuery = {
   pickup_latitude?: number;
   pickup_longitude?: number;
   pickup_radius_meters?: number;
+  route_buffer_meters?: number;
   target_date?: string;
   tag?: string;
   car_type?: string;
@@ -203,6 +209,7 @@ export type RouteSuggestion = {
 export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
+  | { type: "pickup_updated"; connection_id: string }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
@@ -372,6 +379,10 @@ export function cancelRideRequest(requestId: string): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", `/ride-requests/${requestId}/cancel`);
 }
 
+export function updateRideRequestPickup(requestId: string, pickupLocationId: string): Promise<ApiRideRequest> {
+  return request<ApiRideRequest>("PATCH", `/ride-requests/${requestId}/pickup`, { pickup_location_id: pickupLocationId });
+}
+
 export function getMyRideRequests(): Promise<ApiRideRequest[]> {
   return request<ApiRideRequest[]>("GET", "/me/ride-requests");
 }
@@ -382,6 +393,30 @@ export function createConnection(rideRequestId: string, driverTripId: string): P
   return request<ApiConnection>("POST", "/connections", {
     ride_request_id: rideRequestId,
     driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiProposal = { trip: ApiDriverTrip | null; remaining: number };
+
+export function getRideRequestProposal(rideRequestId: string): Promise<ApiProposal> {
+  return request<ApiProposal>("GET", `/ride-requests/${rideRequestId}/proposal`);
+}
+
+export function skipRideRequestProposal(rideRequestId: string, driverTripId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/ride-requests/${rideRequestId}/proposal/skip`, {
+    driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: number };
+
+export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
+  return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/driver-trips/${driverTripId}/proposal/skip`, {
+    ride_request_id: rideRequestId,
   });
 }
 

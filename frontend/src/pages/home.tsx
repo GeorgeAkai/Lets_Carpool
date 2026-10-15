@@ -6,7 +6,7 @@ import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
   Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, ChevronLeft,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, ChevronLeft, Navigation,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
@@ -43,12 +43,17 @@ export interface Listing {
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
   notes?: string | null
+  // Minutes this rider would add to the driver's trip; undefined when the
+  // listing isn't on the rider's route corridor (or no route to compare to).
+  detourMinutes?: number | null
 }
 
 export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
   flexibility: Flexibility; seats?: number; passengers?: number; tags: RideTag[]
   status: string; createdAt: string; notes?: string | null
+  // Exact coordinates of the user's own listing (always exact for /me/*).
+  pickupLat?: number; pickupLng?: number; destLat?: number; destLng?: number
 }
 
 interface Connection {
@@ -301,6 +306,7 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     luggageCapacity: (trip.luggage_capacity as LuggageSize) ?? undefined,
     status: trip.status === 'open' ? 'open' : 'matched',
     postedAt: relativeTime(trip.created_at), notes: trip.notes,
+    detourMinutes: trip.detour_minutes ?? undefined,
   }
 }
 
@@ -338,6 +344,8 @@ function requestToMyListing(req: api.ApiRideRequest): MyListing {
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => t === 'airport' || t === 'student'),
     status: req.status, createdAt: req.created_at, notes: req.notes,
+    pickupLat: req.pickup.latitude, pickupLng: req.pickup.longitude,
+    destLat: req.destination.latitude, destLng: req.destination.longitude,
   }
 }
 
@@ -481,6 +489,20 @@ function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' 
 
 // ─── Listing card ─────────────────────────────────────────────────────────────
 
+// Detour is computed server-side from the driver's real route, so the card can
+// say how much a pickup costs the driver without ever receiving exact pins.
+// Only listings inside the rider's route corridor carry a value, and the
+// corridor check is direction-aware — hence "same direction".
+function DetourBadge({ minutes }: { minutes: number | null | undefined }) {
+  if (minutes == null) return null
+  const label = minutes < 1 ? 'On your way' : `+${Math.round(minutes)} min detour`
+  return (
+    <p className="pl-5 text-xs font-medium text-primary flex items-center gap-1.5">
+      <Navigation className="size-3" />{label}<Dot className="size-3 text-border" /><span className="text-muted-foreground font-normal">same direction</span>
+    </p>
+  )
+}
+
 function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; alreadyConnected: boolean }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -522,6 +544,7 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
           )}
           <span className="text-xs text-muted-foreground">{listing.date}</span>
         </div>
+        <DetourBadge minutes={listing.detourMinutes} />
       </div>
 
       {(listing.tags.length > 0 || (luggage && luggage !== 'none')) && (
@@ -562,12 +585,20 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
 
 // ─── Algorithmic match ranking ─────────────────────────────────────────────────
 //
-// Ranks candidates using only signals that are actually available pre-connection:
-// shared profile interests, verified status, and — when the current user already
-// has an open listing of their own — closeness of target date and flexibility
-// window to it. Exact pickup coordinates are deliberately withheld pre-connection
-// (see the location privacy model), so this does not fabricate a distance/ETA
-// figure the way a full route-corridor match would.
+// Ranks candidates using signals that are available pre-connection. The dominant
+// one, when the rider has an open request with coordinates, is the server-computed
+// detour (minutes added to the driver's trip by picking this rider up) — the
+// backend does the route math, so exact pins are never sent to the client. The
+// rest are tie-breakers: closeness of target date and flexibility window, shared
+// profile interests and verified status. Without a rider reference (e.g. driver
+// mode) there's no detour signal and the original three-term score is used.
+
+const DETOUR_CUTOFF_MIN = 15
+
+function detourScore(detourMinutes: number | null | undefined): number {
+  if (detourMinutes == null) return 0 // not on the rider's route corridor
+  return Math.min(Math.max(1 - detourMinutes / DETOUR_CUTOFF_MIN, 0), 1)
+}
 
 function flexibilityCloseness(a: Flexibility, b: Flexibility): number {
   if (a === b) return 1
@@ -604,24 +635,28 @@ function useRankedMatches(
     const pool = candidates.filter(c => c.ownerId !== currentUserId && c.status === 'open')
     if (pool.length === 0) { setMatches([]); return }
 
+    const useDetour = referenceListing?.type === 'rider' && referenceListing.pickupLat != null
     const preScored = pool.map(listing => {
       const windowScore = referenceListing
         ? 0.6 * dateCloseness(listing.date, referenceListing.date) + 0.4 * flexibilityCloseness(listing.flexibility, referenceListing.flexibility)
         : 0.5
-      return { listing, windowScore }
-    }).sort((a, b) => b.windowScore - a.windowScore).slice(0, 8)
+      const detour = useDetour ? detourScore(listing.detourMinutes) : 0
+      return { listing, windowScore, detour, preScore: useDetour ? 0.6 * detour + 0.25 * windowScore : windowScore }
+    }).sort((a, b) => b.preScore - a.preScore).slice(0, 8)
 
     setLoading(true)
     Promise.all(preScored.map(({ listing }) => api.getUserProfile(listing.ownerId).catch(() => null)))
       .then(profiles => {
         if (cancelled) return
         const lowerMine = new Set(currentUserInterests.map(i => i.toLowerCase()))
-        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore }, i) => {
+        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore, detour }, i) => {
           const profile = profiles[i]
           const sharedInterests = (profile?.interests ?? []).filter(t => lowerMine.has(t.toLowerCase()))
           const interestScore = Math.min(sharedInterests.length / 3, 1)
           const verifiedScore = profile?.photo_verified ? 1 : 0
-          const score = 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
+          const score = useDetour
+            ? 0.6 * detour + 0.25 * windowScore + 0.1 * interestScore + 0.05 * verifiedScore
+            : 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
           return { listing, profile, sharedInterests, score }
         }).sort((a, b) => b.score - a.score)
         setMatches(enriched.slice(0, 3))
@@ -733,6 +768,7 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
         )}
         <span className="text-muted-foreground">{listing.date}</span>
       </div>
+      <DetourBadge minutes={listing.detourMinutes} />
 
       {(profile?.nationality || sharedInterests.length > 0) && (
         <div className="flex flex-wrap gap-1.5">
@@ -772,6 +808,152 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   )
 }
 
+// ─── Proposed match (Empower-style) ─────────────────────────────────────────────
+//
+// For a rider with an open request, the server picks the single best driver trip
+// (lowest detour on the corridor, then date/flexibility). The rider either
+// requests it — the normal pending Connection, driver still accepts/declines —
+// or skips it and gets the next one. Skips are remembered per request.
+
+function ProposedMatch({ rideRequest, onAccepted, showToast }: {
+  rideRequest: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getRideRequestProposal(rideRequest.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [rideRequest.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best ride…</p>
+  const trip = proposal?.trip
+  if (!trip) return null
+  const listing = tripToListing(trip)
+  const freeSeats = (listing.seats ?? 0) - (listing.seatsUsed ?? 0)
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(rideRequest.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to request ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipRideRequestProposal(rideRequest.id, trip.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best match</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The driver heading your way with the smallest detour.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{freeSeats} of {listing.seats} seats free · {listing.date}</p>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Request this ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Driver-side mirror of ProposedMatch: the best open ride request along the
+// driver's own trip. "Offer a ride" is a driver-initiated pending Connection.
+function ProposedRider({ trip, onAccepted, showToast }: {
+  trip: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiDriverProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getDriverTripProposal(trip.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [trip.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best rider…</p>
+  const req = proposal?.request
+  if (!req) return null
+  const listing = { ...requestToListing(req), detourMinutes: req.detour_minutes ?? undefined }
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(req.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to offer ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipDriverTripProposal(trip.id, req.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best rider</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The rider along your route who adds the least time.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''} · {listing.date}</p>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Offer a ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
   listings: Listing[]; referenceListing: MyListing | undefined
   currentUserId: string; currentUserInterests: string[]
@@ -807,7 +989,7 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 // ─── Driver-mode home ───────────────────────────────────────────────────────────
 
 function DriverHomeView({
-  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
+  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, onProposalAccepted, showToast, setView,
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
@@ -816,6 +998,7 @@ function DriverHomeView({
   myOpenTrip: MyListing | undefined; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onProposalAccepted: (conn: api.ApiConnection) => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
@@ -866,6 +1049,7 @@ function DriverHomeView({
             <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
           </div>
         )}
+        {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
         <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
         {loading ? (
           <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Finding nearby requests…</p>
@@ -922,6 +1106,8 @@ function DriverHomeView({
           <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
         </div>
       )}
+
+      {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
 
       <div>
         <div className="flex items-center justify-between">
@@ -1425,7 +1611,7 @@ function MyListingsView({ myListings, onCancel, userCoords, currentUserId, showT
 
 function ConnectionCard({
   connection, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat,
-  autoOpen, isActive, onActivate,
+  onUpdatePickup, autoOpen, isActive, onActivate,
 }: {
   connection: Connection; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
@@ -1434,11 +1620,12 @@ function ConnectionCard({
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
   autoOpen?: 'gassplit' | null
   isActive: boolean
   onActivate: () => void
 }) {
-  const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | null>(null)
+  const [expanded, setExpanded] = useState<'gassplit' | 'blockreport' | 'pickup' | null>(null)
 
   // Another card became the active one — collapse this one so only a single
   // panel is ever open across the inbox at a time.
@@ -1452,8 +1639,14 @@ function ConnectionCard({
   const [reportMode, setReportMode] = useState(false)
   const [busy, setBusy] = useState(false)
   const cardRef = useRef<HTMLDivElement>(null)
+  const [pickupDraft, setPickupDraft] = useState<LocationValue | null>(
+    connection.riderPickupLat != null && connection.riderPickupLng != null
+      ? { label: connection.riderPickupLabel ?? '', lat: connection.riderPickupLat, lng: connection.riderPickupLng }
+      : null,
+  )
+  const [savingPickup, setSavingPickup] = useState(false)
 
-  const toggleSection = async (section: 'gassplit' | 'blockreport') => {
+  const toggleSection = async (section: 'gassplit' | 'blockreport' | 'pickup') => {
     const next = expanded === section ? null : section
     setExpanded(next)
     if (next !== null) onActivate()
@@ -1490,6 +1683,16 @@ function ConnectionCard({
     if (!reportReason.trim()) return
     try { await api.reportUser(connection.withUserId, reportReason.trim()); showToast('Report submitted', 'success'); setReportReason(''); setReportMode(false); setExpanded(null) }
     catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
+  }
+  const handleSavePickup = async () => {
+    if (!pickupDraft) return
+    setSavingPickup(true)
+    try {
+      await onUpdatePickup(connection.id, connection.rideRequestId, pickupDraft)
+      showToast('Pickup address updated', 'success')
+      setExpanded(null)
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to update pickup', 'error') }
+    finally { setSavingPickup(false) }
   }
 
   const { status } = connection
@@ -1550,6 +1753,11 @@ function ConnectionCard({
               </button>
             )}
             <div className="basis-full flex flex-wrap gap-2">
+              {connection.myRole === 'rider' && (
+                <button onClick={() => toggleSection('pickup')} className={`${GHOST_BTN} ${expanded === 'pickup' ? 'bg-secondary text-secondary-foreground border-primary' : ''}`}>
+                  <MapPin className="size-4" />{hasRiderPickupCoords ? 'Edit pickup' : 'Set pickup'}
+                </button>
+              )}
               {hasRouteCoords && (
                 <button onClick={() => onViewRoute(connection)} className={GHOST_BTN}><Map className="size-4" />Route</button>
               )}
@@ -1582,6 +1790,20 @@ function ConnectionCard({
               <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
             </>
           ) : <p className="text-sm text-muted-foreground animate-pulse">Loading suggestion…</p>}
+        </div>
+      )}
+
+      {/* Pickup address panel — rider only, once the driver has accepted */}
+      {expanded === 'pickup' && status === 'accepted' && connection.myRole === 'rider' && (
+        <div className="border-t border-border bg-muted/30 px-6 py-4 space-y-3">
+          <LocationInput label="Pickup address" value={pickupDraft} onChange={setPickupDraft} placeholder="Search for your pickup address…" />
+          <div className="flex gap-2">
+            <button onClick={handleSavePickup} disabled={!pickupDraft || savingPickup} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-60 transition-colors">
+              {savingPickup ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => setExpanded(null)} className="px-4 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
+          </div>
+          <p className="text-xs text-muted-foreground">Your driver will see the exact address you set here.</p>
         </div>
       )}
 
@@ -1728,7 +1950,7 @@ function FullScreenChatView({ connection, currentUserId, onClose, showToast, inc
 
 // ─── Connections view ─────────────────────────────────────────────────────────
 
-function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, deepLink }: {
+function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving, onOpenChat, onUpdatePickup, deepLink }: {
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
@@ -1736,6 +1958,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
   onViewRoute: (conn: Connection) => void
   onStartDriving: (conn: Connection) => void
   onOpenChat: (conn: Connection) => void
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
   deepLink?: { connectionId: string; section: 'gassplit' } | null
 }) {
   const totalUnread = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
@@ -1765,6 +1988,7 @@ function ConnectionsView({ connections, currentUserId, onAccept, onDecline, onCa
             <ConnectionCard key={c.id} connection={c} currentUserId={currentUserId}
               onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
               showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat}
+              onUpdatePickup={onUpdatePickup}
               autoOpen={deepLink?.connectionId === c.id ? deepLink.section : null}
               isActive={openConnectionId === c.id} onActivate={() => setOpenConnectionId(c.id)} />
           ))}
@@ -2513,6 +2737,8 @@ export function Home() {
         }
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
+      } else if (msg.type === 'pickup_updated') {
+        loadConnections(currentUser.id)
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
@@ -2609,16 +2835,34 @@ export function Home() {
   // already enforced server-side) so the destination search bar and filter
   // sheet are what narrow the list, not a silent, invisible GPS distance
   // cutoff a listing could fall just outside of with no indication why.
+  //
+  // The one exception to "no pre-filter": when the rider has an open request, a
+  // second, corridor-filtered search supplies per-trip detour minutes. It only
+  // annotates the unfiltered feed above — it never removes anything from it.
+  const reqKey = myListings.find(l => l.type === 'rider' && l.status === 'open' && l.pickupLat != null && l.destLat != null)
+  const corridorQuery = useMemo<api.SearchQuery | null>(() => reqKey ? {
+    pickup_latitude: reqKey.pickupLat, pickup_longitude: reqKey.pickupLng,
+    destination_latitude: reqKey.destLat, destination_longitude: reqKey.destLng,
+  } : null, [reqKey?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const [trips, requests] = await Promise.all([api.searchDriverTrips({}), api.searchRideRequests({})])
-      const combined = [...trips.map(tripToListing), ...requests.map(requestToListing)]
+      const [trips, requests, corridorTrips] = await Promise.all([
+        api.searchDriverTrips({}), api.searchRideRequests({}),
+        corridorQuery ? api.searchDriverTrips(corridorQuery).catch(() => []) : Promise.resolve([]),
+      ])
+      // (`Map` is the lucide icon in this file, hence a plain record.)
+      const detourByTrip: Record<string, number | null> = Object.fromEntries(corridorTrips.map(t => [t.id, t.detour_minutes ?? null]))
+      const combined = [
+        ...trips.map(t => ({ ...tripToListing(t), detourMinutes: detourByTrip[t.id] ?? undefined })),
+        ...requests.map(requestToListing),
+      ]
       const seenIds = new Set<string>()
       const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
       setAllListings(deduped)
     } catch { } finally { setFeedLoading(false) }
-  }, [])
+  }, [corridorQuery])
 
   // Another user's new post has no way to push into an already-open Discover
   // tab — refetch whenever Discover becomes the active view (not just once on
@@ -2680,7 +2924,8 @@ export function Home() {
         conn = await api.createConnection(listing.apiId, trip.id)
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
-      setConnections(prev => [newConn, ...prev]); showToast('Connection created!', 'success'); setView('connections')
+      const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
+      setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success'); setView('connections')
     } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
   }, [currentUser, userCoords, showToast])
 
@@ -2704,6 +2949,14 @@ export function Home() {
   const onDecline = useCallback((id: string) => transact(id, 'decline'), [transact])
   const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
   const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
+
+  const onUpdatePickup = useCallback(async (connectionId: string, rideRequestId: string, pickup: LocationValue) => {
+    const location = await api.createLocation(pickup.label, pickup.lat, pickup.lng)
+    await api.updateRideRequestPickup(rideRequestId, location.id)
+    setConnections(prev => prev.map(c => c.id === connectionId
+      ? { ...c, riderPickupLat: pickup.lat, riderPickupLng: pickup.lng, riderPickupLabel: pickup.label }
+      : c))
+  }, [])
 
   const onMarkRead = useCallback((id: string) => {
     setConnections(prev => prev.map(c => c.id === id ? { ...c, unreadMessages: 0 } : c))
@@ -2863,6 +3116,10 @@ export function Home() {
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
+                  onProposalAccepted={conn => {
+                    setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                    showToast('Ride offered!', 'success'); setView('connections')
+                  }}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
                   filterType={filterType} setFilterType={setFilterType}
                   filterTag={filterTag} setFilterTag={setFilterTag}
@@ -2874,16 +3131,30 @@ export function Home() {
                 />
               ) : (
                 <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
-                  // Its own desktop-styled MatchCard would clash with the new mobile
-                  // card design, and isn't part of the mobile redesign's scope.
-                  !isMobile && (
+                  <>
+                    {(() => {
+                      const openRequest = myListings.find(l => l.type === 'rider' && l.status === 'open')
+                      return openRequest ? (
+                        <ProposedMatch
+                          key={openRequest.id} rideRequest={openRequest} showToast={showToast}
+                          onAccepted={conn => {
+                            setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                            showToast('Ride requested!', 'success'); setView('connections')
+                          }}
+                        />
+                      ) : null
+                    })()}
+                    {/* Its own desktop-styled MatchCard would clash with the new mobile
+                        card design, and isn't part of the mobile redesign's scope. */}
+                    {!isMobile && (
                     <BestMatches
                       listings={allListings}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                       onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
                     />
-                  )
+                    )}
+                  </>
                 } />
               )
             )}
@@ -2897,7 +3168,7 @@ export function Home() {
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} />}
             {guardedView === 'my-listings' && <MyListingsView myListings={myListings} onCancel={onCancelListing} userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode} onGoPost={() => setView('post')} />}
-            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} deepLink={connDeepLink} />}
+            {guardedView === 'connections' && <ConnectionsView connections={connections} currentUserId={currentUser.id} onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete} showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onOpenChat={onOpenChat} onUpdatePickup={onUpdatePickup} deepLink={connDeepLink} />}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
             {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} onSignOut={onSignOut} />}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}

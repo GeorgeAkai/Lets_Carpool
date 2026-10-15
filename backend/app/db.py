@@ -164,6 +164,38 @@ def run_migrations(database_url: str) -> None:
         )
     """)
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS notes TEXT")
+    # The driver's actual road route (from OSRM at creation time), so search can
+    # match riders against a corridor rather than just the two endpoints. NULL
+    # for trips created before this existed or while routing was unavailable;
+    # search falls back to endpoint-radius matching for those.
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_geog GEOGRAPHY(LINESTRING, 4326)")
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_distance_m DOUBLE PRECISION")
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_duration_s DOUBLE PRECISION")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_driver_trips_route_geog ON driver_trips USING GIST (route_geog)")
+
+    # Trips a rider has skipped when the system proposed their next match, so
+    # the same trip isn't proposed again for that request. No FKs: a skip is
+    # just a hint and shouldn't block deleting/archiving either listing.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_skips (
+            ride_request_id TEXT NOT NULL,
+            driver_trip_id  TEXT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (ride_request_id, driver_trip_id)
+        )
+    """)
+
+    # Same idea from the driver's side: ride requests a driver skipped when the
+    # system proposed a rider for their trip. Separate from match_skips so one
+    # side's skip never hides the listing from the other.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS driver_match_skips (
+            driver_trip_id  TEXT NOT NULL,
+            ride_request_id TEXT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (driver_trip_id, ride_request_id)
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS connections (

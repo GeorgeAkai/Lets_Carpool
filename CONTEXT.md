@@ -17,7 +17,7 @@ In scope:
 - Riders publish ride requests.
 - Drivers publish driver trips.
 - Either side can browse relevant opposite-side listings, with manual filters for date, tag, seats, car type, and luggage size.
-- Either side can initiate a connection manually.
+- Either side can initiate a connection manually. Riders with an open request (and drivers with an open trip) are also shown a system-proposed best match they can request/offer or skip. See Proposed Matches.
 - Users coordinate through a limited pending chat flow and full chat after acceptance, delivered in real time over WebSocket.
 - Users can confirm a gas split in app, while payment happens outside the app.
 - Drivers provide self-declared vehicle and driving eligibility information.
@@ -121,11 +121,11 @@ MVP search is based on tight endpoint matching:
 - Authenticated users search the opposite listing type.
 - Search filters can include destination radius, date/flexibility, tag, pickup proximity, car type, and luggage size. These are exact-match filters over self-declared fields, not ML-based matching.
 
-Do not implement route-corridor or "on the way" matching in MVP. That can be added later with route buffers and more advanced PostGIS logic.
+Driver trips store their OSRM route, and rider searches that carry both a pickup and destination match on a direction-aware 1000 m route corridor, returning `detour_minutes` (see `docs/adr/0001-proposed-matches-on-route-corridor.md`). Trips without a stored route fall back to the endpoint-radius filters above.
 
 ## Connection Flow
 
-Connections are symmetric and manual:
+Connections are symmetric and initiated by a person (a proposal is only a suggestion; accepting it creates a normal connection):
 
 - A rider can request to join a driver trip.
 - A driver can offer a ride on a rider request.
@@ -141,6 +141,13 @@ Connection states:
 - `completed`
 
 Pending connections should expire if nobody responds before the relevant ride date.
+
+## Proposed Matches
+
+- A rider with an open `RideRequest` is shown one **proposed match**: the best open `DriverTrip` on their route corridor, ranked by detour, then date/flexibility. Trips with too few free seats, more than a day off, already skipped, or already connected to that request are never proposed.
+- The rider **requests** it (a normal `pending` `Connection` the driver accepts/declines) or **skips** it (recorded per request in `match_skips`; the next-best is proposed).
+- Drivers get the mirror image for an open `DriverTrip`: the best open `RideRequest` along their route (both points in the corridor, destination ahead of pickup, enough seats for the passenger count). They **offer a ride** (a driver-initiated `pending` `Connection`) or **skip** it (`driver_match_skips`). Rider and driver skips are independent.
+- There is no `proposed` connection state.
 
 Gas split confirmation is separate from connection state. Do not add payment or split states directly into the connection state machine.
 

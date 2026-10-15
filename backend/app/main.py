@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
 from backend.app.domain import DomainError, Store, User
+from backend.app.routing import OSRMClient
 
 
 class Settings(BaseSettings):
@@ -22,6 +23,12 @@ class Settings(BaseSettings):
     jwt_expires_minutes: int = 60 * 24 * 7
     # Space-separated list of allowed CORS origins, e.g. "https://myapp.vercel.app"
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
+
+    # Base URL of the self-hosted OSRM (see docker-compose.yml `osrm`). Used
+    # server-side to store driver routes and compute rider detours. Empty
+    # disables routing: trips are stored without a route and search falls back
+    # to endpoint-radius matching.
+    osrm_base_url: str = "http://localhost:5001"
 
     # Neon Auth server used to cryptographically verify sign-in tokens (must
     # match the frontend's VITE_NEON_AUTH_URL). Required for /auth/login to work.
@@ -122,6 +129,18 @@ class DriverTripCreate(BaseModel):
     luggage_capacity: str = "medium"
     car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
+
+
+class RideRequestPickupUpdate(BaseModel):
+    pickup_location_id: str
+
+
+class DriverProposalSkip(BaseModel):
+    ride_request_id: str
+
+
+class ProposalSkip(BaseModel):
+    driver_trip_id: str
 
 
 class ConnectionCreate(BaseModel):
@@ -226,7 +245,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.store = store or Store(s.database_url)
+    app.state.store = store or Store(
+        s.database_url, router=OSRMClient(s.osrm_base_url) if s.osrm_base_url else None,
+    )
     app.state.settings = s
     app.state.ws_manager = ConnectionManager()
 
@@ -370,6 +391,20 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         request = app.state.store.cancel_ride_request(user.id, request_id)
         return serialize_ride_request(app.state.store, request, exact=True)
 
+    @app.patch("/ride-requests/{request_id}/pickup")
+    async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser) -> dict[str, Any]:
+        request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
+        # Lets a driver who already accepted this rider see the corrected pickup
+        # point without polling — mirrors the transition_connection broadcast below.
+        for c in app.state.store.get_user_connections(user.id):
+            if c.ride_request_id == request.id and c.status == "accepted":
+                trip = app.state.store.get_driver_trip(c.driver_trip_id)
+                await app.state.ws_manager.broadcast([trip.driver_id], {
+                    "type": "pickup_updated",
+                    "connection_id": c.id,
+                })
+        return serialize_ride_request(app.state.store, request, exact=True)
+
     @app.get("/ride-requests/search")
     def search_ride_requests(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         requests = app.state.store.search_ride_requests(user.id, query.to_store_query())
@@ -402,6 +437,34 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def search_driver_trips(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         trips = app.state.store.search_driver_trips(user.id, query.to_store_query())
         return [serialize_driver_trip(app.state.store, t, exact=False) for t in trips]
+
+    @app.get("/ride-requests/{request_id}/proposal")
+    def ride_request_proposal(request_id: str, user: CurrentUser) -> dict[str, Any]:
+        result = app.state.store.propose_match(user.id, request_id)
+        trip = result["trip"]
+        return {
+            "trip": serialize_driver_trip(app.state.store, trip, exact=False) if trip else None,
+            "remaining": result["remaining"],
+        }
+
+    @app.post("/ride-requests/{request_id}/proposal/skip")
+    def skip_ride_request_proposal(request_id: str, payload: ProposalSkip, user: CurrentUser) -> dict[str, Any]:
+        app.state.store.skip_match(user.id, request_id, payload.driver_trip_id)
+        return {"status": "ok"}
+
+    @app.get("/driver-trips/{trip_id}/proposal")
+    def driver_trip_proposal(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        result = app.state.store.propose_rider(user.id, trip_id)
+        rr = result["request"]
+        return {
+            "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
+            "remaining": result["remaining"],
+        }
+
+    @app.post("/driver-trips/{trip_id}/proposal/skip")
+    def skip_driver_trip_proposal(trip_id: str, payload: DriverProposalSkip, user: CurrentUser) -> dict[str, Any]:
+        app.state.store.skip_rider(user.id, trip_id, payload.ride_request_id)
+        return {"status": "ok"}
 
     @app.get("/me/driver-trips")
     def my_driver_trips(user: CurrentUser) -> list[dict[str, Any]]:
@@ -685,6 +748,7 @@ class SearchQuery(BaseModel):
     pickup_latitude: float | None = None
     pickup_longitude: float | None = None
     pickup_radius_meters: float = 5000
+    route_buffer_meters: float = 1000
     target_date: date | None = None
     tag: str | None = None
     car_type: str | None = None
