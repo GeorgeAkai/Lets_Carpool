@@ -6,7 +6,7 @@ services:
     runtime: docker
     dockerContext: ./osrm
     dockerfilePath: ./osrm/Dockerfile
-    plan: standard   # Northern California extract; if the build runs out of memory, move up a plan
+    plan: standard   # 2 GB; the Bay Area crop idles at ~350 MB (512 MB plans OOM)
     healthCheckPath: /route/v1/driving/-122.4194,37.7749;-122.4094,37.7849
     envVars:
       - key: PORT

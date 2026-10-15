@@ -2,21 +2,31 @@
 # OpenStreetMap extract and builds the MLD graph at *image build* time, so no
 # multi-GB dataset is committed to git (GitHub rejects files over 100 MB).
 #
-#   docker build -t carpool-osrm osrm        # Northern California (default, ~650 MB extract)
+#   docker build -t carpool-osrm osrm        # Northern California cropped to the Bay Area (default)
 #   docker build -t carpool-osrm osrm \
-#     --build-arg PBF_URL=https://download.geofabrik.de/north-america/us/california/socal-latest.osm.pbf
+#     --build-arg PBF_URL=https://download.geofabrik.de/north-america/us/california/socal-latest.osm.pbf \
+#     --build-arg BBOX="-118.7,33.6,-117.6,34.4"          # e.g. Los Angeles
+#   docker build -t carpool-osrm osrm --build-arg BBOX=   # whole extract, no crop
 #
-# Build-time RAM is the constraint: osrm-extract needs several GB for a ~650 MB
-# extract. Use a Render plan with enough memory (the standard plan is the
-# starting point); a smaller extract needs less. Trips outside the extract get
+# Measured: the default Bay Area crop is ~630 MB on disk and ~350 MB RSS after a
+# first query (grows under load) — too tight for a 512 MB plan, fine on 1-2 GB.
+# Trips outside the cropped area get
 # no route and fall back to endpoint-radius matching.
 # Pinned to the same version as docker-compose.yml so data and server match.
 ARG PBF_URL=https://download.geofabrik.de/north-america/us/california/norcal-latest.osm.pbf
 
 # The OSRM image has no curl/wget, so fetch the extract in a throwaway stage.
-FROM alpine:3.20 AS download
+FROM debian:bookworm-slim AS download
 ARG PBF_URL
-RUN apk add --no-cache curl && curl -fL --retry 3 -o /region.osm.pbf "$PBF_URL"
+# Optional "minLon,minLat,maxLon,maxLat" crop applied before the graph is built.
+# The routing server holds the whole graph in RAM, so a smaller area is the main
+# lever for fitting a small instance. Set BBOX="" to keep the full extract.
+ARG BBOX="-122.65,37.15,-121.55,38.15"
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates osmium-tool && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fL --retry 3 -o /full.osm.pbf "$PBF_URL" && \
+    if [ -n "$BBOX" ]; then osmium extract --bbox "$BBOX" --strategy=smart -o /region.osm.pbf /full.osm.pbf; \
+    else mv /full.osm.pbf /region.osm.pbf; fi
 
 FROM osrm/osrm-backend:v5.25.0 AS build
 COPY --from=download /region.osm.pbf /data/region.osm.pbf
