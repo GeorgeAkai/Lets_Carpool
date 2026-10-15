@@ -8,19 +8,30 @@
   --neon-radius: var(--radius);
   font-family: 'Outfit', sans-serif;
 
-  /* Suppress the default card shadow/bg since we wrap with our own card */
-  & [class*="card"] {
+  /* Suppress the default card shadow/bg since we wrap with our own card.
+     Keyed on data-slot rather than [class*="card"], which also matched (and
+     blanked out) our own wrapper's bg-card utility. */
+  & [data-slot="card"] {
     box-shadow: none !important;
     background: transparent !important;
     border: none !important;
     padding: 0 !important;
+    max-width: none !important;
+  }
+
+  & [data-slot="card-header"],
+  & [data-slot="card-content"],
+  & [data-slot="card-footer"] {
+    padding-inline: 0 !important;
   }
 }
 
-/* Input fields — match app's input-background style */
-.neon-auth-ui input[type="email"],
-.neon-auth-ui input[type="password"],
-.neon-auth-ui input[type="text"] {
+/* Input fields — match app's input-background style. Scoped to Neon's own
+   card: .neon-auth-ui wraps the whole app, so an unscoped rule restyled every
+   text input (e.g. Discover search) too. */
+.neon-auth-ui [data-slot="card"] input[type="email"],
+.neon-auth-ui [data-slot="card"] input[type="password"],
+.neon-auth-ui [data-slot="card"] input[type="text"] {
   background-color: var(--input-background) !important;
   border-color: transparent !important;
   border-radius: calc(var(--radius) + 2px) !important;
@@ -28,21 +39,22 @@
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.neon-auth-ui input[type="email"]:focus,
-.neon-auth-ui input[type="password"]:focus,
-.neon-auth-ui input[type="text"]:focus {
+.neon-auth-ui [data-slot="card"] input[type="email"]:focus,
+.neon-auth-ui [data-slot="card"] input[type="password"]:focus,
+.neon-auth-ui [data-slot="card"] input[type="text"]:focus {
   border-color: color-mix(in srgb, var(--primary) 30%, transparent) !important;
   outline: none !important;
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent) !important;
 }
 
 /* Primary button — match app's rounded-2xl primary button */
-.neon-auth-ui button[type="submit"],
-.neon-auth-ui [class*="submit"] {
+.neon-auth-ui [data-slot="card"] button[type="submit"],
+.neon-auth-ui [data-slot="card"] [class*="submit"] {
   border-radius: calc(var(--radius) + 4px) !important;
   font-family: 'Outfit', sans-serif;
   font-weight: 600;
   letter-spacing: 0;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 /* Social buttons */
@@ -53,7 +65,7 @@
 }
 
 /* Links */
-.neon-auth-ui a {
+.neon-auth-ui [data-slot="card"] a {
   color: var(--primary);
   font-family: 'Outfit', sans-serif;
 }

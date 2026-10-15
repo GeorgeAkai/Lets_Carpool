@@ -1,24 +1,23 @@
 import React, {
-  useState, useMemo, useEffect, useCallback, useRef, useContext, type CSSProperties,
+  useState, useMemo, useEffect, useCallback, useRef, type CSSProperties,
   useId,
 } from 'react'
 import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
-  Check, X, Fuel, ChevronRight, Home as HomeIcon, Dot, Bell, LogOut,
+  Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun,
+  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, Navigation,
   ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { AuthUIContext } from '@neondatabase/neon-js/auth/react'
-import { useTheme } from '@neondatabase/auth-ui'
+import { useTheme } from 'next-themes'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
-import { MapView } from '../MapView'
+import { MapView, distanceMeters } from '../MapView'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
-import { authClient, fetchNeonJWT } from '../lib/auth'
+import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
 import {
@@ -44,12 +43,16 @@ export interface Listing {
   seats?: number; seatsUsed?: number; passengers?: number; estimatedGas?: number
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
+  notes?: string | null
+  // Minutes this rider would add to the driver's trip; undefined when the
+  // listing isn't on the rider's route corridor (or no route to compare to).
+  detourMinutes?: number | null
 }
 
 export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
   flexibility: Flexibility; seats?: number; seatsReserved?: number; passengers?: number; tags: RideTag[]
-  status: string; createdAt: string
+  status: string; createdAt: string; notes?: string | null
   // Own listings come back with exact coordinates, which "Re-book / Clone"
   // reuses to pre-fill the post form without re-geocoding.
   pickupLat?: number; pickupLng?: number; destLat?: number; destLng?: number
@@ -102,6 +105,20 @@ interface NominatimResult {
   address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
 }
 
+async function reverseGeocode(lat: number, lng: number): Promise<string> {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
+      { headers: { 'Accept-Language': 'en' } },
+    )
+    const data: NominatimResult = await res.json()
+    const label = shortLabel(data)
+    return label || 'My location'
+  } catch {
+    return 'My location'
+  }
+}
+
 function shortLabel(r: NominatimResult): string {
   const parts = [r.name || r.display_name.split(',')[0]]
   const a = r.address ?? {}
@@ -112,13 +129,14 @@ function shortLabel(r: NominatimResult): string {
 }
 
 function LocationInput({
-  label, value, onChange, placeholder, required,
+  label, value, onChange, placeholder, required, nearCoords,
 }: {
   label: string
   value: LocationValue | null
   onChange: (v: LocationValue | null) => void
   placeholder: string
   required?: boolean
+  nearCoords?: { lat: number; lng: number } | null
 }) {
   const [query, setQuery] = useState(value?.label ?? '')
   const [suggestions, setSuggestions] = useState<NominatimResult[]>([])
@@ -138,18 +156,34 @@ function LocationInput({
     debounceRef.current = setTimeout(async () => {
       setLoading(true)
       try {
+        // Bias (not restrict) toward the user's area: a ~1° box (~100km) around
+        // their location tells Nominatim to rank local matches higher, without
+        // `bounded=1` — which would hide a deliberate search for a far-away
+        // place entirely. The client-side distance sort below is what actually
+        // guarantees the nearest match comes first, since viewbox alone is only
+        // a soft hint and a same-named city on the other side of the world can
+        // still outrank it on Nominatim's own "importance" score.
+        const viewbox = nearCoords
+          ? `&viewbox=${nearCoords.lng - 1},${nearCoords.lat + 1},${nearCoords.lng + 1},${nearCoords.lat - 1}`
+          : ''
         const res = await fetch(
-          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1`,
+          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1${viewbox}`,
           { headers: { 'Accept-Language': 'en' } },
         )
         const data: NominatimResult[] = await res.json()
+        if (nearCoords) {
+          data.sort((a, b) =>
+            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(a.lat), parseFloat(a.lon)]) -
+            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(b.lat), parseFloat(b.lon)]),
+          )
+        }
         setSuggestions(data)
         setOpen(data.length > 0)
       } catch { /* network error — silently ignore */ } finally {
         setLoading(false)
       }
     }, 350)
-  }, [])
+  }, [nearCoords])
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -171,9 +205,9 @@ function LocationInput({
 
   return (
     <div ref={containerRef} className="space-y-1.5">
-      <label className="text-sm font-medium">{label}</label>
+      <label className="text-sm font-semibold">{label}</label>
       <div className="relative">
-        <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
+        <MapPin className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
         <input
           type="text"
           required={required}
@@ -189,7 +223,7 @@ function LocationInput({
             search(e.target.value)
           }}
           onFocus={() => { if (suggestions.length > 0) setOpen(true) }}
-          className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors text-foreground placeholder:text-muted-foreground"
+          className="w-full pl-10 pr-8 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors text-foreground placeholder:text-muted-foreground"
         />
         {loading && (
           <div className="absolute right-3 top-1/2 -translate-y-1/2 size-3.5 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
@@ -226,6 +260,11 @@ function LocationInput({
 
 export const FLEX_LABEL: Record<Flexibility, string> = {
   morning: 'Morning', afternoon: 'Afternoon', evening: 'Evening', flexible: 'Flexible',
+}
+
+// Time-of-day dot shown next to a route, matching the Figma Make cards.
+export const FLEX_DOT: Record<Flexibility, string> = {
+  morning: 'bg-amber-500', afternoon: 'bg-blue-600', evening: 'bg-violet-600', flexible: 'bg-emerald-600',
 }
 
 const CANNED_MESSAGES: Record<string, string> = {
@@ -281,7 +320,8 @@ function tripToListing(trip: api.ApiDriverTrip): Listing {
     carType: (trip.car_type as CarType) ?? undefined,
     luggageCapacity: (trip.luggage_capacity as LuggageSize) ?? undefined,
     status: trip.status === 'open' ? 'open' : 'matched',
-    postedAt: relativeTime(trip.created_at),
+    postedAt: relativeTime(trip.created_at), notes: trip.notes,
+    detourMinutes: trip.detour_minutes ?? undefined,
   }
 }
 
@@ -296,7 +336,7 @@ function requestToListing(req: api.ApiRideRequest): Listing {
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
     luggageSize: (req.luggage_size as LuggageSize) ?? undefined,
     status: req.status === 'open' ? 'open' : 'matched',
-    postedAt: relativeTime(req.created_at),
+    postedAt: relativeTime(req.created_at), notes: req.notes,
   }
 }
 
@@ -307,7 +347,7 @@ function tripToMyListing(trip: api.ApiDriverTrip): MyListing {
     date: trip.target_date, flexibility: apiFlexibility(trip.flexibility),
     seats: trip.seats_available, seatsReserved: trip.seats_reserved,
     tags: trip.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
-    status: trip.status, createdAt: trip.created_at,
+    status: trip.status, createdAt: trip.created_at, notes: trip.notes,
     pickupLat: trip.pickup.latitude, pickupLng: trip.pickup.longitude,
     destLat: trip.destination.latitude, destLng: trip.destination.longitude,
     carType: (trip.car_type as CarType) ?? undefined, luggage: (trip.luggage_capacity as LuggageSize) ?? undefined,
@@ -321,7 +361,7 @@ function requestToMyListing(req: api.ApiRideRequest): MyListing {
     date: req.target_date, flexibility: apiFlexibility(req.flexibility),
     passengers: req.passenger_count,
     tags: req.tags.filter((t): t is RideTag => VALID_RIDE_TAGS.has(t)),
-    status: req.status, createdAt: req.created_at,
+    status: req.status, createdAt: req.created_at, notes: req.notes,
     pickupLat: req.pickup.latitude, pickupLng: req.pickup.longitude,
     destLat: req.destination.latitude, destLng: req.destination.longitude,
     luggage: (req.luggage_size as LuggageSize) ?? undefined,
@@ -372,8 +412,8 @@ function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: strin
 
 // ─── Small utility components ─────────────────────────────────────────────────
 
-export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'lg'; photoUrl?: string | null }) {
-  const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', lg: 'size-14 text-xl' }[size]
+export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'card' | 'lg'; photoUrl?: string | null }) {
+  const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', 'card': 'size-10 text-sm', lg: 'size-14 text-xl' }[size]
   if (photoUrl) {
     return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
   }
@@ -395,7 +435,15 @@ function SeatDots({ total, used }: { total: number; used: number }) {
 }
 
 function TagPill({ tag }: { tag: RideTag }) {
-  return <span className="text-xs px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">{tag}</span>
+  return <span className={`${CHIP} capitalize`}>{tag}</span>
+}
+
+const STATUS_CHIP = {
+  amber: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
+  green: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+  red: 'bg-destructive/10 text-destructive dark:text-red-300',
+  blue: 'bg-secondary text-secondary-foreground',
+  grey: 'bg-muted text-muted-foreground',
 }
 
 function ConnStatusBadge({ status }: { status: ConnStatus }) {
@@ -408,7 +456,7 @@ function ConnStatusBadge({ status }: { status: ConnStatus }) {
     expired:   { label: 'Expired',   cls: 'bg-muted text-muted-foreground' },
   }
   const { label, cls } = cfg[status]
-  return <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}`}>{label}</span>
+  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${cls}`}>{label}</span>
 }
 
 function ListingStatusBadge({ status }: { status: string }) {
@@ -420,11 +468,46 @@ function ListingStatusBadge({ status }: { status: string }) {
     completed: 'bg-muted text-muted-foreground',
   }
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${colors[status] ?? 'bg-muted text-muted-foreground'}`}>
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${colors[status] ?? STATUS_CHIP.grey}`}>
       {status.charAt(0).toUpperCase() + status.slice(1)}
     </span>
   )
 }
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-3">{children}</p>
+}
+
+// Route line shared by listing and match cards: "From → To • Morning".
+function RouteLine({ from, to, flexibility }: { from: string; to: string; flexibility: Flexibility }) {
+  return (
+    <div className="flex items-center gap-1.5 mt-0.5 flex-wrap text-xs">
+      <span className="font-medium text-foreground">{from}</span>
+      <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+      <span className="font-medium text-foreground">{to}</span>
+      <span className={`size-1.5 rounded-full shrink-0 ${FLEX_DOT[flexibility]}`} />
+      <span className="text-muted-foreground">{FLEX_LABEL[flexibility]}</span>
+    </div>
+  )
+}
+
+// Note preview clamped to two lines with a Show more toggle for long notes.
+function NotePreview({ notes }: { notes: string }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div>
+      <p className={`text-xs text-muted-foreground whitespace-pre-wrap ${expanded ? '' : 'line-clamp-2'}`}>“{notes}”</p>
+      {notes.length > 60 && (
+        <button type="button" onClick={() => setExpanded(v => !v)} className="text-xs mt-0.5 text-primary hover:underline">
+          {expanded ? 'Show less' : 'Show more'}
+        </button>
+      )}
+    </div>
+  )
+}
+
+const CHIP = 'text-xs px-2 py-0.5 rounded-full font-medium bg-muted text-muted-foreground'
+const GHOST_BTN = 'inline-flex items-center gap-1.5 rounded-xl border border-border bg-card px-3 py-2 text-xs font-semibold text-foreground hover:bg-muted disabled:opacity-60 transition-colors'
 
 function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' } | null }) {
   if (!toast) return null
@@ -439,119 +522,116 @@ function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' 
 
 // ─── Listing card ─────────────────────────────────────────────────────────────
 
+// Detour is computed server-side from the driver's real route, so the card can
+// say how much a pickup costs the driver without ever receiving exact pins.
+// Only listings inside the rider's route corridor carry a value, and the
+// corridor check is direction-aware — hence "same direction".
+function DetourBadge({ minutes }: { minutes: number | null | undefined }) {
+  if (minutes == null) return null
+  const label = minutes < 1 ? 'On your way' : `+${Math.round(minutes)} min detour`
+  return (
+    <p className="pl-5 text-xs font-medium text-primary flex items-center gap-1.5">
+      <Navigation className="size-3" />{label}<Dot className="size-3 text-border" /><span className="text-muted-foreground font-normal">same direction</span>
+    </p>
+  )
+}
+
 function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; alreadyConnected: boolean }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
   const isOwn = listing.ownerId === currentUserId
+  const luggage = isDriver ? listing.luggageCapacity : listing.luggageSize
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}
-      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-4 hover:shadow-lg hover:shadow-foreground/5 transition-shadow group"
+      className="bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-semibold">{listing.user.name}</span>
-              {listing.user.verified && (
-                <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                  <Check className="size-2.5 text-primary" />
-                </span>
-              )}
-            </div>
-            <span className="text-xs text-muted-foreground">{listing.postedAt}</span>
+      <div className="flex items-start gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-semibold">{listing.user.name}</span>
+            {listing.user.verified && (
+              <span className="size-4 rounded-full bg-primary/10 flex items-center justify-center shrink-0" title="Verified">
+                <Check className="size-2.5 text-primary" />
+              </span>
+            )}
+            {isDriver && (listing.carType || listing.vehicle) && (
+              <span className="text-xs text-muted-foreground">
+                {listing.carType ? `${CAR_TYPE_EMOJI[listing.carType]} ${listing.vehicle ?? CAR_TYPE_LABELS[listing.carType]}` : listing.vehicle}
+              </span>
+            )}
+            {!isDriver && (
+              <span className="text-xs text-muted-foreground">🧍 {listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
+            )}
           </div>
+          <RouteLine from={listing.from} to={listing.to} flexibility={listing.flexibility} />
         </div>
+        <div className="flex flex-col items-end gap-1 shrink-0">
+          {isDriver ? (
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${freeSeats > 0 ? 'bg-secondary text-secondary-foreground' : STATUS_CHIP.red}`}>
+              <span style={MONO}>{freeSeats}</span> of {listing.seats} seats free
+            </span>
+          ) : (
+            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${STATUS_CHIP.amber}`}>Needs ride</span>
+          )}
+          <span className="text-xs text-muted-foreground">{listing.date}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+
+      {(listing.tags.length > 0 || (luggage && luggage !== 'none')) && (
+        <div className="flex flex-wrap gap-1.5">
+          {listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}
+          {luggage && luggage !== 'none' && (
+            <span className={CHIP}>🧳 {isDriver ? `Up to ${LUGGAGE_LABELS[luggage]}` : LUGGAGE_LABELS[luggage]}</span>
+          )}
+        </div>
+      )}
+
+      {listing.notes && <NotePreview notes={listing.notes} />}
+
+      <div className="flex items-center justify-between gap-3 mt-1">
+        {listing.estimatedGas != null ? (
+          <span style={MONO} className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">⛽ ~${listing.estimatedGas}/person</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">Posted {listing.postedAt}</span>
+        )}
         {isOwn ? (
-          <span className="text-xs font-semibold px-2.5 py-1 rounded-full shrink-0 bg-secondary text-secondary-foreground">Your Listing</span>
-        ) : (
-          <span className={`text-xs font-medium px-2.5 py-1 rounded-full shrink-0 ${isDriver ? 'bg-primary/10 text-primary' : 'bg-accent/15 text-amber-700'}`}>
-            {isDriver ? 'Offering ride' : 'Needs ride'}
-          </span>
-        )}
-      </div>
-
-      <div className="space-y-1.5">
-        <div className="flex items-center gap-2 text-sm">
-          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
-          <span className="text-muted-foreground">{listing.from}</span>
-          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
-          <span className="font-semibold text-foreground">{listing.to}</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
-          <Calendar className="size-3" /><span>{listing.date}</span>
-          <Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-muted-foreground">
-        {isDriver ? (
-          <span className="flex items-center gap-1.5">
-            <SeatDots total={listing.seats!} used={listing.seatsUsed!} />
-            <span><span style={MONO} className="text-foreground font-medium">{freeSeats}</span>{' of '}{listing.seats} seats free</span>
+          <span className="text-sm font-semibold px-4 py-2 rounded-xl bg-muted text-muted-foreground">Your post</span>
+        ) : alreadyConnected ? (
+          <span className="text-sm font-semibold px-4 py-2 rounded-xl bg-muted text-muted-foreground flex items-center gap-1.5">
+            <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
           </span>
         ) : (
-          <span className="flex items-center gap-1">
-            <Users className="size-3" />
-            {listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}
-          </span>
-        )}
-        {listing.estimatedGas != null && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Fuel className="size-3" />~<span style={MONO} className="text-foreground font-medium">${listing.estimatedGas}</span>/person</span></>
-        )}
-        {isDriver && listing.carType && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><span>{CAR_TYPE_EMOJI[listing.carType]}</span>{CAR_TYPE_LABELS[listing.carType]}</span></>
-        )}
-        {isDriver && listing.vehicle && !listing.carType && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Car className="size-3" />{listing.vehicle}</span></>
-        )}
-        {isDriver && listing.luggageCapacity && listing.luggageCapacity !== 'none' && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</span></>
-        )}
-        {!isDriver && listing.luggageSize && listing.luggageSize !== 'none' && (
-          <><span className="text-border">·</span>
-          <span className="flex items-center gap-1"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</span></>
+          <button
+            onClick={() => onConnect(listing)}
+            className="text-sm font-semibold px-4 py-2 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 active:scale-[0.98] transition-all"
+          >
+            {isDriver ? 'Request to join' : 'Offer a ride'}
+          </button>
         )}
       </div>
-
-      {listing.tags.length > 0 && (
-        <div className="flex gap-1.5">{listing.tags.map(tag => <TagPill key={tag} tag={tag} />)}</div>
-      )}
-
-      {isOwn ? (
-        <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
-          Manage it in My Rides
-        </div>
-      ) : alreadyConnected ? (
-        <div className="mt-auto w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-2">
-          <Check className="size-4" />{isDriver ? 'Request sent' : 'Offer sent'}
-        </div>
-      ) : (
-        <button
-          onClick={() => onConnect(listing)}
-          className="mt-auto w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-        >
-          {isDriver ? 'Request Ride' : 'Offer Ride'}
-          <ChevronRight className="size-4 group-hover:translate-x-0.5 transition-transform" />
-        </button>
-      )}
     </motion.div>
   )
 }
 
 // ─── Algorithmic match ranking ─────────────────────────────────────────────────
 //
-// Ranks candidates using only signals that are actually available pre-connection:
-// shared profile interests, verified status, and — when the current user already
-// has an open listing of their own — closeness of target date and flexibility
-// window to it. Exact pickup coordinates are deliberately withheld pre-connection
-// (see the location privacy model), so this does not fabricate a distance/ETA
-// figure the way a full route-corridor match would.
+// Ranks candidates using signals that are available pre-connection. The dominant
+// one, when the rider has an open request with coordinates, is the server-computed
+// detour (minutes added to the driver's trip by picking this rider up) — the
+// backend does the route math, so exact pins are never sent to the client. The
+// rest are tie-breakers: closeness of target date and flexibility window, shared
+// profile interests and verified status. Without a rider reference (e.g. driver
+// mode) there's no detour signal and the original three-term score is used.
+
+const DETOUR_CUTOFF_MIN = 15
+
+function detourScore(detourMinutes: number | null | undefined): number {
+  if (detourMinutes == null) return 0 // not on the rider's route corridor
+  return Math.min(Math.max(1 - detourMinutes / DETOUR_CUTOFF_MIN, 0), 1)
+}
 
 function flexibilityCloseness(a: Flexibility, b: Flexibility): number {
   if (a === b) return 1
@@ -588,24 +668,28 @@ function useRankedMatches(
     const pool = candidates.filter(c => c.ownerId !== currentUserId && c.status === 'open')
     if (pool.length === 0) { setMatches([]); return }
 
+    const useDetour = referenceListing?.type === 'rider' && referenceListing.pickupLat != null
     const preScored = pool.map(listing => {
       const windowScore = referenceListing
         ? 0.6 * dateCloseness(listing.date, referenceListing.date) + 0.4 * flexibilityCloseness(listing.flexibility, referenceListing.flexibility)
         : 0.5
-      return { listing, windowScore }
-    }).sort((a, b) => b.windowScore - a.windowScore).slice(0, 8)
+      const detour = useDetour ? detourScore(listing.detourMinutes) : 0
+      return { listing, windowScore, detour, preScore: useDetour ? 0.6 * detour + 0.25 * windowScore : windowScore }
+    }).sort((a, b) => b.preScore - a.preScore).slice(0, 8)
 
     setLoading(true)
     Promise.all(preScored.map(({ listing }) => api.getUserProfile(listing.ownerId).catch(() => null)))
       .then(profiles => {
         if (cancelled) return
         const lowerMine = new Set(currentUserInterests.map(i => i.toLowerCase()))
-        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore }, i) => {
+        const enriched: EnrichedMatch[] = preScored.map(({ listing, windowScore, detour }, i) => {
           const profile = profiles[i]
           const sharedInterests = (profile?.interests ?? []).filter(t => lowerMine.has(t.toLowerCase()))
           const interestScore = Math.min(sharedInterests.length / 3, 1)
           const verifiedScore = profile?.photo_verified ? 1 : 0
-          const score = 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
+          const score = useDetour
+            ? 0.6 * detour + 0.25 * windowScore + 0.1 * interestScore + 0.05 * verifiedScore
+            : 0.45 * windowScore + 0.4 * interestScore + 0.15 * verifiedScore
           return { listing, profile, sharedInterests, score }
         }).sort((a, b) => b.score - a.score)
         setMatches(enriched.slice(0, 3))
@@ -686,36 +770,132 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   return (
     <motion.div
       initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: rank * 0.05 }}
-      className="relative bg-card rounded-[1.25rem] border border-border p-5 flex flex-col gap-4"
+      className="relative w-80 shrink-0 snap-start bg-card rounded-2xl border border-border p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all"
     >
-      {rank === 0 && (
-        <span className="absolute -top-2.5 left-5 bg-primary text-primary-foreground text-[10px] font-bold px-2.5 py-1 rounded-full tracking-wide">TOP MATCH</span>
-      )}
-      <div className="flex items-start justify-between gap-3 mt-1">
-        <div className="flex items-center gap-3 min-w-0">
-          {profile?.photo_url ? (
-            <img src={profile.photo_url} alt="" className="size-11 rounded-full object-cover ring-1 ring-border shrink-0" />
-          ) : (
-            <div style={MONO} className="size-11 rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0">{initials}</div>
-          )}
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-semibold truncate">{name}</span>
-              {profile?.photo_verified && (
-                <span className="size-4 rounded-full bg-green-500 flex items-center justify-center shrink-0"><Check className="size-2.5 text-white" /></span>
-              )}
-            </div>
-            <div className="flex flex-wrap gap-1.5 mt-1">
-              {profile?.nationality && <span className="text-[11px] px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">{profile.nationality}</span>}
-              {sharedInterests.slice(0, 2).map(tag => (
-                <span key={tag} className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{tag}</span>
-              ))}
-            </div>
+      <span className="absolute -top-2.5 left-4 bg-primary text-primary-foreground text-xs font-bold px-2 py-0.5 rounded-full">
+        {rank === 0 ? '✨ Top match' : '✨ Best match'}
+      </span>
+      <div className="flex items-start gap-3 mt-1">
+        {profile?.photo_url ? (
+          <img src={profile.photo_url} alt="" className="size-10 rounded-full object-cover ring-1 ring-border shrink-0" />
+        ) : (
+          <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{initials}</div>
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="text-sm font-semibold truncate">{name}</span>
+            {profile?.photo_verified && (
+              <span className="size-4 rounded-full bg-emerald-600 flex items-center justify-center shrink-0" title="Photo verified"><Check className="size-2.5 text-white" /></span>
+            )}
           </div>
+          <RouteLine from={listing.from} to={listing.to} flexibility={listing.flexibility} />
         </div>
         <UserMenuButton targetUserId={listing.ownerId} showToast={showToast} />
       </div>
 
+      <div className="flex items-center justify-between gap-2 text-xs">
+        {isDriverListing ? (
+          <span className="font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground"><span style={MONO}>{freeSeats}</span> of {listing.seats} seats free</span>
+        ) : (
+          <span className="font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
+        )}
+        <span className="text-muted-foreground">{listing.date}</span>
+      </div>
+      <DetourBadge minutes={listing.detourMinutes} />
+
+      {(profile?.nationality || sharedInterests.length > 0) && (
+        <div className="flex flex-wrap gap-1.5">
+          {profile?.nationality && <span className={CHIP}>{profile.nationality}</span>}
+          {sharedInterests.slice(0, 2).map(tag => (
+            <span key={tag} className="text-xs px-2 py-0.5 rounded-full font-medium bg-secondary text-secondary-foreground">{tag}</span>
+          ))}
+        </div>
+      )}
+
+      {expanded && (
+        <div className="rounded-xl bg-muted p-3 space-y-1.5 text-xs text-muted-foreground">
+          {listing.tags.length > 0 && <div className="flex gap-1.5 flex-wrap">{listing.tags.map(t => <TagPill key={t} tag={t} />)}</div>}
+          {isDriverListing && listing.carType && <p className="flex items-center gap-1.5"><Car className="size-3" />{CAR_TYPE_EMOJI[listing.carType]} {CAR_TYPE_LABELS[listing.carType]}</p>}
+          {isDriverListing && listing.luggageCapacity && listing.luggageCapacity !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</p>}
+          {!isDriverListing && listing.luggageSize && listing.luggageSize !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</p>}
+          {listing.notes && <p className="text-foreground/80">{listing.notes}</p>}
+          <p>Posted {listing.postedAt}</p>
+        </div>
+      )}
+
+      <div className="mt-auto flex gap-2">
+        {alreadyConnected ? (
+          <div className="flex-1 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center justify-center gap-1.5">
+            <Check className="size-4" />Request sent
+          </div>
+        ) : (
+          <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all whitespace-nowrap">
+            {requesting ? 'Requesting…' : 'Instant Request Match'}
+          </button>
+        )}
+        <button onClick={() => setExpanded(v => !v)} className="px-3 py-2 rounded-xl bg-muted text-sm font-semibold text-foreground hover:bg-border transition-colors whitespace-nowrap">
+          {expanded ? 'Hide' : 'View Route'}
+        </button>
+      </div>
+    </motion.div>
+  )
+}
+
+// ─── Proposed match (Empower-style) ─────────────────────────────────────────────
+//
+// For a rider with an open request, the server picks the single best driver trip
+// (lowest detour on the corridor, then date/flexibility). The rider either
+// requests it — the normal pending Connection, driver still accepts/declines —
+// or skips it and gets the next one. Skips are remembered per request.
+
+function ProposedMatch({ rideRequest, onAccepted, showToast }: {
+  rideRequest: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getRideRequestProposal(rideRequest.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [rideRequest.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best ride…</p>
+  const trip = proposal?.trip
+  if (!trip) return null
+  const listing = tripToListing(trip)
+  const freeSeats = (listing.seats ?? 0) - (listing.seatsUsed ?? 0)
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(rideRequest.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to request ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipRideRequestProposal(rideRequest.id, trip.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best match</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The driver heading your way with the smallest detour.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{freeSeats} of {listing.seats} seats free · {listing.date}</p>
+        </div>
+      </div>
       <div className="space-y-1.5">
         <div className="flex items-center gap-2 text-sm">
           <MapPin className="size-3.5 text-muted-foreground shrink-0" />
@@ -723,45 +903,87 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
           <ArrowRight className="size-3 text-muted-foreground shrink-0" />
           <span className="font-semibold text-foreground truncate">{listing.to}</span>
         </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground pl-5">
-          <Calendar className="size-3" /><span>{listing.date}</span>
-          <Dot className="size-3" /><span>{FLEX_LABEL[listing.flexibility]}</span>
-        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
       </div>
-
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-        {isDriverListing ? (
-          <span className="flex items-center gap-1.5"><Users className="size-3.5" /><span style={MONO} className="text-foreground font-medium">{freeSeats}</span> of {listing.seats} seats free</span>
-        ) : (
-          <span className="flex items-center gap-1.5"><Users className="size-3.5" />{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
-        )}
-      </div>
-
-      {expanded && (
-        <div className="rounded-xl bg-muted/50 p-3 space-y-1.5 text-xs text-muted-foreground">
-          {listing.tags.length > 0 && <div className="flex gap-1.5 flex-wrap">{listing.tags.map(t => <TagPill key={t} tag={t} />)}</div>}
-          {isDriverListing && listing.carType && <p className="flex items-center gap-1.5"><Car className="size-3" />{CAR_TYPE_EMOJI[listing.carType]} {CAR_TYPE_LABELS[listing.carType]}</p>}
-          {isDriverListing && listing.luggageCapacity && listing.luggageCapacity !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />Up to {LUGGAGE_LABELS[listing.luggageCapacity]}</p>}
-          {!isDriverListing && listing.luggageSize && listing.luggageSize !== 'none' && <p className="flex items-center gap-1.5"><Package className="size-3" />{LUGGAGE_LABELS[listing.luggageSize]}</p>}
-          <p>Posted {listing.postedAt}</p>
-        </div>
-      )}
-
       <div className="flex gap-2">
-        {alreadyConnected ? (
-          <div className="flex-1 py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
-            <Check className="size-4" />Request sent
-          </div>
-        ) : (
-          <button onClick={handleRequest} disabled={requesting} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
-            {requesting ? 'Requesting…' : 'Instant Request Match'}
-          </button>
-        )}
-        <button onClick={() => setExpanded(v => !v)} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted transition-colors">
-          {expanded ? 'Hide' : 'View Route'}
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Request this ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
         </button>
       </div>
-    </motion.div>
+    </div>
+  )
+}
+
+// Driver-side mirror of ProposedMatch: the best open ride request along the
+// driver's own trip. "Offer a ride" is a driver-initiated pending Connection.
+function ProposedRider({ trip, onAccepted, showToast }: {
+  trip: MyListing
+  onAccepted: (conn: api.ApiConnection) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const [proposal, setProposal] = useState<api.ApiDriverProposal | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try { setProposal(await api.getDriverTripProposal(trip.id)) }
+    catch { setProposal(null) }
+    finally { setLoading(false) }
+  }, [trip.id])
+  useEffect(() => { load() }, [load])
+
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best rider…</p>
+  const req = proposal?.request
+  if (!req) return null
+  const listing = { ...requestToListing(req), detourMinutes: req.detour_minutes ?? undefined }
+
+  const accept = async () => {
+    setBusy(true)
+    try { onAccepted(await api.createConnection(req.id, trip.id)) }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to offer ride', 'error'); setBusy(false) }
+  }
+  const skip = async () => {
+    setBusy(true)
+    try { await api.skipDriverTripProposal(trip.id, req.id); await load() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to skip', 'error') }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Your best rider</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The rider along your route who adds the least time.</p>
+      </div>
+      <div className="flex items-center gap-3">
+        <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+        <div className="min-w-0">
+          <p className="text-sm font-semibold truncate">{listing.user.name}</p>
+          <p className="text-xs text-muted-foreground">{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''} · {listing.date}</p>
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 text-sm">
+          <MapPin className="size-3.5 text-muted-foreground shrink-0" />
+          <span className="text-muted-foreground truncate">{listing.from}</span>
+          <ArrowRight className="size-3 text-muted-foreground shrink-0" />
+          <span className="font-semibold text-foreground truncate">{listing.to}</span>
+        </div>
+        <DetourBadge minutes={listing.detourMinutes} />
+      </div>
+      <div className="flex gap-2">
+        <button onClick={accept} disabled={busy} className="flex-1 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 active:scale-[0.98] transition-all">
+          Offer a ride
+        </button>
+        <button onClick={skip} disabled={busy} className="px-4 py-2.5 rounded-xl border border-border text-sm font-medium text-foreground hover:bg-muted disabled:opacity-60 transition-colors">
+          {proposal && proposal.remaining > 0 ? 'Skip' : 'Skip (last one)'}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -783,18 +1005,16 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
   if (!loading && matches.length === 0) return null
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h2 className="text-lg font-semibold text-foreground">Best matches for you</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">Ranked by departure window and what you have in common.</p>
-      </div>
+    <div>
+      <SectionLabel>✨ Best matches for you</SectionLabel>
       {loading ? (
         <p className="text-sm text-muted-foreground animate-pulse">Finding your best matches…</p>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="flex gap-4 overflow-x-auto snap-x pt-3 pb-2 -mx-1 px-1 items-stretch">
           {matches.map((m, i) => <MatchCard key={m.listing.id} match={m} rank={i} onConnect={onConnect} showToast={showToast} alreadyConnected={connectedListingIds.has(m.listing.apiId)} />)}
         </div>
       )}
+      <p className="text-xs text-muted-foreground mt-1">Ranked by departure window and what you have in common.</p>
     </div>
   )
 }
@@ -802,7 +1022,7 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 // ─── Driver-mode home ───────────────────────────────────────────────────────────
 
 function DriverHomeView({
-  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, showToast, setView,
+  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, onProposalAccepted, showToast, setView,
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
@@ -812,6 +1032,7 @@ function DriverHomeView({
   myOpenTrip: MyListing | undefined; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onProposalAccepted: (conn: api.ApiConnection) => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
@@ -858,11 +1079,12 @@ function DriverHomeView({
           seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded} showSeats={false}
         />
         {!myOpenTrip && (
-          <div className="rounded-3xl border border-dashed border-border p-5 text-center">
+          <div className="rounded-2xl border border-dashed border-border bg-card p-5 text-center">
             <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
-            <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+            <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
           </div>
         )}
+        {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
         <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
         {loading ? (
           <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Finding nearby requests…</p>
@@ -898,7 +1120,7 @@ function DriverHomeView({
       </div>
 
       {myOpenTrip ? (
-        <div className="rounded-3xl bg-primary text-primary-foreground p-6">
+        <div className="rounded-2xl bg-primary text-primary-foreground p-6 shadow-lg shadow-primary/25">
           <div className="flex items-center justify-between gap-3">
             <span className="text-xs font-semibold uppercase tracking-wide text-primary-foreground/70">Active trip</span>
             <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-white/15">Open</span>
@@ -914,54 +1136,76 @@ function DriverHomeView({
           </div>
         </div>
       ) : (
-        <div className="rounded-3xl border border-dashed border-border p-6 text-center">
+        <div className="rounded-2xl border border-dashed border-border bg-card p-6 text-center">
           <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
-          <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
+          <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
         </div>
       )}
 
-      <div className="flex items-center justify-between">
-        <h2 className="text-base font-semibold text-foreground">Requests along your route</h2>
-        {!loading && <span className="text-xs text-muted-foreground">{matches.length} nearby</span>}
-      </div>
+      {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
 
-      {loading ? (
-        <p className="text-sm text-muted-foreground animate-pulse">Finding nearby requests…</p>
-      ) : matches.length === 0 ? (
-        <p className="text-sm text-muted-foreground py-6 text-center">No ride requests to show yet.</p>
-      ) : (
-        <div className="space-y-2.5">
-          {matches.map(m => {
-            const name = m.profile?.display_name ?? m.listing.user.name
-            return (
-              <div key={m.listing.id} className="bg-card border border-border rounded-2xl p-4 flex items-center gap-3.5">
-                {m.profile?.photo_url ? (
-                  <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
-                ) : (
-                  <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
-                )}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-semibold">{name}</span>
-                    {m.sharedInterests.length > 0 && <span className="text-[11px] px-2 py-0.5 rounded-full bg-primary/10 text-primary font-medium">{m.sharedInterests[0]}</span>}
+      <div>
+        <div className="flex items-center justify-between">
+          <SectionLabel>Riders needing a driver</SectionLabel>
+          {!loading && <span className="text-xs text-muted-foreground mb-3">{matches.length} nearby</span>}
+        </div>
+
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse">Finding nearby requests…</p>
+        ) : matches.length === 0 ? (
+          <div className="text-center py-12 text-muted-foreground">
+            <p className="text-4xl mb-3">🧍</p>
+            <p className="font-semibold">No ride requests to show yet</p>
+            <p className="text-sm mt-1">New requests along your route will show up here.</p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {matches.map(m => {
+              const name = m.profile?.display_name ?? m.listing.user.name
+              const l = m.listing
+              return (
+                <div key={l.id} className="bg-card border border-border rounded-2xl p-5 flex flex-col gap-3 hover:shadow-lg hover:shadow-foreground/10 hover:-translate-y-0.5 transition-all">
+                  <div className="flex items-start gap-3">
+                    {m.profile?.photo_url ? (
+                      <img src={m.profile.photo_url} alt="" className="size-10 rounded-full object-cover shrink-0" />
+                    ) : (
+                      <div style={MONO} className="size-10 rounded-full bg-secondary text-secondary-foreground text-sm font-semibold flex items-center justify-center shrink-0">{toInitials(name)}</div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-semibold">{name}</span>
+                        <span className="text-xs text-muted-foreground">🧍 {l.passengers} passenger{(l.passengers ?? 0) > 1 ? 's' : ''}</span>
+                      </div>
+                      <RouteLine from={l.from} to={l.to} flexibility={l.flexibility} />
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <span className="text-xs text-muted-foreground">{l.date}</span>
+                    </div>
+                    <UserMenuButton targetUserId={l.ownerId} showToast={showToast} />
                   </div>
-                  <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                    <span>{m.listing.from}</span> → <span>{m.listing.to}</span> · {m.listing.passengers} passenger{(m.listing.passengers ?? 0) > 1 ? 's' : ''} · {m.listing.date}
-                  </p>
+                  {(l.tags.length > 0 || m.sharedInterests.length > 0 || (l.luggageSize && l.luggageSize !== 'none')) && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {m.sharedInterests.slice(0, 1).map(t => <span key={t} className="text-xs px-2 py-0.5 rounded-full font-medium bg-secondary text-secondary-foreground">{t}</span>)}
+                      {l.tags.map(t => <TagPill key={t} tag={t} />)}
+                      {l.luggageSize && l.luggageSize !== 'none' && <span className={CHIP}>🧳 {LUGGAGE_LABELS[l.luggageSize]}</span>}
+                    </div>
+                  )}
+                  {l.notes && <NotePreview notes={l.notes} />}
+                  <div className="flex items-center justify-end">
+                    {connectedListingIds.has(l.apiId) ? (
+                      <span className="px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-semibold flex items-center gap-1.5"><Check className="size-4" />Offered</span>
+                    ) : (
+                      <button onClick={() => onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all">
+                        Offer to drive
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <UserMenuButton targetUserId={m.listing.ownerId} showToast={showToast} />
-                {connectedListingIds.has(m.listing.apiId) ? (
-                  <span className="shrink-0 px-4 py-2 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center gap-1.5"><Check className="size-4" />Offered</span>
-                ) : (
-                  <button onClick={() => onConnect(m.listing).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error'))} className="shrink-0 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                    Offer Ride
-                  </button>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      )}
+              )
+            })}
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -973,7 +1217,7 @@ function FeedView({
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
-  listings, onConnect, loading, currentUserId, setView, hasLocation, connectedListingIds,
+  listings, onConnect, loading, currentUserId, setView, hasLocation, connectedListingIds, bestMatches,
 }: {
   hasLocation: boolean
   searchQuery: string; setSearchQuery: (v: string) => void
@@ -987,6 +1231,7 @@ function FeedView({
   listings: Listing[]; onConnect: (l: Listing) => void; loading: boolean; currentUserId: string
   setView: (v: View) => void
   connectedListingIds: Set<string>
+  bestMatches?: React.ReactNode
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const isMobile = useIsMobile()
@@ -1018,9 +1263,9 @@ function FeedView({
           </div>
         ) : (
           <div className="text-center py-16 text-muted-foreground">
-            <Search className="size-10 mx-auto mb-4 opacity-20" />
-            <p className="font-medium">No rides match</p>
-            <p className="text-sm mt-1">Try a different destination or fewer filters.</p>
+            <p className="text-4xl mb-4 opacity-50">🚗</p>
+            <p className="font-medium">No nearby drivers right now</p>
+            <p className="text-sm mt-1">Try searching for a specific destination above or post a request.</p>
           </div>
         )}
         <FilterSheet
@@ -1034,78 +1279,88 @@ function FeedView({
     )
   }
 
+  const pill = (active: boolean) => `text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`
+  const chip = (active: boolean) => `text-xs font-medium px-3 py-1.5 rounded-full border transition-colors ${active ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`
   return (
     <div className="space-y-6">
-      <div className="pb-2">
+      <div>
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Find your ride</h1>
-        <p className="text-muted-foreground mt-1">Connect with drivers and riders heading your way.</p>
+        <p className="text-sm text-muted-foreground mt-1">Connect with drivers and riders heading your way.</p>
       </div>
 
-      <div className="flex items-center gap-3 rounded-2xl bg-card border border-border px-8 py-6 focus-within:ring-2 focus-within:ring-ring/25 focus-within:border-primary/30 transition-colors">
-        <Search className="size-5 shrink-0 text-muted-foreground" />
-        <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-          className="flex-1 bg-transparent text-base text-foreground placeholder:text-muted-foreground focus:outline-none pl-2" />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        {(['all', 'driver', 'rider'] as const).map(t => (
-          <button key={t} onClick={() => setFilterType(t)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterType === t ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-            {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
-          </button>
-        ))}
-        <div className="w-px h-5 bg-border mx-0.5" />
-        {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-          <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-accent/20 text-amber-800 ring-1 ring-accent/40' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-            {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
-          </button>
-        ))}
-        <button onClick={() => setShowAdvanced(v => !v)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${showAdvanced ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
-          Filters {showAdvanced ? '▲' : '▼'}
-        </button>
-      </div>
-
-      {showAdvanced && (
-        <div className="rounded-2xl bg-muted p-4 space-y-3">
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Vehicle size</p>
-            <div className="flex flex-wrap gap-2">
-              {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
-                <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
-                  {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Luggage I'm bringing</p>
-            <div className="flex flex-wrap gap-2">
-              {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
-                <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
-                  {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
-                </button>
-              ))}
-            </div>
-          </div>
+      <div className="space-y-4">
+        <div className="relative">
+          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+          <input type="text" placeholder="Search destination, neighborhood…" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            className="w-full pl-10 pr-4 py-3 rounded-xl bg-card border border-border text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary focus:ring-3 focus:ring-primary/15 transition-colors" />
         </div>
-      )}
 
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        {loading ? <span className="animate-pulse">Loading…</span> : (
-          <><span style={MONO} className="text-foreground font-medium">{listings.length}</span><span>listing{listings.length !== 1 ? 's' : ''} found</span></>
+        <div className="flex flex-wrap items-center gap-2">
+          {(['all', 'driver', 'rider'] as const).map(t => (
+            <button key={t} onClick={() => setFilterType(t)} className={pill(filterType === t)}>
+              {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {(['', 'airport', 'student', 'church', 'college', 'work', 'event'] as const).map(tag => (
+            <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={chip(filterTag === tag)}>
+              {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
+            </button>
+          ))}
+          <button onClick={() => setShowAdvanced(v => !v)} className={chip(showAdvanced)}>
+            More filters {showAdvanced ? '▲' : '▼'}
+          </button>
+        </div>
+
+        {showAdvanced && (
+          <div className="rounded-2xl bg-card border border-border p-4 space-y-3">
+            <div className="space-y-1.5">
+              <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Vehicle size</p>
+              <div className="flex flex-wrap gap-2">
+                {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
+                  <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={pill(filterCarType === ct)}>
+                    {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Luggage I'm bringing</p>
+              <div className="flex flex-wrap gap-2">
+                {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
+                  <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={pill(filterLuggage === ls)}>
+                    {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
-      {!loading && listings.length > 0 ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4">
-          {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} alreadyConnected={connectedListingIds.has(l.apiId)} />)}
+      {bestMatches}
+
+      <div>
+        <div className="flex items-center justify-between">
+          <SectionLabel>All listings</SectionLabel>
+          {!loading && <span className="text-xs text-muted-foreground mb-3"><span style={MONO} className="text-foreground font-medium">{listings.length}</span> found</span>}
         </div>
-      ) : !loading ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <Search className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No listings match</p>
-          <p className="text-sm mt-1">Try broadening your filters.</p>
-        </div>
-      ) : null}
+        {loading ? (
+          <p className="text-sm text-muted-foreground animate-pulse">Loading…</p>
+        ) : listings.length > 0 ? (
+          <div className="flex flex-col gap-4">
+            {listings.map(l => <ListingCard key={l.id} listing={l} onConnect={onConnect} currentUserId={currentUserId} alreadyConnected={connectedListingIds.has(l.apiId)} />)}
+          </div>
+        ) : (
+          <div className="text-center py-12 text-muted-foreground">
+            <p className="text-4xl mb-3">🚗</p>
+            <p className="font-semibold">No rides found</p>
+            <p className="text-sm mt-1">Try adjusting your search or filters, or post a request.</p>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -1122,6 +1377,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
   // type while in Rider/Driver mode is exactly the kind of mixed-page
   // behavior the mode gate exists to remove.
   const type = defaultType
+  const submittingRef = useRef(false)
+  const [notes, setNotes] = useState('')
   const [from, setFrom] = useState<LocationValue | null>(prefill?.from ?? null)
   const [to, setTo] = useState<LocationValue | null>(prefill?.to ?? null)
   const [date, setDate] = useState('')
@@ -1143,7 +1400,9 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 
   const handleSubmit = async (e: { preventDefault(): void }) => {
     e.preventDefault()
+    if (submittingRef.current) return
     if (!from || !to) { setError('Please select both pickup and destination from the suggestions'); return }
+    submittingRef.current = true
     setSubmitted(true); setError('')
     try {
       const [pickupLoc, destLoc] = await Promise.all([
@@ -1155,6 +1414,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
           pickup_location_id: pickupLoc.id, destination_location_id: destLoc.id,
           target_date: date, flexibility, seats_available: parseInt(seats, 10),
           tags: Array.from(tags), car_type: carType || undefined, luggage_capacity: luggageCapacity,
+          notes: notes.trim() || undefined,
         })
         onPost(tripToMyListing(trip))
       } else {
@@ -1162,14 +1422,18 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
           pickup_location_id: pickupLoc.id, destination_location_id: destLoc.id,
           target_date: date, flexibility, passenger_count: parseInt(passengers, 10),
           tags: Array.from(tags), luggage_size: luggageSize,
+          notes: notes.trim() || undefined,
         })
         onPost(requestToMyListing(req))
       }
-    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to post'); setSubmitted(false) }
+    } catch (err) { setError(err instanceof Error ? err.message : 'Failed to post'); setSubmitted(false); submittingRef.current = false }
   }
 
-  const inputCls = 'w-full px-3 py-2.5 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors'
-  const iconInputCls = 'pl-9 ' + inputCls
+  const inputCls = 'w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm focus:border-primary focus:outline-none focus:ring-3 focus:ring-primary/15 transition-colors'
+  const iconInputCls = 'pl-10 ' + inputCls
+  const optionCls = (active: boolean) => `px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`
+  const countValue = type === 'driver' ? seats : passengers
+  const setCount = (n: number) => { const v = String(Math.min(8, Math.max(1, n))); type === 'driver' ? setSeats(v) : setPassengers(v) }
 
   return (
     <div className="max-w-lg mx-auto">
@@ -1181,49 +1445,60 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
         </p>
       </div>
 
-      <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-muted text-sm font-medium text-foreground mb-8">
-        {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
+      <div className="flex items-center justify-between gap-3 rounded-2xl p-1 pr-4 mb-8 bg-card border border-border">
+        <span className="px-4 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold">
+          {type === 'driver' ? "🚗 Offering a ride" : '🧍 Requesting a ride'}
+        </span>
+        <span className="text-xs text-muted-foreground">Switch mode from your Profile</span>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-5">
-        <div className="grid grid-cols-2 gap-3">
-          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required />
-          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required />
+      <form onSubmit={handleSubmit} className="flex flex-col gap-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required nearCoords={userCoords} />
+          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required nearCoords={userCoords} />
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Date</label>
+            <label className="text-sm font-semibold">Date</label>
             <div className="relative">
               <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <input required type="date" value={date} onChange={e => setDate(e.target.value)} className={iconInputCls} />
             </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Flexibility</label>
-            <select value={flexibility} onChange={e => setFlexibility(e.target.value as Flexibility)} className={inputCls}>
-              {Object.entries(FLEX_LABEL).map(([k, l]) => <option key={k} value={k}>{l}</option>)}
-            </select>
+            <label className="text-sm font-semibold">Flexibility</label>
+            <div className="flex gap-2 flex-wrap" role="radiogroup" aria-label="Flexibility">
+              {(Object.entries(FLEX_LABEL) as [Flexibility, string][]).map(([k, l]) => (
+                <button key={k} type="button" role="radio" aria-checked={flexibility === k} onClick={() => setFlexibility(k)} className={`${optionCls(flexibility === k)} flex items-center gap-1.5`}>
+                  <span className={`size-1.5 rounded-full ${flexibility === k ? 'bg-primary-foreground' : FLEX_DOT[k]}`} />{l}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">{type === 'driver' ? 'Seats available' : 'Passengers'}</label>
-            <input required type="number" min="1" value={type === 'driver' ? seats : passengers} onChange={e => type === 'driver' ? setSeats(e.target.value) : setPassengers(e.target.value)} className={inputCls} />
+            <label className="text-sm font-semibold" id="post-count-label">{type === 'driver' ? 'Seats available' : 'Passengers'}</label>
+            <div className="flex items-center gap-3" role="group" aria-labelledby="post-count-label">
+              <button type="button" aria-label="Decrease" onClick={() => setCount(parseInt(countValue, 10) - 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">−</button>
+              <span style={MONO} className="w-8 text-center text-xl font-bold text-foreground">{countValue}</span>
+              <button type="button" aria-label="Increase" onClick={() => setCount(parseInt(countValue, 10) + 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">+</button>
+            </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Gas split estimate</label>
+            <label className="text-sm font-semibold">Gas split ($/person)</label>
             <div className="relative">
-              <Fuel className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
-              <input value={gasEstimate} onChange={e => setGasEstimate(e.target.value)} placeholder="$ per person" className={iconInputCls} />
+              <span style={MONO} className="absolute left-4 top-1/2 -translate-y-1/2 font-semibold text-muted-foreground pointer-events-none">$</span>
+              <input value={gasEstimate} onChange={e => setGasEstimate(e.target.value)} placeholder="0.00" inputMode="decimal" style={MONO} className={iconInputCls.replace('pl-10', 'pl-8')} />
             </div>
           </div>
         </div>
 
         {type === 'driver' && (
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">
+            <label className="text-sm font-semibold">
               Vehicle{autoFilledFromProfile && <span className="text-muted-foreground font-normal"> · auto-filled from your profile</span>}
             </label>
             <input value={vehicle} onChange={e => setVehicle(e.target.value)} placeholder="e.g. Subaru Outback '23" className={inputCls} />
@@ -1232,10 +1507,10 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 
         {type === 'driver' && (
           <div className="space-y-1.5">
-            <label className="text-sm font-medium">Vehicle type</label>
+            <label className="text-sm font-semibold">Vehicle type</label>
             <div className="flex flex-wrap gap-2">
               {(['sedan', 'suv', 'van', 'minivan', 'truck'] as CarType[]).map(ct => (
-                <button key={ct} type="button" onClick={() => setCarType(carType === ct ? '' : ct)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${carType === ct ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                <button key={ct} type="button" onClick={() => setCarType(carType === ct ? '' : ct)} className={optionCls(carType === ct)}>
                   {CAR_TYPE_EMOJI[ct]} {CAR_TYPE_LABELS[ct]}
                 </button>
               ))}
@@ -1244,13 +1519,13 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
         )}
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">{type === 'driver' ? 'Max luggage accepted' : "Luggage I'm bringing"}</label>
+          <label className="text-sm font-semibold">{type === 'driver' ? 'Max luggage accepted' : "Luggage I'm bringing"}</label>
           <div className="flex flex-wrap gap-2">
             {(['none', 'small', 'medium', 'large', 'oversized'] as LuggageSize[]).map(ls => {
               const current = type === 'driver' ? luggageCapacity : luggageSize
               const setter = type === 'driver' ? setLuggageCapacity : setLuggageSize
               return (
-                <button key={ls} type="button" onClick={() => setter(ls)} className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors ${current === ls ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+                <button key={ls} type="button" onClick={() => setter(ls)} className={optionCls(current === ls)}>
                   {LUGGAGE_LABELS[ls]}
                 </button>
               )
@@ -1259,24 +1534,35 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
         </div>
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">Tags</label>
+          <label className="text-sm font-semibold">Tags</label>
           <div className="flex gap-2 flex-wrap">
             {(['airport', 'student', 'church', 'college', 'work', 'event'] as RideTag[]).map(tag => (
-              <button key={tag} type="button" onClick={() => toggleTag(tag)} className={`px-3.5 py-2 rounded-xl text-sm font-medium transition-colors ${tags.has(tag) ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={tag} type="button" aria-pressed={tags.has(tag)} onClick={() => toggleTag(tag)} className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${tags.has(tag) ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`}>
                 {tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}
           </div>
         </div>
 
-        <label className="inline-flex items-center gap-2 text-sm text-muted-foreground">
-          <input type="checkbox" checked={declared} onChange={() => setDeclared(v => !v)} className="form-checkbox h-4 w-4 rounded border-border bg-input-background text-primary focus:ring-ring" />
-          I confirm the information is accurate.
+        <div className="space-y-1.5">
+          <label className="text-sm font-semibold">Optional note</label>
+          <textarea
+            value={notes} onChange={e => setNotes(e.target.value)} rows={3} maxLength={500}
+            placeholder={type === 'driver'
+              ? "e.g. I'm heading to SFO around 8am. Anyone going the same direction?"
+              : "e.g. Looking for a driver heading downtown Friday morning, one small bag."}
+            className={`${inputCls} resize-none`}
+          />
+        </div>
+
+        <label className="flex items-start gap-3 text-sm leading-relaxed text-muted-foreground cursor-pointer">
+          <input type="checkbox" checked={declared} onChange={() => setDeclared(v => !v)} className="mt-0.5 size-5 shrink-0 rounded accent-primary" />
+          I confirm this listing is accurate and I agree to Let's Carpool's community guidelines.
         </label>
 
-        {error && <p className="text-sm text-red-500">{error}</p>}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <button type="submit" disabled={submitted} className="w-full py-3 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 disabled:opacity-60 transition-colors">
+        <button type="submit" disabled={submitted} className="w-full py-4 rounded-xl bg-primary text-primary-foreground text-sm font-bold shadow-lg shadow-primary/30 hover:bg-primary/90 disabled:opacity-60 disabled:shadow-none transition-all">
           {submitted ? 'Posting...' : 'Post listing'}
         </button>
       </form>
@@ -1532,8 +1818,9 @@ function ConversationListItem({ connection, selected, currentUserId, onSelect }:
 
 function ConversationPane({
   connection, currentUserId, onBack, onAccept, onDecline, onCancel, onComplete, showToast,
-  onViewRoute, onStartDriving, onMarkRead, initialPanel, incomingMessage, onMessageSent,
+  onViewRoute, onStartDriving, onMarkRead, initialPanel, incomingMessage, onMessageSent, onUpdatePickup,
 }: {
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
   connection: Connection; currentUserId: string; onBack?: () => void
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
@@ -1544,7 +1831,13 @@ function ConversationPane({
   incomingMessage: { connectionId: string; message: api.ApiMessage } | null
   onMessageSent: (connectionId: string, message: api.ApiMessage) => void
 }) {
-  const [panel, setPanel] = useState<'gassplit' | 'safety' | null>(initialPanel ?? null)
+  const [panel, setPanel] = useState<'gassplit' | 'safety' | 'pickup' | null>(initialPanel ?? null)
+  const [pickupDraft, setPickupDraft] = useState<LocationValue | null>(
+    connection.riderPickupLat != null && connection.riderPickupLng != null
+      ? { label: connection.riderPickupLabel ?? '', lat: connection.riderPickupLat, lng: connection.riderPickupLng }
+      : null,
+  )
+  const [savingPickup, setSavingPickup] = useState(false)
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
   const [msgsLoaded, setMsgsLoaded] = useState(false)
   const [msgText, setMsgText] = useState('')
@@ -1627,6 +1920,18 @@ function ConversationPane({
     catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
   }
 
+  // Rider-only, once accepted: the exact pickup address the driver navigates to.
+  const handleSavePickup = async () => {
+    if (!pickupDraft) return
+    setSavingPickup(true)
+    try {
+      await onUpdatePickup(connectionId, connection.rideRequestId, pickupDraft)
+      showToast('Pickup address updated', 'success')
+      setPanel(null)
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to update pickup', 'error') }
+    finally { setSavingPickup(false) }
+  }
+
   const iStarted = connection.initiatorUserId === currentUserId
   const hasRouteCoords = !!(connection.pickupLat && connection.destLat)
   const hasRiderPickupCoords = !!(connection.riderPickupLat && connection.riderPickupLng)
@@ -1678,6 +1983,9 @@ function ConversationPane({
                   <button onClick={() => onStartDriving(connection)} className={`${btn} bg-green-600 text-white font-semibold hover:bg-green-700`}><Car className="size-4" />Start Driving</button>
                 )}
                 {hasRouteCoords && <button onClick={() => onViewRoute(connection)} className={btnOutline}><Map className="size-4" />Route</button>}
+                {connection.myRole === 'rider' && (
+                  <button onClick={() => setPanel(panel === 'pickup' ? null : 'pickup')} aria-pressed={panel === 'pickup'} className={btnOutline}><MapPin className="size-4" />Pickup address</button>
+                )}
                 <button onClick={() => setPanel(panel === 'gassplit' ? null : 'gassplit')} aria-pressed={panel === 'gassplit'} className={`${btn} ${panel === 'gassplit' ? 'bg-accent/20 text-amber-800 dark:text-amber-300' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
                 <button onClick={run(onComplete, 'Ride completed!')} disabled={busy} className={btnOutline}><Check className="size-4" />Complete</button>
                 <button onClick={run(onCancel, 'Ride cancelled')} disabled={busy} className={`${btn} text-muted-foreground hover:text-destructive hover:bg-destructive/10`}>Cancel</button>
@@ -1708,6 +2016,18 @@ function ConversationPane({
               <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
             </>
           ) : <p className="text-sm text-muted-foreground animate-pulse">Loading suggestion…</p>}
+        </div>
+      )}
+      {panel === 'pickup' && status === 'accepted' && connection.myRole === 'rider' && (
+        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
+          <LocationInput label="Pickup address" value={pickupDraft} onChange={setPickupDraft} placeholder="Search for your pickup address…" />
+          <div className="flex gap-2">
+            <button onClick={handleSavePickup} disabled={!pickupDraft || savingPickup} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-60 transition-colors">
+              {savingPickup ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => setPanel(null)} className="px-4 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:text-foreground transition-colors">Cancel</button>
+          </div>
+          <p className="text-xs text-muted-foreground">Your driver will see the exact address you set here.</p>
         </div>
       )}
       {panel === 'safety' && (
@@ -1782,8 +2102,9 @@ function ConversationPane({
 
 function InboxView({
   connections, currentUserId, onAccept, onDecline, onCancel, onComplete, showToast, onViewRoute, onStartDriving,
-  onMarkRead, deepLink, onDeepLinkHandled, listingFilter, onClearListingFilter, incomingMessage, onMessageSent,
+  onMarkRead, deepLink, onDeepLinkHandled, listingFilter, onClearListingFilter, incomingMessage, onMessageSent, onUpdatePickup,
 }: {
+  onUpdatePickup: (connectionId: string, rideRequestId: string, pickup: LocationValue) => Promise<void>
   connections: Connection[]; currentUserId: string
   onAccept: (id: string) => Promise<void>; onDecline: (id: string) => Promise<void>
   onCancel: (id: string) => Promise<void>; onComplete: (id: string) => Promise<void>
@@ -1844,7 +2165,7 @@ function InboxView({
       onBack={isMobile ? () => setSelectedId(null) : undefined}
       onAccept={onAccept} onDecline={onDecline} onCancel={onCancel} onComplete={onComplete}
       showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
-      initialPanel={initialPanel} incomingMessage={incomingMessage} onMessageSent={onMessageSent}
+      initialPanel={initialPanel} incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup}
     />
   )
 
@@ -1938,13 +2259,14 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 }) {
   const [filter, setFilter] = useState<NotifCategory>('all')
 
-  const iconForType = (type: string) => {
-    if (type.includes('connection_received')) return <UserPlus className="size-4 text-primary" />
-    if (type.includes('accepted') || type.includes('chat_unlocked')) return <Check className="size-4 text-green-600" />
-    if (type.includes('chat')) return <MessageCircle className="size-4 text-primary" />
-    if (type.includes('gas_split')) return <Fuel className="size-4 text-amber-600" />
-    if (type.includes('declined') || type.includes('cancelled')) return <X className="size-4 text-red-500" />
-    return <Bell className="size-4 text-muted-foreground" />
+  // Icon + tinted circle per type, as in the Figma Make notification list.
+  const iconForType = (type: string): { icon: React.ReactNode; bg: string } => {
+    if (type.includes('connection_received')) return { icon: <UserPlus className="size-4 text-primary" />, bg: 'bg-secondary' }
+    if (type.includes('accepted') || type.includes('chat_unlocked')) return { icon: <Check className="size-4 text-emerald-600" />, bg: 'bg-emerald-500/15' }
+    if (type.includes('chat')) return { icon: <MessageCircle className="size-4 text-primary" />, bg: 'bg-secondary' }
+    if (type.includes('gas_split')) return { icon: <Fuel className="size-4 text-amber-600" />, bg: 'bg-amber-500/15' }
+    if (type.includes('declined') || type.includes('cancelled')) return { icon: <X className="size-4 text-destructive" />, bg: 'bg-destructive/10' }
+    return { icon: <Bell className="size-4 text-muted-foreground" />, bg: 'bg-muted' }
   }
 
   const unreadCount = notifications.filter(n => !n.read).length
@@ -1955,7 +2277,7 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Notifications</h1>
-          <p className="text-muted-foreground mt-1">Stay up to date on your connections and activity.</p>
+          <p className="text-sm text-muted-foreground mt-1">{unreadCount > 0 ? `${unreadCount} unread` : 'Stay up to date on your connections and activity.'}</p>
         </div>
         {unreadCount > 0 && (
           <button onClick={onMarkAllRead} className="shrink-0 text-sm font-semibold text-primary hover:underline">
@@ -1966,33 +2288,33 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
       <div className="flex flex-wrap gap-2">
         {NOTIF_FILTERS.map(f => (
-          <button key={f.id} onClick={() => setFilter(f.id)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filter === f.id ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+          <button key={f.id} onClick={() => setFilter(f.id)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filter === f.id ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
             {f.label}
           </button>
         ))}
       </div>
 
       {visible.length === 0 ? (
-        <div className="text-center py-24 text-muted-foreground">
-          <Bell className="size-10 mx-auto mb-4 opacity-20" />
-          <p className="font-medium">No notifications</p>
-          <p className="text-sm mt-1">You're all caught up.</p>
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <p className="text-5xl mb-4">🔔</p>
+          <p className="font-bold text-base text-foreground mb-1">All caught up!</p>
+          <p className="text-sm text-muted-foreground">You have no notifications.</p>
         </div>
       ) : (
-        <div className="space-y-2">
+        <div className="flex flex-col gap-3 max-w-2xl">
           {visible.map(n => (
             <motion.div
               key={n.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}
               onClick={() => onNavigate(n)}
-              className={`relative flex items-start gap-3 p-4 pl-5 rounded-2xl border cursor-pointer transition-colors ${n.read ? 'bg-card border-border hover:bg-muted/50' : 'bg-primary/10 border-primary/25 hover:bg-primary/15'}`}
+              className={`relative flex items-start gap-3 p-4 rounded-2xl border border-border cursor-pointer transition-colors ${n.read ? 'bg-muted/60 hover:bg-muted' : 'bg-card border-l-[3px] border-l-primary hover:bg-card/80'}`}
             >
-              {!n.read && <span className="absolute top-5 left-1.5 size-1.5 rounded-full bg-primary" aria-hidden />}
-              <div className="mt-0.5 shrink-0">{iconForType(n.type)}</div>
+              {(() => { const { icon, bg } = iconForType(n.type); return <div className={`size-9 rounded-full flex items-center justify-center shrink-0 ${bg}`}>{icon}</div> })()}
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-semibold text-foreground">{n.title}</p>
-                <p className="text-sm text-muted-foreground mt-0.5">{n.body}</p>
+                <p className={`text-sm leading-snug text-foreground ${n.read ? 'font-normal' : 'font-semibold'}`}>{n.title}</p>
+                <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">{n.body}</p>
+                <p className="text-xs text-muted-foreground mt-1.5">{relativeTime(n.created_at)}</p>
               </div>
-              <span className="text-xs text-muted-foreground shrink-0">{relativeTime(n.created_at)}</span>
+              {!n.read && <span className="mt-2 size-2 rounded-full bg-primary shrink-0" aria-label="Unread" />}
               <button
                 onClick={e => { e.stopPropagation(); onDismiss(n.id) }}
                 aria-label="Dismiss notification"
@@ -2269,17 +2591,16 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   )
 }
 
-// ─── Neon ↔ Backend session sync ─────────────────────────────────────────────
+// ─── Auth ↔ Backend session sync ─────────────────────────────────────────────
 
 const AUTH_TOKEN_RETRY_LIMIT = 3
 
-function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
-  onAuthenticated: (neonToken: string) => Promise<void>
+function AuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
+  onAuthenticated: (token: string) => Promise<void>
   onUnauthenticated: () => void
   onAuthError: (message: string) => void
 }) {
-  const ctx = useContext(AuthUIContext)
-  const { data: session, isPending } = ctx.hooks.useSession()
+  const { session, isPending } = useAuthSession()
   const lastSyncedId = useRef<string | null | undefined>(undefined)
 
   useEffect(() => {
@@ -2296,16 +2617,16 @@ function NeonAuthSync({ onAuthenticated, onUnauthenticated, onAuthError }: {
 
     // The backend verifies this token's signature itself — it never trusts a
     // client-supplied email/name (that would let anyone authenticate as anyone).
-    // fetchNeonJWT can reject or resolve null (e.g. the Neon Auth server is
+    // getAccessToken can reject or resolve null (e.g. the auth server is
     // briefly unreachable) — retry a few times with backoff, and surface an
     // error instead of hanging on "Loading…" forever if it never recovers.
     let cancelled = false
 
     const attempt = async (attemptNumber: number): Promise<void> => {
       try {
-        const token = await fetchNeonJWT()
+        const token = await getAccessToken()
         if (cancelled) return
-        if (!token) throw new Error('Neon Auth returned no token')
+        if (!token) throw new Error('No access token for the current session')
         lastSyncedId.current = uid
         await onAuthenticated(token)
       } catch {
@@ -2367,39 +2688,47 @@ function AccountMenu({ currentUser, initials, setView, onSignOut, onOpenAdmin }:
   )
 }
 
+function BrandMark({ size = 'md' }: { size?: 'sm' | 'md' }) {
+  return (
+    <span className={`${size === 'sm' ? 'size-7 rounded-lg' : 'size-8 rounded-lg'} bg-primary text-primary-foreground flex items-center justify-center shrink-0`}>
+      <Car className="size-4" />
+    </span>
+  )
+}
+
 function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, initials, darkMode, onToggleDark, mode }: {
   setView: (v: View) => void; currentUser: ApiUser | null; unreadCount: number
-  onSignOut: () => void; onOpenAdmin: () => void; initials: string; darkMode: boolean; onToggleDark: () => void
-  mode: ListingType
+  onSignOut: () => void; onOpenAdmin: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
 }) {
+  const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
   return (
-    <header className="sticky top-0 z-40 bg-sidebar text-sidebar-foreground border-b border-sidebar-border">
-      <div className="max-w-[1440px] mx-auto px-4 lg:px-8 h-14 flex items-center justify-between gap-3">
-        <button onClick={() => setView('feed')} className="flex items-center gap-2 text-sm font-semibold text-sidebar-foreground hover:text-sidebar-primary transition-colors xl:text-base min-w-0">
-          <span className="size-7 rounded-lg bg-sidebar-primary text-white flex items-center justify-center shrink-0"><Car className="size-4" /></span>
-          <span className="hidden sm:inline truncate">Let's Carpool</span>
+    <header className="sticky top-0 z-40 bg-card text-foreground border-b border-border">
+      <div className="px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
+        <button onClick={() => setView('feed')} className="flex items-center gap-2 xl:hidden">
+          <BrandMark size="sm" />
+          <span className="text-sm font-bold text-foreground">Let's Carpool</span>
         </button>
+        <div className="hidden xl:flex items-center gap-2">
+          <span className="text-sm font-semibold text-muted-foreground">Riding as</span>
+          <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{mode === 'driver' ? '🚗 Driver' : '🧍 Rider'}</span>
+        </div>
         {currentUser ? (
-          <div className="flex items-center gap-1 sm:gap-2">
-            {/* Read-only reminder of the session's mode; switching is a deliberate action in Profile. */}
-            <button onClick={() => setView('profile')} title="Change mode in Profile" className="px-2.5 py-1 rounded-lg bg-sidebar-accent text-[11px] font-semibold text-sidebar-foreground/80 hover:text-sidebar-foreground transition-colors">
-              {mode === 'rider' ? 'Passenger' : 'Driver'}
+          <div className="flex items-center gap-2">
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
-            </button>
-            <button onClick={() => setView('notifications')} className="relative p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Notifications">
-              <Bell className="size-5" />
-              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[10px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
+            <button onClick={() => setView('notifications')} className={`relative ${iconBtn}`} aria-label="Notifications">
+              <Bell className="size-4" />
+              {unreadCount > 0 && <span className="absolute -top-0.5 -right-0.5 size-4 flex items-center justify-center rounded-full bg-destructive text-white text-[9px] font-bold">{unreadCount > 9 ? '9+' : unreadCount}</span>}
             </button>
             <AccountMenu currentUser={currentUser} initials={initials} setView={setView} onSignOut={onSignOut} onOpenAdmin={onOpenAdmin} />
           </div>
         ) : (
           <div className="flex items-center gap-2">
-            <button onClick={onToggleDark} className="p-2 rounded-xl hover:bg-sidebar-accent text-sidebar-foreground/70 hover:text-sidebar-foreground transition-colors" aria-label="Toggle dark mode">
-              {darkMode ? <Sun className="size-5" /> : <Moon className="size-5" />}
+            <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
-            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-2xl bg-sidebar-primary text-white text-sm font-semibold hover:opacity-90 transition-colors">Sign in</button>
+            <button onClick={() => setView('feed')} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Sign in</button>
           </div>
         )}
       </div>
@@ -2437,43 +2766,45 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   )
 }
 
-function Sidebar({ view, setView, unreadMessages }: { view: View; setView: (v: View) => void; unreadMessages: number }) {
-  const items: Array<{ id: View; label: string }> = [
-    { id: 'feed', label: 'Discover' }, { id: 'map', label: 'Live Map' }, { id: 'pools', label: 'Pools' },
-    { id: 'post', label: 'Post' }, { id: 'my-listings', label: 'My Rides' },
-    { id: 'connections', label: 'Inbox' }, { id: 'notifications', label: 'Notifications' }, { id: 'profile', label: 'Profile' },
+function Sidebar({ view, setView, unreadCount }: { view: View; setView: (v: View) => void; unreadCount: number }) {
+  const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
+    { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
+    { id: 'map', label: 'Live Map', icon: <MapPin className="size-5" /> },
+    { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
+    { id: 'post', label: 'Post', icon: <PlusCircle className="size-5" /> },
+    { id: 'my-listings', label: 'My Rides', icon: <Calendar className="size-5" /> },
+    { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
+    { id: 'notifications', label: 'Notifications', icon: <Bell className="size-5" /> },
+    { id: 'profile', label: 'Profile', icon: <User className="size-5" /> },
   ]
   return (
-    <aside className="bg-sidebar border border-sidebar-border rounded-[2rem] p-6 xl:h-fit xl:sticky xl:top-20">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <p className="text-sm text-sidebar-foreground/60">Carpooling app</p>
-          <h1 className="mt-2 text-2xl font-semibold text-sidebar-foreground">Let's Carpool</h1>
-        </div>
-        <div className="rounded-3xl bg-sidebar-primary px-3 py-2 text-white text-xs font-semibold">MVP</div>
+    <aside className="fixed left-0 top-0 bottom-0 w-60 z-30 flex flex-col bg-sidebar text-sidebar-foreground">
+      <div className="flex items-center gap-2.5 px-5 py-5 border-b border-sidebar-border">
+        <BrandMark />
+        <span className="text-sm font-semibold">Let's Carpool</span>
       </div>
-      <div className="mt-8 space-y-1.5">
-        {items.map(item => (
-          <button key={item.id} type="button" onClick={() => setView(item.id)} aria-current={view === item.id ? 'page' : undefined} className={`w-full rounded-3xl px-4 py-3 text-left text-sm font-medium transition-all flex items-center justify-between ${view === item.id ? 'bg-sidebar-primary text-white shadow-lg shadow-sidebar-primary/20' : 'text-sidebar-foreground/65 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}>
-            {item.label}
-            {item.id === 'connections' && unreadMessages > 0 && (
-              <span className="min-w-5 h-5 px-1.5 rounded-full bg-destructive text-white text-[10px] font-bold flex items-center justify-center">{unreadMessages > 9 ? '9+' : unreadMessages}</span>
-            )}
-          </button>
-        ))}
-      </div>
-      <div className="mt-8 rounded-[2rem] bg-card p-6 shadow-[0_36px_60px_-40px_rgba(0,0,0,0.18)]">
-        <div className="flex items-center gap-3">
-          <div className="rounded-2xl bg-primary/10 p-3 text-primary"><HomeIcon className="size-5" /></div>
-          <div>
-            <p className="text-sm text-muted-foreground">Quick start</p>
-            <p className="text-sm font-semibold text-foreground">Browse listings, post trips, and manage matches.</p>
-          </div>
-        </div>
-        <div className="mt-6 space-y-3 text-sm text-muted-foreground">
-          <div className="flex items-center gap-2"><Dot className="size-2" />Search and filter rides across the marketplace.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Post one-off ride requests or driver trips.</div>
-          <div className="flex items-center gap-2"><Dot className="size-2" />Track pending connections and confirm gas split.</div>
+      <nav className="flex-1 py-4 px-3 flex flex-col gap-0.5 overflow-y-auto">
+        {items.map(item => {
+          const active = view === item.id
+          return (
+            <button
+              key={item.id} type="button" onClick={() => setView(item.id)}
+              aria-current={active ? 'page' : undefined}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium w-full text-left transition-colors ${active ? 'bg-sidebar-primary text-sidebar-primary-foreground' : 'text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-foreground'}`}
+            >
+              <span className={active ? '' : 'text-sidebar-foreground/50'}>{item.icon}</span>
+              <span>{item.label}</span>
+              {item.id === 'notifications' && unreadCount > 0 && (
+                <span className="ml-auto min-w-5 text-center text-xs font-bold px-1.5 py-0.5 rounded-full bg-destructive text-white">{unreadCount > 9 ? '9+' : unreadCount}</span>
+              )}
+            </button>
+          )
+        })}
+      </nav>
+      <div className="px-3 pb-2">
+        <div className="rounded-xl p-3 text-xs bg-white/5 text-sidebar-foreground/50">
+          New here?{' '}
+          <button type="button" className="text-xs underline text-sidebar-foreground/80" onClick={() => setView('post')}>Post your first listing →</button>
         </div>
       </div>
     </aside>
@@ -2487,28 +2818,36 @@ function Sidebar({ view, setView, unreadMessages }: { view: View; setView: (v: V
 
 function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
   const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
-    { mode: 'rider', icon: <Users className="size-7" />, title: 'I need a ride', desc: 'Find drivers heading your way.' },
-    { mode: 'driver', icon: <Car className="size-7" />, title: "I'm offering a ride", desc: 'Publish your route and find riders.' },
+    { mode: 'rider', icon: <Users className="size-8" />, title: 'I need a ride', desc: 'Find drivers heading your way and request a seat.' },
+    { mode: 'driver', icon: <Car className="size-8" />, title: "I'm offering a ride", desc: 'Publish your route, pick up riders, and split costs.' },
   ]
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center gap-8 px-6 py-12 text-center">
-      <div>
-        <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground">How are you riding today?</h1>
-        <p className="mt-2 text-muted-foreground max-w-sm mx-auto">Choose how you'll use Carpool this session — you can switch anytime from Profile.</p>
-      </div>
-      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
-        {options.map(({ mode: m, icon, title, desc }) => (
-          <button
-            key={m}
-            type="button"
-            onClick={() => onChoose(m)}
-            className="flex-1 rounded-3xl border border-border bg-card p-6 text-left hover:border-primary/40 hover:shadow-lg transition-all"
-          >
-            <span className="inline-flex rounded-2xl bg-primary/10 p-3 text-primary">{icon}</span>
-            <h2 className="mt-4 text-lg font-semibold text-foreground">{title}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">{desc}</p>
-          </button>
-        ))}
+    <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center px-4 py-10">
+      <div className="w-full max-w-lg">
+        <div className="mb-8">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="size-10 rounded-xl bg-primary text-primary-foreground flex items-center justify-center"><Car className="size-5" /></span>
+            <span className="text-sm font-semibold text-primary">Let's Carpool</span>
+          </div>
+          <h1 style={SERIF} className="text-3xl leading-tight text-foreground">How are you riding today?</h1>
+          <p className="mt-2 text-sm text-muted-foreground">Choose your role for this session — you can switch anytime from your Profile.</p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {options.map(({ mode: m, icon, title, desc }) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => onChoose(m)}
+              className="flex flex-col items-start gap-4 rounded-2xl border-2 border-border bg-card p-6 text-left shadow-sm hover:border-primary hover:-translate-y-0.5 hover:shadow-lg hover:shadow-primary/15 transition-all"
+            >
+              <span className="size-14 rounded-xl bg-secondary text-secondary-foreground flex items-center justify-center">{icon}</span>
+              <span>
+                <span className="block text-base font-bold leading-snug text-foreground">{title}</span>
+                <span className="block mt-1 text-sm leading-relaxed text-muted-foreground">{desc}</span>
+              </span>
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -2540,11 +2879,11 @@ export function Home() {
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
   // ── Dark mode ──
-  // Driven by next-themes (via NeonAuthUIProvider in App.tsx), not a separate
+  // Driven by next-themes (via ThemeProvider in App.tsx), not a separate
   // mechanism of our own — it already owns the `class` on <html>, persists to
   // localStorage, and is active on every route (Home never having mounted was
   // exactly why the old carpool_dark-based toggle didn't survive across pages:
-  // NeonAuthUIProvider wraps every route and would silently overwrite it).
+  // ThemeProvider in App.tsx wraps every route and would silently overwrite it).
   const { resolvedTheme, setTheme } = useTheme()
   const darkMode = resolvedTheme === 'dark'
 
@@ -2616,10 +2955,8 @@ export function Home() {
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
   const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'chat' | 'gassplit' } | null>(null)
 
-  // ── Full-screen chat ──
-
-  // ── WebSocket ──
-  const wsRef = useRef<WebSocket | null>(null)
+  // ── Real-time (WebSocket locally, polling in production — see api.createRealtime) ──
+  const wsRef = useRef<{ close: () => void } | null>(null)
   const showToastRef = useRef<(msg: string, type: 'success' | 'error') => void>(() => {})
 
   // ── Toast ──
@@ -2634,7 +2971,7 @@ export function Home() {
 
   useEffect(() => {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
-    const ws = api.createWebSocket(currentUser.id, (msg: WsMessage) => {
+    const ws = api.createRealtime(currentUser.id, (msg: WsMessage) => {
       if (msg.type === 'chat_message') {
         const m = msg.message
         setConnections(prev => prev.map(c => c.id === msg.connection_id
@@ -2648,23 +2985,25 @@ export function Home() {
         setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
+      } else if (msg.type === 'pickup_updated') {
+        loadConnections(currentUser.id)
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
     })
     wsRef.current = ws
-    return () => { ws?.close(); wsRef.current = null }
+    return () => { ws.close(); wsRef.current = null }
   }, [currentUser])
 
-  // ── Neon session → backend sync ──
-  const handleAuthenticated = useCallback(async (neonToken: string) => {
+  // ── Auth session → backend sync ──
+  const handleAuthenticated = useCallback(async (token: string) => {
     try {
       const existingToken = localStorage.getItem('carpool_token')
       if (existingToken) {
         try { const user = await api.getMe(); setCurrentUser(user); requestLocation(); return }
         catch { localStorage.removeItem('carpool_token') }
       }
-      const user = await api.login(neonToken)
+      const user = await api.login(token)
       setCurrentUser(user); requestLocation()
       setAuthError(null)
     } finally { setAuthLoading(false) }
@@ -2674,7 +3013,7 @@ export function Home() {
     api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
   }, [])
 
-  // Fires only after NeonAuthSync exhausts its retries — e.g. the Neon Auth
+  // Fires only after AuthSync exhausts its retries — e.g. the auth
   // server is unreachable — so the UI never hangs on "Loading…" forever.
   const handleAuthError = useCallback((message: string) => {
     setAuthError(message); setAuthLoading(false)
@@ -2749,16 +3088,50 @@ export function Home() {
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
 
   // ── Feed ──
-  const loadListings = useCallback(async (coords?: { lat: number; lng: number } | null) => {
+  // Deliberately no pickup-radius pre-filter: Discover should show every
+  // active listing (minus your own, blocked users, and suspended accounts —
+  // already enforced server-side) so the destination search bar and filter
+  // sheet are what narrow the list, not a silent, invisible GPS distance
+  // cutoff a listing could fall just outside of with no indication why.
+  //
+  // The one exception to "no pre-filter": when the rider has an open request, a
+  // second, corridor-filtered search supplies per-trip detour minutes. It only
+  // annotates the unfiltered feed above — it never removes anything from it.
+  const reqKey = myListings.find(l => l.type === 'rider' && l.status === 'open' && l.pickupLat != null && l.destLat != null)
+  const corridorQuery = useMemo<api.SearchQuery | null>(() => reqKey ? {
+    pickup_latitude: reqKey.pickupLat, pickup_longitude: reqKey.pickupLng,
+    destination_latitude: reqKey.destLat, destination_longitude: reqKey.destLng,
+  } : null, [reqKey?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadListings = useCallback(async () => {
     setFeedLoading(true)
     try {
-      const q = coords ? { pickup_latitude: coords.lat, pickup_longitude: coords.lng, pickup_radius_meters: 80000 } : {}
-      const [trips, requests] = await Promise.all([api.searchDriverTrips(q), api.searchRideRequests(q)])
-      setAllListings([...trips.map(tripToListing), ...requests.map(requestToListing)])
+      const [trips, requests, corridorTrips] = await Promise.all([
+        api.searchDriverTrips({}), api.searchRideRequests({}),
+        corridorQuery ? api.searchDriverTrips(corridorQuery).catch(() => []) : Promise.resolve([]),
+      ])
+      // (`Map` is the lucide icon in this file, hence a plain record.)
+      const detourByTrip: Record<string, number | null> = Object.fromEntries(corridorTrips.map(t => [t.id, t.detour_minutes ?? null]))
+      const combined = [
+        ...trips.map(t => ({ ...tripToListing(t), detourMinutes: detourByTrip[t.id] ?? undefined })),
+        ...requests.map(requestToListing),
+      ]
+      const seenIds = new Set<string>()
+      const deduped = combined.filter(l => (seenIds.has(l.id) ? false : (seenIds.add(l.id), true)))
+      setAllListings(deduped)
     } catch { } finally { setFeedLoading(false) }
-  }, [])
+  }, [corridorQuery])
 
-  useEffect(() => { if (currentUser) loadListings(userCoords) }, [currentUser, userCoords, loadListings])
+  // Another user's new post has no way to push into an already-open Discover
+  // tab — refetch whenever Discover becomes the active view (not just once on
+  // mount), and keep polling while it stays active so a listing posted while
+  // you're already browsing shows up without a manual reload.
+  useEffect(() => {
+    if (!currentUser || view !== 'feed') return
+    loadListings()
+    const id = setInterval(loadListings, 20000)
+    return () => clearInterval(id)
+  }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
   const filteredListings = useMemo(() => {
@@ -2796,24 +3169,26 @@ export function Home() {
   const onConnect = useCallback(async (listing: Listing) => {
     try {
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
+      const pickupLabel = userCoords ? await reverseGeocode(lat, lng) : 'My location'
       let conn: api.ApiConnection
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([api.createLocation('My location', lat, lng), api.createLocation(listing.to, lat, lng)])
+        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: 1, tags: [] })
         conn = await api.createConnection(rr.id, listing.apiId)
       } else {
-        const [p, d] = await Promise.all([api.createLocation('My location', lat, lng), api.createLocation(listing.to, lat, lng)])
+        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
         const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
         conn = await api.createConnection(listing.apiId, trip.id)
       }
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
-      setConnections(prev => [newConn, ...prev]); showToast('Connection created!', 'success')
+      const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
+      setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
       setInboxListingFilter(null); setConnDeepLink({ connectionId: newConn.id, section: 'chat' }); setView('connections')
     } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error') }
   }, [currentUser, userCoords, showToast, setView])
 
   const onPost = useCallback((listing: MyListing) => {
-    setMyListings(prev => [listing, ...prev]); setPostPrefill(null); loadListings(userCoords); loadMyListings(); setView('my-listings'); showToast('Listing posted!', 'success')
+    setMyListings(prev => [listing, ...prev]); setPostPrefill(null); loadListings(); loadMyListings(); setView('my-listings'); showToast('Listing posted!', 'success')
   }, [loadListings, loadMyListings, showToast, setView, userCoords])
 
   // ── My Rides card actions ──
@@ -2865,6 +3240,14 @@ export function Home() {
   const onDecline = useCallback((id: string) => transact(id, 'decline'), [transact])
   const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
   const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
+
+  const onUpdatePickup = useCallback(async (connectionId: string, rideRequestId: string, pickup: LocationValue) => {
+    const location = await api.createLocation(pickup.label, pickup.lat, pickup.lng)
+    await api.updateRideRequestPickup(rideRequestId, location.id)
+    setConnections(prev => prev.map(c => c.id === connectionId
+      ? { ...c, riderPickupLat: pickup.lat, riderPickupLng: pickup.lng, riderPickupLabel: pickup.label }
+      : c))
+  }, [])
 
   const onMarkRead = useCallback((id: string) => {
     setConnections(prev => prev.map(c => c.id === id ? { ...c, unreadMessages: 0 } : c))
@@ -2928,7 +3311,7 @@ export function Home() {
   const unreadMessages = connections.reduce((sum, c) => sum + c.unreadMessages, 0)
 
   const onSignOut = useCallback(() => {
-    authClient.signOut().catch(() => {})
+    supabase.auth.signOut().catch(() => {})
     api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
@@ -2967,7 +3350,7 @@ export function Home() {
   if (authLoading) {
     return (
       <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
         <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
       </div>
     )
@@ -2975,7 +3358,7 @@ export function Home() {
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
@@ -2986,8 +3369,8 @@ export function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col">
-      <NeonAuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
+      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
       {/* The immersive full-bleed Map view supplies its own floating header on
@@ -2996,11 +3379,10 @@ export function Home() {
         <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} onOpenAdmin={() => setView('admin')} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
-      <div className="flex-1 max-w-[1440px] mx-auto w-full px-4 py-4 xl:py-6 lg:px-8 pb-24 xl:pb-6">
-        <div className="grid gap-6 xl:grid-cols-[260px_minmax(0,1fr)]">
-          <div className="hidden xl:block">
-            <Sidebar view={guardedView} setView={setView} unreadMessages={unreadMessages} />
-          </div>
+      {!isMobile && <Sidebar view={guardedView} setView={setView} unreadCount={unreadCount} />}
+
+      <div className="flex-1 w-full max-w-[1000px] mx-auto px-4 py-6 lg:px-8 pb-[calc(var(--bottom-nav-h)+2rem)] xl:pb-6">
+        <div>
           <main className="min-w-0">
             {guardedView === 'feed' && (
               mode === 'driver' ? (
@@ -3008,6 +3390,10 @@ export function Home() {
                   myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
+                  onProposalAccepted={conn => {
+                    setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                    showToast('Ride offered!', 'success'); setView('connections')
+                  }}
                   searchQuery={searchQuery} setSearchQuery={setSearchQuery}
                   filterType={filterType} setFilterType={setFilterType}
                   filterTag={filterTag} setFilterTag={setFilterTag}
@@ -3019,19 +3405,32 @@ export function Home() {
                   hasLocation={!!userCoords}
                 />
               ) : (
-                <div className="space-y-8">
-                  {/* Its own desktop-styled MatchCard would clash with the new mobile
-                      card design, and isn't part of the mobile redesign's scope. */}
-                  {!isMobile && (
+                <FeedView hasLocation={!!userCoords} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                  <>
+                    {(() => {
+                      const openRequest = myListings.find(l => l.type === 'rider' && l.status === 'open')
+                      return openRequest ? (
+                        <ProposedMatch
+                          key={openRequest.id} rideRequest={openRequest} showToast={showToast}
+                          onAccepted={conn => {
+                            setConnections(prev => [apiConnectionToConnection(conn, currentUser.id), ...prev])
+                            showToast('Ride requested!', 'success'); setView('connections')
+                          }}
+                        />
+                      ) : null
+                    })()}
+                    {/* Its own desktop-styled MatchCard would clash with the new mobile
+                        card design, and isn't part of the mobile redesign's scope. */}
+                    {!isMobile && (
                     <BestMatches
                       listings={allListings}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                       onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
                     />
-                  )}
-                  <FeedView searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} hasLocation={!!userCoords} connectedListingIds={connectedListingIds} />
-                </div>
+                    )}
+                  </>
+                } />
               )
             )}
             {guardedView === 'feed' && isMobile && (
@@ -3040,7 +3439,7 @@ export function Home() {
                 <OfferRideFab mode={mode} onClick={() => setView('post')} />
               </>
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView key={postPrefill?.key ?? 'new'} onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} prefill={postPrefill} onClearPrefill={() => setPostPrefill(null)} />}
             {guardedView === 'my-listings' && (
@@ -3057,7 +3456,7 @@ export function Home() {
                 showToast={showToast} onViewRoute={onViewRoute} onStartDriving={onStartDriving} onMarkRead={onMarkRead}
                 deepLink={connDeepLink} onDeepLinkHandled={() => setConnDeepLink(null)}
                 listingFilter={inboxListingFilter} onClearListingFilter={() => setInboxListingFilter(null)}
-                incomingMessage={incomingMessage} onMessageSent={onMessageSent}
+                incomingMessage={incomingMessage} onMessageSent={onMessageSent} onUpdatePickup={onUpdatePickup}
               />
             )}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}

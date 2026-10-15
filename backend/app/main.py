@@ -11,8 +11,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
-from backend.app.auth import create_access_token, decode_access_token, verify_neon_auth_token
+from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, Store, User
+from backend.app.routing import OSRMClient
 
 
 class Settings(BaseSettings):
@@ -23,21 +24,23 @@ class Settings(BaseSettings):
     # Space-separated list of allowed CORS origins, e.g. "https://myapp.vercel.app"
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
 
-    # Neon Auth server used to cryptographically verify sign-in tokens (must
-    # match the frontend's VITE_NEON_AUTH_URL). Required for /auth/login to work.
-    # Path confirmed against a live Neon Auth server (better-auth's plugin-
-    # specific /jwks route 404s there; the standard OAuth/OIDC well-known
-    # discovery path is what's actually served).
-    neon_auth_url: str | None = None
-    neon_auth_jwks_path: str = "/.well-known/jwks.json"
-    # Issuer/audience aren't set by default — unlike the JWKS path, I couldn't
-    # verify these against a real signed token, and guessing wrong here means
-    # every sign-in fails closed with no way to tell why (same failure mode as
-    # the wrong default JWKS path did). Signature + expiry are still verified
-    # unconditionally either way. Set these once you've confirmed the actual
-    # `iss`/`aud` claims your Neon Auth project issues (decode a real token).
-    neon_auth_issuer: str | None = None
-    neon_auth_audience: str | None = None
+    # Base URL of the self-hosted OSRM (see docker-compose.yml `osrm`). Used
+    # server-side to store driver routes and compute rider detours. Empty
+    # disables routing: trips are stored without a route and search falls back
+    # to endpoint-radius matching.
+    osrm_base_url: str = "http://localhost:5001"
+
+    # Supabase project URL (must match the frontend's VITE_SUPABASE_URL). Access
+    # tokens are verified against its JWKS endpoint. Required for /auth/login.
+    supabase_url: str | None = None
+    supabase_jwks_path: str = "/auth/v1/.well-known/jwks.json"
+    # Legacy projects that still sign with a shared HS256 secret: set this
+    # (Supabase dashboard -> Settings -> API -> JWT Secret) instead of using JWKS.
+    supabase_jwt_secret: str | None = None
+    # Supabase issues aud="authenticated" for signed-in users. Issuer is
+    # `<supabase_url>/auth/v1` and is checked when set.
+    supabase_jwt_issuer: str | None = None
+    supabase_jwt_audience: str | None = "authenticated"
 
     # Shared secret Vercel Cron sends as `Authorization: Bearer <secret>` when
     # invoking scheduled requests. Required to trigger the /cron/expire sweep
@@ -53,19 +56,19 @@ class Settings(BaseSettings):
         return {e.strip().lower() for e in self.admin_emails.split() if e.strip()}
 
     @property
-    def neon_auth_jwks_url(self) -> str | None:
-        if not self.neon_auth_url:
+    def supabase_jwks_url(self) -> str | None:
+        if not self.supabase_url:
             return None
-        return self.neon_auth_url.rstrip("/") + self.neon_auth_jwks_path
+        return self.supabase_url.rstrip("/") + self.supabase_jwks_path
 
 
 # ─── Request/Response models ──────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
-    # The raw Neon Auth session JWT (from the frontend's `authClient.getJWTToken()`),
-    # verified server-side against the Neon Auth JWKS endpoint — never a client-
+    # The raw Supabase access token (the Supabase access token),
+    # verified server-side against the Supabase JWKS endpoint — never a client-
     # supplied name/email, which would let anyone authenticate as anyone.
-    neon_token: str = Field(..., min_length=1)
+    token: str = Field(..., min_length=1)
 
 
 class ProfileUpdate(BaseModel):
@@ -109,6 +112,7 @@ class RideRequestCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     luggage_size: str = "none"
     preferred_car_type: str | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class DriverTripCreate(BaseModel):
@@ -120,6 +124,19 @@ class DriverTripCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     luggage_capacity: str = "medium"
     car_type: str | None = None
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class RideRequestPickupUpdate(BaseModel):
+    pickup_location_id: str
+
+
+class DriverProposalSkip(BaseModel):
+    ride_request_id: str
+
+
+class ProposalSkip(BaseModel):
+    driver_trip_id: str
 
 
 class ConnectionCreate(BaseModel):
@@ -224,7 +241,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.store = store or Store(s.database_url)
+    app.state.store = store or Store(
+        s.database_url, router=OSRMClient(s.osrm_base_url) if s.osrm_base_url else None,
+    )
     app.state.settings = s
     app.state.ws_manager = ConnectionManager()
 
@@ -244,7 +263,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "service": app.state.settings.api_name, "database": "neon"}
+        return {"status": "ok", "service": app.state.settings.api_name, "database": "postgres"}
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
@@ -252,14 +271,15 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
         settings = app.state.settings
         ip = client_ip(request)
-        if not settings.neon_auth_jwks_url:
-            raise DomainError("Server is not configured with NEON_AUTH_URL", 500)
+        if not settings.supabase_jwks_url and not settings.supabase_jwt_secret:
+            raise DomainError("Server is not configured with SUPABASE_URL", 500)
         try:
-            claims = verify_neon_auth_token(
-                payload.neon_token,
-                jwks_url=settings.neon_auth_jwks_url,
-                issuer=settings.neon_auth_issuer,
-                audience=settings.neon_auth_audience,
+            claims = verify_supabase_token(
+                payload.token,
+                jwks_url=settings.supabase_jwks_url,
+                hs256_secret=settings.supabase_jwt_secret,
+                issuer=settings.supabase_jwt_issuer,
+                audience=settings.supabase_jwt_audience,
             )
         except DomainError as exc:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": str(exc)})
@@ -267,8 +287,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         email = claims.get("email")
         if not isinstance(email, str) or not email:
             app.state.store.log_audit("LOGIN_FAILED", None, None, ip, {"reason": "missing email claim"})
-            raise DomainError("Neon Auth token did not include an email claim", 401)
-        name = claims.get("name") or email.split("@")[0]
+            raise DomainError("Token did not include an email claim", 401)
+        meta = claims.get("user_metadata") or {}
+        name = meta.get("name") or meta.get("full_name") or claims.get("name") or email.split("@")[0]
         user, is_new = app.state.store.authenticate_email(email, str(name))
         if user.status == "suspended":
             app.state.store.log_audit("LOGIN_FAILED", user.id, user.email, ip, {"reason": "account suspended"})
@@ -368,6 +389,20 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         request = app.state.store.cancel_ride_request(user.id, request_id)
         return serialize_ride_request(app.state.store, request, exact=True)
 
+    @app.patch("/ride-requests/{request_id}/pickup")
+    async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser) -> dict[str, Any]:
+        request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
+        # Lets a driver who already accepted this rider see the corrected pickup
+        # point without polling — mirrors the transition_connection broadcast below.
+        for c in app.state.store.get_user_connections(user.id):
+            if c.ride_request_id == request.id and c.status == "accepted":
+                trip = app.state.store.get_driver_trip(c.driver_trip_id)
+                await app.state.ws_manager.broadcast([trip.driver_id], {
+                    "type": "pickup_updated",
+                    "connection_id": c.id,
+                })
+        return serialize_ride_request(app.state.store, request, exact=True)
+
     @app.get("/ride-requests/search")
     def search_ride_requests(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         requests = app.state.store.search_ride_requests(user.id, query.to_store_query())
@@ -400,6 +435,34 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def search_driver_trips(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         trips = app.state.store.search_driver_trips(user.id, query.to_store_query())
         return [serialize_driver_trip(app.state.store, t, exact=False) for t in trips]
+
+    @app.get("/ride-requests/{request_id}/proposal")
+    def ride_request_proposal(request_id: str, user: CurrentUser) -> dict[str, Any]:
+        result = app.state.store.propose_match(user.id, request_id)
+        trip = result["trip"]
+        return {
+            "trip": serialize_driver_trip(app.state.store, trip, exact=False) if trip else None,
+            "remaining": result["remaining"],
+        }
+
+    @app.post("/ride-requests/{request_id}/proposal/skip")
+    def skip_ride_request_proposal(request_id: str, payload: ProposalSkip, user: CurrentUser) -> dict[str, Any]:
+        app.state.store.skip_match(user.id, request_id, payload.driver_trip_id)
+        return {"status": "ok"}
+
+    @app.get("/driver-trips/{trip_id}/proposal")
+    def driver_trip_proposal(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        result = app.state.store.propose_rider(user.id, trip_id)
+        rr = result["request"]
+        return {
+            "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
+            "remaining": result["remaining"],
+        }
+
+    @app.post("/driver-trips/{trip_id}/proposal/skip")
+    def skip_driver_trip_proposal(trip_id: str, payload: DriverProposalSkip, user: CurrentUser) -> dict[str, Any]:
+        app.state.store.skip_rider(user.id, trip_id, payload.ride_request_id)
+        return {"status": "ok"}
 
     @app.get("/me/driver-trips")
     def my_driver_trips(user: CurrentUser) -> list[dict[str, Any]]:
@@ -683,6 +746,7 @@ class SearchQuery(BaseModel):
     pickup_latitude: float | None = None
     pickup_longitude: float | None = None
     pickup_radius_meters: float = 5000
+    route_buffer_meters: float = 1000
     target_date: date | None = None
     tag: str | None = None
     car_type: str | None = None

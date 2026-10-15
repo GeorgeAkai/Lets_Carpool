@@ -4,7 +4,7 @@ import {
   Pencil, Map as MapIcon, Plus, Calendar, ChevronDown, Check, LocateFixed,
 } from 'lucide-react'
 import {
-  Avatar, FLEX_LABEL, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
+  Avatar, FLEX_LABEL, FLEX_DOT, CAR_TYPE_LABELS, CAR_TYPE_EMOJI, LUGGAGE_LABELS,
 } from './home'
 import type { Listing, RideTag, CarType, LuggageSize } from './home'
 
@@ -63,7 +63,7 @@ export function BottomSheet({ open, onClose, title, children }: {
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center" role="dialog" aria-modal="true" aria-label={title}>
       <div className="absolute inset-0 bg-foreground/40 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl px-5 pt-2.5 pb-8 space-y-5 max-h-[80vh] overflow-y-auto">
+      <div className="relative w-full max-w-lg bg-card rounded-t-3xl border-t border-border shadow-xl px-5 pt-2.5 pb-[calc(env(safe-area-inset-bottom)+2rem)] space-y-5 max-h-[80vh] overflow-y-auto">
         <div className="flex justify-center"><span className="block w-9 h-1 rounded-full bg-border" /></div>
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-foreground">{title}</h2>
@@ -158,10 +158,10 @@ export function FilterSheet({
   return (
     <BottomSheet open={open} onClose={onClose} title="Filters">
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Showing</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Showing</p>
           <div className="flex flex-wrap gap-2">
             {(['all', 'driver', 'rider'] as const).map(t => (
-              <button key={t} onClick={() => setFilterType(t)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterType === t ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={t} onClick={() => setFilterType(t)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterType === t ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {t === 'all' ? 'All' : t === 'driver' ? 'Offering rides' : 'Need rides'}
               </button>
             ))}
@@ -169,10 +169,10 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Category</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Category</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'airport', 'student', 'church', 'college'] as const).map(tag => (
-              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterTag === tag ? 'bg-accent/20 text-amber-800 ring-1 ring-accent/40' : 'bg-muted text-muted-foreground hover:text-foreground'}`}>
+              <button key={tag} onClick={() => setFilterTag(tag as '' | RideTag)} className={`text-xs font-medium px-3 py-1.5 rounded-full border transition-colors ${filterTag === tag ? 'bg-secondary text-secondary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {tag === '' ? 'All tags' : tag.charAt(0).toUpperCase() + tag.slice(1)}
               </button>
             ))}
@@ -180,10 +180,10 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Vehicle size</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Vehicle size</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'sedan', 'suv', 'van', 'minivan', 'truck'] as const).map(ct => (
-              <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
+              <button key={ct} onClick={() => setFilterCarType(ct as '' | CarType)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterCarType === ct ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {ct === '' ? 'Any' : `${CAR_TYPE_EMOJI[ct as CarType]} ${CAR_TYPE_LABELS[ct as CarType]}`}
               </button>
             ))}
@@ -191,17 +191,17 @@ export function FilterSheet({
         </div>
 
         <div className="space-y-1.5">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Luggage I'm bringing</p>
+          <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Luggage I'm bringing</p>
           <div className="flex flex-wrap gap-2">
             {(['', 'small', 'medium', 'large', 'oversized'] as const).map(ls => (
-              <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground' : 'bg-card text-muted-foreground hover:text-foreground border border-border'}`}>
+              <button key={ls} onClick={() => setFilterLuggage(ls as '' | LuggageSize)} className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-colors ${filterLuggage === ls ? 'bg-primary text-primary-foreground border-primary' : 'bg-card text-muted-foreground border-border hover:text-foreground'}`}>
                 {ls === '' ? 'Any' : LUGGAGE_LABELS[ls as LuggageSize]}
               </button>
             ))}
           </div>
         </div>
 
-        <button onClick={onClose} className="w-full py-3 rounded-2xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
+        <button onClick={onClose} className="w-full py-3 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
           Show results
         </button>
     </BottomSheet>
@@ -211,7 +211,7 @@ export function FilterSheet({
 export function SectionHeader({ label, count, noun }: { label: string; count: number; noun: string }) {
   return (
     <div className="flex items-baseline justify-between px-1">
-      <h2 className="text-lg font-semibold text-foreground">{label}</h2>
+      <h2 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">{label}</h2>
       <span className="text-xs text-muted-foreground">{count} {noun} nearby</span>
     </div>
   )
@@ -229,10 +229,12 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
     <div className="bg-card rounded-2xl border border-border p-4 flex flex-col gap-3">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3 min-w-0">
-          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
+          <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} size="card" />
           <div className="min-w-0">
             <p className="text-sm font-semibold text-foreground truncate">{listing.user.name}</p>
-            <p className="text-xs text-muted-foreground">{listing.date} · {FLEX_LABEL[listing.flexibility]}</p>
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className={`size-1.5 rounded-full ${FLEX_DOT[listing.flexibility]}`} />{FLEX_LABEL[listing.flexibility]} · {listing.date}
+            </p>
           </div>
         </div>
         {isOwn ? (
@@ -240,8 +242,8 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
             Your Listing <Pencil className="size-3" />
           </button>
         ) : (
-          <span className={`shrink-0 text-xs font-medium px-2.5 py-1 rounded-full ${isDriver ? 'bg-primary/10 text-primary' : 'bg-accent/15 text-amber-700'}`}>
-            {isDriver ? 'Offering' : 'Needs ride'}
+          <span className={`shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full ${isDriver ? 'bg-secondary text-secondary-foreground' : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'}`}>
+            {isDriver ? `${freeSeats} seat${freeSeats !== 1 ? 's' : ''} left` : 'Needs ride'}
           </span>
         )}
       </div>
@@ -254,9 +256,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
       </div>
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        {isDriver ? (
-          <span className="flex items-center gap-1"><Users className="size-3" />{freeSeats} seat{freeSeats !== 1 ? 's' : ''} left</span>
-        ) : (
+        {!isDriver && (
           <span className="flex items-center gap-1"><Users className="size-3" />{listing.passengers} passenger{(listing.passengers ?? 0) > 1 ? 's' : ''}</span>
         )}
         {isDriver && listing.carType && (
@@ -270,6 +270,10 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
         )}
       </div>
 
+      {listing.notes && (
+        <p className="text-xs text-muted-foreground whitespace-pre-wrap line-clamp-3">“{listing.notes}”</p>
+      )}
+
       {!isOwn && (
         alreadyConnected ? (
           <div className="mt-1 w-full py-2.5 rounded-xl bg-muted text-muted-foreground text-sm font-medium flex items-center justify-center gap-1.5">
@@ -278,7 +282,7 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
         ) : (
           <button
             onClick={() => onConnect(listing)}
-            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 active:scale-[0.98] transition-all"
+            className="mt-1 w-full py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-[0.98] transition-all"
           >
             {/* Driver listings are seats you can ask for; passenger listings are
                 people you can pick up. */}
@@ -298,7 +302,7 @@ export function ViewToggleFab({ onClick }: { onClick: () => void }) {
     <button
       onClick={onClick}
       aria-label="Switch to map view"
-      className="fixed bottom-20 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-5 py-3 rounded-full bg-foreground text-background text-sm font-semibold shadow-xl active:scale-95 transition-transform"
+      className="fixed bottom-[calc(var(--bottom-nav-h)+1rem)] left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-5 py-3 rounded-full bg-foreground text-background text-sm font-semibold shadow-xl active:scale-95 transition-transform"
     >
       <MapIcon className="size-4" /> Map View
     </button>
@@ -316,7 +320,7 @@ export function OfferRideFab({ mode, onClick }: { mode: 'rider' | 'driver'; onCl
       onClick={onClick}
       aria-label={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
       title={mode === 'driver' ? 'Offer a ride' : 'Request a ride'}
-      className="fixed bottom-20 right-4 z-30 size-14 rounded-full bg-primary text-primary-foreground shadow-xl active:scale-95 transition-transform flex items-center justify-center"
+      className="fixed bottom-[calc(var(--bottom-nav-h)+1rem)] right-4 z-30 size-14 rounded-full bg-primary text-primary-foreground shadow-xl active:scale-95 transition-transform flex items-center justify-center"
     >
       <Plus className="size-6" />
     </button>

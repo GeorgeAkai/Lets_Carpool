@@ -226,13 +226,14 @@ interface NominatimResult {
 interface Props {
   userCoords: { lat: number; lng: number } | null
   currentUserId: string
+  userMode: "driver" | "rider"
   tripRoute?: TripRoute | null
   onClearRoute?: () => void
   drivingTo?: DrivingTarget | null
   onStopDriving?: () => void
 }
 
-export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
+export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
   const accentColor = ACCENT
 
   const mapRef = useRef<maplibregl.Map | null>(null)
@@ -830,12 +831,14 @@ export function MapView({ userCoords, tripRoute, onClearRoute, drivingTo, onStop
 
                     {sheetExpanded && (
                       <div className="space-y-2 pt-2">
-                        <button
-                          onClick={toggleSharing}
-                          className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${sharing ? "bg-green-500 text-white" : "bg-white text-slate-900"}`}
-                        >
-                          {sharing ? "📡 Sharing your location" : "Share my location as a driver"}
-                        </button>
+                        {userMode === "driver" && (
+                          <button
+                            onClick={toggleSharing}
+                            className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-colors ${sharing ? "bg-green-500 text-white" : "bg-white text-slate-900"}`}
+                          >
+                            {sharing ? "📡 Sharing your location" : "Share my location as a driver"}
+                          </button>
+                        )}
                         {selected && (
                           <div className="rounded-2xl bg-white/10 p-3.5 space-y-2.5">
                             <div className="flex items-center justify-between gap-2">

@@ -1,0 +1,9 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "BACKEND_URL": "https://letscarpool-g8h0e7cdf0dmdnb8.canadacentral-01.azurewebsites.net",
+    "CRON_SECRET": "same value as the backend App Service's CRON_SECRET"
+  }
+}

@@ -1,18 +1,34 @@
-import { createAuthClient } from '@neondatabase/neon-js/auth'
+import { createClient } from '@supabase/supabase-js'
+import { useEffect, useState } from 'react'
 
-export const authClient = createAuthClient(import.meta.env.VITE_NEON_AUTH_URL)
+const url = import.meta.env.VITE_SUPABASE_URL as string | undefined
+const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined
+if (!url || !anonKey) {
+  console.warn('VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY are not set — sign-in will not work.')
+}
 
-// The SDK's generic client.getJWTToken() RPC maps method names to URL path
-// segments (e.g. "get-j-w-t-token"), which doesn't match the JWT plugin's
-// actual route — confirmed against the real Neon Auth server, where that path
-// 404s while GET {authUrl}/token (better-auth's real JWT plugin endpoint)
-// returns 401 for an unauthenticated request, i.e. it exists. Call it directly.
-export async function fetchNeonJWT(): Promise<string | null> {
-  const base = String(import.meta.env.VITE_NEON_AUTH_URL ?? '').replace(/\/+$/, '')
-  if (!base) return null
-  const res = await fetch(`${base}/token`, { credentials: 'include' })
-  if (!res.ok) return null
-  const data: unknown = await res.json().catch(() => null)
-  const token = (data as { token?: unknown } | null)?.token
-  return typeof token === 'string' && token ? token : null
+// createClient throws on an empty URL, which would white-screen the whole app
+// instead of just failing sign-in, so fall back to inert placeholders.
+export const supabase = createClient(url || 'http://localhost:54321', anonKey || 'missing-anon-key')
+
+export type AuthSession = { user: { id: string; email: string } } | null
+
+export function useAuthSession(): { session: AuthSession; isPending: boolean } {
+  const [state, setState] = useState<{ session: AuthSession; isPending: boolean }>({ session: null, isPending: true })
+
+  useEffect(() => {
+    const toSession = (s: { user: { id: string; email?: string } } | null): AuthSession =>
+      s ? { user: { id: s.user.id, email: s.user.email ?? '' } } : null
+    supabase.auth.getSession().then(({ data }) => setState({ session: toSession(data.session), isPending: false }))
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => setState({ session: toSession(s), isPending: false }))
+    return () => sub.subscription.unsubscribe()
+  }, [])
+
+  return state
+}
+
+// The backend verifies this JWT's signature itself (see /auth/login).
+export async function getAccessToken(): Promise<string | null> {
+  const { data } = await supabase.auth.getSession()
+  return data.session?.access_token ?? null
 }

@@ -44,6 +44,10 @@ export type ApiDriverTrip = {
   created_at: string;
   luggage_capacity: string;
   car_type: string | null;
+  notes: string | null;
+  // Minutes this rider would add to the trip; only set on corridor searches
+  // (search with both pickup and destination coordinates).
+  detour_minutes?: number | null;
 };
 
 export type ApiRideRequest = {
@@ -61,6 +65,9 @@ export type ApiRideRequest = {
   created_at: string;
   luggage_size: string;
   preferred_car_type: string | null;
+  notes: string | null;
+  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  detour_minutes?: number | null;
 };
 
 export type ApiConnection = {
@@ -130,6 +137,7 @@ export type SearchQuery = {
   pickup_latitude?: number;
   pickup_longitude?: number;
   pickup_radius_meters?: number;
+  route_buffer_meters?: number;
   target_date?: string;
   tag?: string;
   car_type?: string;
@@ -201,14 +209,11 @@ export type RouteSuggestion = {
 export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
+  | { type: "pickup_updated"; connection_id: string }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
-export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
-  if (!BASE.includes("localhost") && !BASE.includes("127.0.0.1")) {
-    return null;
-  }
-
+function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): WebSocket | null {
   const t = token();
   let ws: WebSocket;
   try {
@@ -231,10 +236,85 @@ export function createWebSocket(userId: string, onMessage: (msg: WsMessage) => v
   return ws;
 }
 
+// ─── Real-time strategy ───────────────────────────────────────────────────────
+// The API runs as Vercel serverless functions, which can't hold WebSockets open,
+// so outside localhost the client polls instead. VITE_REALTIME_STRATEGY
+// ("websocket" | "polling") overrides the default (websocket on localhost,
+// polling everywhere else). Polling hits GET /me/connections and
+// GET /notifications every POLL_INTERVAL_MS (paused while the tab is hidden)
+// and synthesises the same WsMessage events. `driver_nearby` has no polling
+// equivalent. A hosted realtime service (Ably/Pusher) can replace this later
+// behind the same `createRealtime` interface.
+
+export const POLL_INTERVAL_MS = 8000;
+
+export type RealtimeStrategy = "websocket" | "polling";
+
+export function realtimeStrategy(): RealtimeStrategy {
+  const forced = import.meta.env.VITE_REALTIME_STRATEGY;
+  if (forced === "websocket" || forced === "polling") return forced;
+  return BASE.includes("localhost") || BASE.includes("127.0.0.1") ? "websocket" : "polling";
+}
+
+function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void } {
+  const statuses = new Map<string, string>();
+  const seenNotifications = new Set<string>();
+  let primed = false;
+  let stopped = false;
+  let running = false;
+
+  const poll = async () => {
+    if (stopped || running || document.hidden) return;
+    running = true;
+    try {
+      const [connections, notifications] = await Promise.all([getMyConnections(), getNotifications()]);
+      if (stopped) return;
+
+      const events: WsMessage[] = [];
+      for (const c of connections) {
+        const previous = statuses.get(c.id);
+        if (primed && previous === undefined) events.push({ type: "pickup_updated", connection_id: c.id });
+        else if (previous !== undefined && previous !== c.status) events.push({ type: "connection_update", connection_id: c.id, status: c.status });
+        statuses.set(c.id, c.status);
+      }
+
+      const chatConnectionIds = new Set<string>();
+      for (const n of notifications) {
+        if (seenNotifications.has(n.id)) continue;
+        seenNotifications.add(n.id);
+        if (primed && n.type === "chat_message" && n.related_id) chatConnectionIds.add(n.related_id);
+      }
+      for (const connectionId of chatConnectionIds) {
+        const messages = await getMessages(connectionId);
+        const latest = messages[messages.length - 1];
+        if (latest) events.push({ type: "chat_message", connection_id: connectionId, message: latest });
+      }
+
+      primed = true;
+      if (!stopped) events.forEach(onMessage);
+    } catch { /* transient network/auth error — try again next tick */ }
+    finally { running = false; }
+  };
+
+  void poll();
+  const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+  const onVisible = () => { if (!document.hidden) void poll(); };
+  document.addEventListener("visibilitychange", onVisible);
+  return {
+    close: () => { stopped = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); },
+  };
+}
+
+export function createRealtime(userId: string, onMessage: (msg: WsMessage) => void): { close: () => void } {
+  if (realtimeStrategy() === "polling") return createPoller(onMessage);
+  const ws = createWebSocket(userId, onMessage);
+  return { close: () => ws?.close() };
+}
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
-export async function login(neonToken: string): Promise<ApiUser> {
-  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { neon_token: neonToken });
+export async function login(token: string): Promise<ApiUser> {
+  const res = await request<{ access_token: string; user: ApiUser }>("POST", "/auth/login", { token });
   localStorage.setItem("carpool_token", res.access_token);
   return res.user;
 }
@@ -328,6 +408,7 @@ export function createDriverTrip(data: {
   tags: string[];
   luggage_capacity?: string;
   car_type?: string;
+  notes?: string;
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
@@ -360,12 +441,17 @@ export function createRideRequest(data: {
   tags: string[];
   luggage_size?: string;
   preferred_car_type?: string;
+  notes?: string;
 }): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", "/ride-requests", data);
 }
 
 export function cancelRideRequest(requestId: string): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", `/ride-requests/${requestId}/cancel`);
+}
+
+export function updateRideRequestPickup(requestId: string, pickupLocationId: string): Promise<ApiRideRequest> {
+  return request<ApiRideRequest>("PATCH", `/ride-requests/${requestId}/pickup`, { pickup_location_id: pickupLocationId });
 }
 
 export function getMyRideRequests(): Promise<ApiRideRequest[]> {
@@ -378,6 +464,30 @@ export function createConnection(rideRequestId: string, driverTripId: string): P
   return request<ApiConnection>("POST", "/connections", {
     ride_request_id: rideRequestId,
     driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiProposal = { trip: ApiDriverTrip | null; remaining: number };
+
+export function getRideRequestProposal(rideRequestId: string): Promise<ApiProposal> {
+  return request<ApiProposal>("GET", `/ride-requests/${rideRequestId}/proposal`);
+}
+
+export function skipRideRequestProposal(rideRequestId: string, driverTripId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/ride-requests/${rideRequestId}/proposal/skip`, {
+    driver_trip_id: driverTripId,
+  });
+}
+
+export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: number };
+
+export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
+  return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
+  return request<{ status: string }>("POST", `/driver-trips/${driverTripId}/proposal/skip`, {
+    ride_request_id: rideRequestId,
   });
 }
 
