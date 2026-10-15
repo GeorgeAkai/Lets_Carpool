@@ -6,7 +6,7 @@ services:
     runtime: docker
     dockerContext: ./osrm
     dockerfilePath: ./osrm/Dockerfile
-    plan: standard   # all-US needs tens of GB of RAM — set a smaller PBF_URL build arg or a bigger plan
+    plan: standard   # Northern California extract; if the build runs out of memory, move up a plan
     healthCheckPath: /route/v1/driving/-122.4194,37.7749;-122.4094,37.7849
     envVars:
       - key: PORT

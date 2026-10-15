@@ -2,15 +2,16 @@
 # OpenStreetMap extract and builds the MLD graph at *image build* time, so no
 # multi-GB dataset is committed to git (GitHub rejects files over 100 MB).
 #
-#   docker build -t carpool-osrm osrm                      # all of the US (default)
-#   docker build -t carpool-osrm osrm --build-arg PBF_URL=<other geofabrik .osm.pbf>
+#   docker build -t carpool-osrm osrm        # Northern California (default, ~650 MB extract)
+#   docker build -t carpool-osrm osrm \
+#     --build-arg PBF_URL=https://download.geofabrik.de/north-america/us/california/socal-latest.osm.pbf
 #
-# Resource warning: the US extract is ~10 GB. Building the graph needs on the
-# order of 64 GB RAM and several hours, and serving it needs tens of GB of RAM;
-# managed hosts' standard plans can't do that. Prefer building the image on a
-# large machine, or pass a smaller PBF_URL (a state or metro) for Render.
+# Build-time RAM is the constraint: osrm-extract needs several GB for a ~650 MB
+# extract. Use a Render plan with enough memory (the standard plan is the
+# starting point); a smaller extract needs less. Trips outside the extract get
+# no route and fall back to endpoint-radius matching.
 # Pinned to the same version as docker-compose.yml so data and server match.
-ARG PBF_URL=https://download.geofabrik.de/north-america/us-latest.osm.pbf
+ARG PBF_URL=https://download.geofabrik.de/north-america/us/california/norcal-latest.osm.pbf
 
 # The OSRM image has no curl/wget, so fetch the extract in a throwaway stage.
 FROM alpine:3.20 AS download
