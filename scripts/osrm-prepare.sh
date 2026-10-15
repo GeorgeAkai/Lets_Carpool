@@ -7,12 +7,12 @@
 #     scripts/osrm-prepare.sh
 #
 # The extract must cover every region drivers/riders will search in. Default is
-# California; pick a smaller or different one from https://download.geofabrik.de.
+# California (set OSRM_PBF_URL for all-US or another region); pick a smaller or different one from https://download.geofabrik.de.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 PBF_URL="${OSRM_PBF_URL:-https://download.geofabrik.de/north-america/us/california-latest.osm.pbf}"
-IMAGE="osrm/osrm-backend:v5.27.1"
+IMAGE="osrm/osrm-backend:v5.25.0"
 DATA_DIR="$PWD/osrm-data"
 
 mkdir -p "$DATA_DIR"
