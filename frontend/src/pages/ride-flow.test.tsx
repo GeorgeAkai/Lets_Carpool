@@ -90,7 +90,13 @@ async function pickDestination(user: ReturnType<typeof userEvent.setup>, text: s
 
 describe("Rider flow: Home → Results → Ride details", () => {
   useMobileViewport();
-  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
+  beforeEach(() => {
+    // A real pickup point is required to open a ride request.
+    Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+      getCurrentPosition: (ok: (p: unknown) => void) => ok({ coords: { latitude: 39.7, longitude: -121.8 } }),
+    } });
+  });
+  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); Reflect.deleteProperty(navigator, "geolocation"); });
 
   it("finds rides, sorts them, and requests a seat with the real destination", async () => {
     const user = userEvent.setup();
@@ -111,7 +117,7 @@ describe("Rider flow: Home → Results → Ride details", () => {
     await user.click(screen.getByRole("button", { name: /1 seat/i }));
     await user.click(screen.getByRole("button", { name: /more seats needed/i }));
     await user.click(screen.getByRole("button", { name: /^done$/i }));
-    await user.click(screen.getByRole("button", { name: /find rides/i }));
+    await user.click(screen.getByRole("button", { name: /browse all rides/i }));
 
     await screen.findByText(/2 drivers going your way/i);
     const search = calls.find(c => c.key === "GET /driver-trips/search" && c.url.includes("destination_latitude"));
@@ -137,8 +143,69 @@ describe("Rider flow: Home → Results → Ride details", () => {
     expect(rr.passenger_count).toBe(2);
     const dest = calls.filter(c => c.key === "POST /locations").map(c => c.body as { label: string; latitude: number });
     expect(dest.some(d => d.label.startsWith("Sacramento") && d.latitude === 38.58)).toBe(true);
-    await screen.findByRole("heading", { name: /^inbox$/i });
+    // Requesting now lands on the waiting screen, not the inbox.
+    await screen.findByText(/waiting for priya/i);
   });
+
+  it("'Find me a ride' requests the top match and opens the trip once accepted", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const pending = { id: "con_new", ride_request_id: "rrq_new", driver_trip_id: PRIYA.id, initiator_user_id: "usr_me", status: "pending", created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null,
+      ride_request: { id: "rrq_new", rider_id: "usr_me", pickup: { id: "a", label: "Elm St, Chico, CA", exact: true, latitude: 39.7, longitude: -121.8 }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "flexible", passenger_count: 1, tags: [], status: "open", created_at: "x" },
+      driver_trip: PRIYA,
+      driver_profile: { user_id: PRIYA.driver_id, display_name: "Priya", photo_url: null, bio: null, photo_verified: true, interests: [], nationality: null, phone: "+1 555 0100" },
+      rider_profile: null };
+    let polls = 0;
+    let requested = false;
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "POST /locations": (body: unknown) => ({ id: `loc_${(body as { label: string }).label.length}`, label: (body as { label: string }).label, exact: true }),
+      "POST /ride-requests": { id: "rrq_new", rider_id: "usr_me", status: "open" },
+      "POST /connections": () => { requested = true; return pending; },
+      "GET /me/connections": () => (!requested ? [] : ++polls < 3 ? [pending] : [{ ...pending, status: "accepted" }]),
+      "GET /connections/con_new/messages": [],
+      "GET /connections/con_new/live": { connection_id: "con_new", pickup: { label: "Elm St, Chico, CA", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await pickDestination(user, "Sacramento");
+    await user.click(screen.getByRole("button", { name: /find me a ride/i }));
+
+    // Best match (Priya) is asked automatically, with no list or detail screen in between.
+    await screen.findByText(/waiting for priya/i);
+    const conn = calls.find(c => c.key === "POST /connections")!.body as Record<string, unknown>;
+    expect(conn.driver_trip_id).toBe(PRIYA.id);
+
+    // Once Priya accepts, the rider lands on the trip-day screen.
+    await screen.findByText(/ride confirmed/i, undefined, { timeout: 8000 });
+    await screen.findByRole("button", { name: /i’m at the pickup spot/i });
+    expect(screen.queryByText(/waiting for priya/i)).toBeNull();
+  }, 15000);
+
+  it("moves on to the next best driver when the first one declines", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const conn = (t: typeof PRIYA, status: string) => ({ id: `con_${t.id}`, ride_request_id: "rrq_new", driver_trip_id: t.id, initiator_user_id: "usr_me", status, created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null,
+      ride_request: { id: "rrq_new", rider_id: "usr_me", pickup: { id: "a", label: "Elm St, Chico, CA", exact: true }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "flexible", passenger_count: 1, tags: [], status: "open", created_at: "x" },
+      driver_trip: t, driver_profile: null, rider_profile: null });
+    const asked: string[] = [];
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "POST /locations": (body: unknown) => ({ id: `loc_${(body as { label: string }).label.length}`, label: (body as { label: string }).label, exact: true }),
+      "POST /ride-requests": { id: "rrq_new", rider_id: "usr_me", status: "open" },
+      "POST /connections": (body: unknown) => { const t = (body as { driver_trip_id: string }).driver_trip_id === PRIYA.id ? PRIYA : MARCUS; asked.push(t.id); return conn(t, "pending"); },
+      "GET /me/connections": () => asked.map(id => conn(id === PRIYA.id ? PRIYA : MARCUS, id === PRIYA.id ? "declined" : "pending")),
+    });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await pickDestination(user, "Sacramento");
+    await user.click(screen.getByRole("button", { name: /find me a ride/i }));
+    await screen.findByText(/waiting for priya/i);
+    await screen.findByText(/waiting for marcus/i, undefined, { timeout: 8000 });
+    expect(asked).toEqual([PRIYA.id, MARCUS.id]);
+    expect(calls.filter(c => c.key === "POST /ride-requests")).toHaveLength(1); // one request reused
+  }, 15000);
 });
 
 describe("Trip day", () => {

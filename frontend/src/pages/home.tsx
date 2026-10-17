@@ -19,11 +19,12 @@ import { searchPlaces, reverseGeocode } from '../lib/googleMaps'
 import type { PlaceResult } from '../lib/googleMaps'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
+import { IncomingRequests } from './incoming-requests'
 import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
 import {
-  HomeScreen, ResultsScreen, RideDetailScreen, TripDayScreen, OfferRideScreen, StarRating, fmtTime,
+  HomeScreen, ResultsScreen, RideDetailScreen, FindRideScreen, TripDayScreen, OfferRideScreen, StarRating, fmtTime,
   defaultRideSearch, pickNextTrip, type RideSearch,
 } from './ride-flow'
 import {
@@ -35,7 +36,7 @@ import { AdminView } from './admin'
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
-  | 'results' | 'ride' | 'trip' | 'offer'
+  | 'results' | 'ride' | 'trip' | 'offer' | 'finding'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -2773,7 +2774,7 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   // Home / Trips / Messages / Profile. Searching, posting and the map all
   // start from Home; Pools lives inside Trips.
   const items: Array<{ id: View; label: string; icon: React.ReactNode; also: View[] }> = [
-    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post'] },
+    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post', 'finding'] },
     { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools'] },
     { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
     { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin'] },
@@ -2892,14 +2893,14 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 // work with the browser's back button.
 const VIEW_PATHS: Record<View, string> = {
   home: '/discover', feed: '/discover', admin: '/admin',
-  results: '/rides', ride: '/rides/detail', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
+  results: '/rides', ride: '/rides/detail', finding: '/rides/finding', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
   'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
 }
 const PATH_VIEWS: Record<string, View> = {
   '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
   '/my-rides': 'my-listings', '/connections': 'connections', '/inbox': 'connections',
   '/notifications': 'notifications', '/profile': 'profile', '/admin': 'admin',
-  '/rides': 'results', '/rides/detail': 'ride', '/trip': 'trip', '/offer': 'offer',
+  '/rides': 'results', '/rides/detail': 'ride', '/rides/finding': 'finding', '/trip': 'trip', '/offer': 'offer',
 }
 
 export function Home() {
@@ -2976,12 +2977,17 @@ export function Home() {
   const [rideSearch, setRideSearch] = useState<RideSearch>(defaultRideSearch)
   const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
   const [tripDayId, setTripDayId] = useState<string | null>(null)
+  // Find-a-ride flow: a driver the rider picked (null = auto top match) and drivers already tried.
+  const [findTrip, setFindTrip] = useState<api.ApiDriverTrip | null>(null)
+  const [findNonce, setFindNonce] = useState(0)
+  const [passedTripIds, setPassedTripIds] = useState<string[]>([])
   const [savedRoutes, setSavedRoutes] = useState<api.SavedRoute[]>([])
   useEffect(() => { if (view !== 'post') setPostPrefill(null) }, [view])
 
   // ── Connections ──
   const [connections, setConnections] = useState<Connection[]>([])
   const connectionsRef = useRef<Connection[]>([])
+  const loadMyListingsRef = useRef<() => void>(() => {})
   useEffect(() => { connectionsRef.current = connections }, [connections])
   const [incomingMessage, setIncomingMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
   const [inboxListingFilter, setInboxListingFilter] = useState<{ id: string; label: string } | null>(null)
@@ -3025,9 +3031,21 @@ export function Home() {
         showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
         setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
+        const before = connectionsRef.current.find(c => c.id === msg.connection_id)
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
-      } else if (msg.type === 'pickup_updated') {
+        if (before && before.initiatorUserId === currentUser.id) {
+          if (msg.status === 'accepted') showToastRef.current(`🎉 ${before.withUser.name} accepted your request`, 'success')
+          else if (msg.status === 'declined') showToastRef.current(`${before.withUser.name} declined your request`, 'error')
+        }
+        // Accepting reveals the pickup details and changes seat counts; refetch.
         loadConnections(currentUser.id)
+        loadMyListingsRef.current()
+      } else if (msg.type === 'pickup_updated') {
+        // A connection we hadn't seen yet (someone requested us) or new pickup details.
+        const known = new Set(connectionsRef.current.map(c => c.id))
+        if (!known.has(msg.connection_id)) showToastRef.current('🚗 New ride request', 'success')
+        loadConnections(currentUser.id)
+        loadMyListingsRef.current()
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
@@ -3125,6 +3143,7 @@ export function Home() {
       setMyListings(combined)
     } catch { }
   }, [])
+  loadMyListingsRef.current = loadMyListings
 
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
   useEffect(() => { if (currentUser) api.getSavedRoutes().then(setSavedRoutes).catch(() => {}) }, [currentUser])
@@ -3374,18 +3393,19 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding']
   const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
     : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
     // Screens that need in-memory context fall back after a reload.
     : view === 'ride' && !selectedTrip ? 'results'
+    : view === 'finding' && !rideSearch.to ? 'feed'
     : view === 'trip' && !tripDayConnection ? 'my-listings'
     : view
   // Full-screen flow steps bring their own back/close controls and sticky
   // action bar, so the app chrome steps aside on phones (as on the map).
-  const immersive = guardedView === 'map' || guardedView === 'results' || guardedView === 'ride' || guardedView === 'trip' || guardedView === 'offer'
+  const immersive = guardedView === 'map' || guardedView === 'results' || guardedView === 'ride' || guardedView === 'trip' || guardedView === 'offer' || guardedView === 'finding'
   const hideTopBarOnMobile = immersive || guardedView === 'feed'
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
@@ -3442,6 +3462,14 @@ export function Home() {
       <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
+            {guardedView !== 'map' && guardedView !== 'connections' && (
+              <IncomingRequests
+                connections={connections} currentUserId={currentUser.id}
+                onAccept={onAccept} onDecline={onDecline} onStartDriving={onStartDriving}
+                onOpenChat={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
+                reload={() => loadConnections(currentUser.id)} showToast={showToast}
+              />
+            )}
             {guardedView === 'feed' && isMobile && (
               <HomeScreen
                 mode={mode} currentUser={currentUser} hasLocation={!!userCoords}
@@ -3464,6 +3492,7 @@ export function Home() {
                 }}
                 nextTrip={pickNextTrip(connections, mode)}
                 onPrimary={() => setView(mode === 'driver' ? 'offer' : 'results')}
+                onFindMe={() => { setFindTrip(null); setPassedTripIds([]); setFindNonce(n => n + 1); setView('finding') }}
                 onOpenTrip={c => { setTripDayId(c.id); setView('trip') }}
                 onOpenProfile={() => setView('profile')}
                 onOpenMap={() => setView('map')}
@@ -3491,6 +3520,7 @@ export function Home() {
                 requestedTripIds={connectedListingIds}
                 onBack={() => setView('feed')}
                 onOpenTrip={t => { setSelectedTrip(t); setView('ride') }}
+                onRequestTrip={async t => { setFindTrip(t); setFindNonce(n => n + 1); setView('finding') }}
                 onNotify={async () => {
                   const to = rideSearch.to; if (!to) return
                   const d = await api.createLocation(to.label, to.lat, to.lng)
@@ -3505,12 +3535,25 @@ export function Home() {
                 trip={selectedTrip} seats={rideSearch.seats}
                 requested={connectedListingIds.has(selectedTrip.id)}
                 onBack={() => setView('results')}
-                onRequest={async () => {
-                  await onConnect(tripToListing(selectedTrip), {
-                    from: rideSearch.from, to: rideSearch.to, seats: rideSearch.seats, time: rideSearch.time, quiet: true,
-                  })
-                  setInboxListingFilter(null); setConnDeepLink(null); setView('connections')
+                onRequest={async () => { setFindTrip(selectedTrip); setFindNonce(n => n + 1); setView('finding') }}
+              />
+            )}
+            {guardedView === 'finding' && (
+              <FindRideScreen
+                key={findNonce}
+                search={rideSearch} userCoords={userCoords} currentUserId={currentUser.id}
+                excludeTripIds={new Set([...connectedListingIds, ...passedTripIds])}
+                firstTrip={findTrip}
+                onBack={() => setView('feed')}
+                onSeeAll={() => setView('results')}
+                onFindAnother={() => { setFindTrip(null); setFindNonce(n => n + 1) }}
+                onConnectionCreated={c => setConnections(prev => [apiConnectionToConnection(c, currentUser.id), ...prev.filter(x => x.id !== c.id)])}
+                onTripPassed={id => setPassedTripIds(prev => (prev.includes(id) ? prev : [...prev, id]))}
+                onAccepted={async id => {
+                  await loadConnections(currentUser.id)
+                  setTripDayId(id); setView('trip'); showToast('🎉 Ride confirmed', 'success')
                 }}
+                showToast={showToast}
               />
             )}
             {guardedView === 'trip' && tripDayConnection && (

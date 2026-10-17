@@ -140,7 +140,7 @@ function VerifiedIcon({ size = 16 }: { size?: number }) {
 
 export function HomeScreen({
   mode, currentUser, hasLocation, search, setSearch, savedRoutes, onSaveRoute, onDeleteRoute,
-  nextTrip, onPrimary, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, children,
+  nextTrip, onPrimary, onFindMe, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, children,
 }: {
   onOpenMap?: () => void
   onOpenNotifications?: () => void
@@ -155,6 +155,8 @@ export function HomeScreen({
   onDeleteRoute: (id: string) => Promise<void>
   nextTrip: Connection | null
   onPrimary: () => void
+  // Rider only: skip the list and request the best-matching driver straight away.
+  onFindMe?: () => void
   onOpenTrip: (c: Connection) => void
   onOpenProfile: () => void
   children?: ReactNode
@@ -235,9 +237,19 @@ export function HomeScreen({
           </button>
         </div>
         <div className="px-1.5 pb-1.5">
-          <PrimaryButton onClick={onPrimary} disabled={isDriver && !search.to}>
-            {isDriver ? 'Post this ride' : 'Find rides'}
-          </PrimaryButton>
+          {!isDriver && onFindMe ? (
+            <div className="flex flex-col gap-1.5">
+              <PrimaryButton onClick={onFindMe} disabled={!search.to}>Find me a ride</PrimaryButton>
+              <button type="button" onClick={onPrimary}
+                className="min-h-11 text-sm font-semibold text-muted-foreground hover:text-foreground">
+                Or browse all rides
+              </button>
+            </div>
+          ) : (
+            <PrimaryButton onClick={onPrimary} disabled={isDriver && !search.to}>
+              {isDriver ? 'Post this ride' : 'Find rides'}
+            </PrimaryButton>
+          )}
         </div>
       </section>
 
@@ -388,7 +400,7 @@ function Stepper({ value, min, max, onChange, label, hint }: {
 type SortKey = 'best' | 'soonest' | 'price' | 'verified'
 
 export function ResultsScreen({
-  search, userCoords, currentUserId, requestedTripIds, onBack, onOpenTrip, onNotify, showToast,
+  search, userCoords, currentUserId, requestedTripIds, onBack, onOpenTrip, onRequestTrip, onNotify, showToast,
 }: {
   search: RideSearch
   userCoords: { lat: number; lng: number } | null
@@ -396,6 +408,8 @@ export function ResultsScreen({
   requestedTripIds: Set<string>
   onBack: () => void
   onOpenTrip: (trip: ApiDriverTrip) => void
+  // One-tap request straight from the result card (no detail screen).
+  onRequestTrip: (trip: ApiDriverTrip) => Promise<void>
   onNotify: () => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
 }) {
@@ -403,6 +417,7 @@ export function ResultsScreen({
   const [sort, setSort] = useState<SortKey>('best')
   const [anyDate, setAnyDate] = useState(false)
   const [notified, setNotified] = useState(false)
+  const [requestingId, setRequestingId] = useState<string | null>(null)
 
   const origin = search.from && Number.isFinite(search.from.lat) ? search.from : userCoords ? { lat: userCoords.lat, lng: userCoords.lng } : null
 
@@ -427,15 +442,12 @@ export function ResultsScreen({
     const list = sort === 'verified' ? fits.filter(t => t.driver_stats?.id_verified) : [...fits]
     const price = (t: ApiDriverTrip) => t.pricing?.price_per_seat_cents ?? Number.MAX_SAFE_INTEGER
     const when = (t: ApiDriverTrip) => `${t.target_date} ${t.departure_time ?? ({ morning: '09', afternoon: '14', evening: '19' } as Record<string, string>)[t.flexibility] ?? '12'}`
-    // Best match: least detour first, then the target time, then trust.
-    const score = (t: ApiDriverTrip) => (t.detour_minutes ?? 30) * 2
-      + (search.time && t.departure_time ? Math.abs(minutesOf(t.departure_time) - minutesOf(search.time)) / 10 : 0)
-      - (t.driver_stats?.rating_avg ?? 4) - (t.driver_stats?.id_verified ? 2 : 0)
+    const score = (t: ApiDriverTrip) => tripScore(t, search)
     if (sort === 'soonest') list.sort((a, b) => when(a).localeCompare(when(b)))
     else if (sort === 'price') list.sort((a, b) => price(a) - price(b))
     else list.sort((a, b) => score(a) - score(b))
     return list
-  }, [fits, sort, search.time])
+  }, [fits, sort, search])
 
   const chips: { id: SortKey; label: string }[] = [
     { id: 'best', label: 'Best match' }, { id: 'soonest', label: 'Leaves soonest' },
@@ -478,9 +490,9 @@ export function ResultsScreen({
               const free = t.seats_available - t.seats_reserved
               const name = t.driver_name ?? 'Driver'
               return (
-                <li key={t.id}>
+                <li key={t.id} className={`bg-card rounded-[18px] p-4 flex flex-col gap-3.5 border ${best ? 'border-primary' : 'border-border'}`}>
                   <button type="button" onClick={() => onOpenTrip(t)}
-                    className={`w-full text-left text-foreground bg-card rounded-[18px] p-4 flex flex-col gap-3.5 border hover:brightness-110 transition ${best ? 'border-primary' : 'border-border'}`}>
+                    className="w-full text-left text-foreground flex flex-col gap-3.5 hover:brightness-110 transition">
                     <div className="flex justify-between items-start gap-3">
                       <div className="flex flex-col gap-1 min-w-0">
                         {best && <span className="self-start text-[11px] font-bold tracking-[0.04em] uppercase text-primary-foreground bg-primary px-2 py-[3px] rounded-md">Best match</span>}
@@ -510,6 +522,18 @@ export function ResultsScreen({
                       </span>
                     </div>
                   </button>
+                  {!requestedTripIds.has(t.id) && free > 0 && t.driver_id !== currentUserId && (
+                    <button type="button" disabled={requestingId !== null}
+                      onClick={async () => {
+                        setRequestingId(t.id)
+                        try { await onRequestTrip(t) }
+                        catch (e) { showToast(e instanceof Error ? e.message : 'Could not send request', 'error') }
+                        finally { setRequestingId(null) }
+                      }}
+                      className="min-h-[44px] rounded-[12px] bg-primary text-primary-foreground text-sm font-semibold disabled:opacity-60">
+                      {requestingId === t.id ? 'Sending…' : `Request this ride · ${fmtMoney(t.pricing?.price_per_seat_cents)}`}
+                    </button>
+                  )}
                 </li>
               )
             })}
@@ -528,6 +552,13 @@ export function ResultsScreen({
       )}
     </div>
   )
+}
+
+// Best match: least detour first, then the target time, then trust. Lower is better.
+export function tripScore(t: ApiDriverTrip, search: Pick<RideSearch, 'time'>): number {
+  return (t.detour_minutes ?? 30) * 2
+    + (search.time && t.departure_time ? Math.abs(minutesOf(t.departure_time) - minutesOf(search.time)) / 10 : 0)
+    - (t.driver_stats?.rating_avg ?? 4) - (t.driver_stats?.id_verified ? 2 : 0)
 }
 
 function minutesOf(hhmm: string): number {
@@ -1071,3 +1102,240 @@ export function pickNextTrip(connections: Connection[], role: 'rider' | 'driver'
   return upcoming[0] ?? null
 }
 
+
+
+// ─── 4 · Find me a ride: request the top match, wait, hand over to trip day ──
+//
+// One screen replaces Results → Details → Inbox. It asks the best-ranked driver
+// (or the specific `firstTrip` the rider picked), shows a live countdown, and
+// moves on to the next match if the driver declines or doesn't answer in time.
+// A single ride request is created up front and reused for every driver asked.
+
+export const ANSWER_WINDOW_S = 120
+
+type FindPhase =
+  | { kind: 'searching' }
+  | { kind: 'waiting'; trip: ApiDriverTrip; connectionId: string; deadline: number }
+  | { kind: 'ended'; reason: string }
+
+export function FindRideScreen({
+  search, userCoords, currentUserId, excludeTripIds, firstTrip, onBack, onSeeAll, onFindAnother,
+  onConnectionCreated, onTripPassed, onAccepted, showToast, pollMs = 2000, answerWindowS = ANSWER_WINDOW_S,
+}: {
+  search: RideSearch
+  userCoords: { lat: number; lng: number } | null
+  currentUserId: string
+  excludeTripIds: Set<string>
+  // Set when the rider chose a specific driver: ask only them, no auto-advance.
+  firstTrip?: ApiDriverTrip | null
+  onBack: () => void
+  onSeeAll: () => void
+  onFindAnother: () => void
+  onConnectionCreated: (c: api.ApiConnection) => void
+  onTripPassed: (tripId: string) => void
+  onAccepted: (connectionId: string) => Promise<void>
+  showToast: (msg: string, type: 'success' | 'error') => void
+  pollMs?: number
+  answerWindowS?: number
+}) {
+  const [phase, setPhase] = useState<FindPhase>({ kind: 'searching' })
+  const [now, setNow] = useState(() => Date.now())
+  const queueRef = useRef<ApiDriverTrip[]>([])
+  const requestIdRef = useRef<string | null>(null)
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
+  const startedRef = useRef(false)
+  const aliveRef = useRef(true)
+  useEffect(() => () => { aliveRef.current = false }, [])
+  // Parent callbacks change identity every render; keep timers/effects stable.
+  const cb = useRef({ onConnectionCreated, onTripPassed, onAccepted, showToast })
+  cb.current = { onConnectionCreated, onTripPassed, onAccepted, showToast }
+
+  const closeRequest = useCallback(() => {
+    const id = requestIdRef.current
+    requestIdRef.current = null
+    if (id) api.cancelRideRequest(id).catch(() => {})
+  }, [])
+
+  const requestNext = useCallback(async (): Promise<void> => {
+    const trip = queueRef.current.shift()
+    if (!trip) {
+      closeRequest()
+      if (aliveRef.current) setPhase({ kind: 'ended', reason: firstTrip ? 'That driver can’t take you right now.' : 'No more drivers are available for this trip right now.' })
+      return
+    }
+    let conn: api.ApiConnection
+    try {
+      conn = await api.createConnection(requestIdRef.current!, trip.id)
+    } catch {
+      // Trip filled up or went away since the search — try the next one.
+      cb.current.onTripPassed(trip.id)
+      return requestNext()
+    }
+    if (!aliveRef.current) return
+    try { cb.current.onConnectionCreated(conn) } catch (e) { console.error(e) }
+    setNow(Date.now())
+    setPhase({ kind: 'waiting', trip, connectionId: conn.id, deadline: Date.now() + answerWindowS * 1000 })
+  }, [answerWindowS, closeRequest, firstTrip])
+
+  // Search, create the ride request once, then ask the first driver.
+  useEffect(() => {
+    if (startedRef.current) return
+    startedRef.current = true
+    ;(async () => {
+      try {
+        const origin = search.from && Number.isFinite(search.from.lat) ? search.from : userCoords ? { lat: userCoords.lat, lng: userCoords.lng, label: '' } : null
+        if (!search.to || !origin) throw new Error('Choose a destination and turn on location (or set a start) first.')
+        let trips: ApiDriverTrip[]
+        if (firstTrip) trips = [firstTrip]
+        else {
+          const rows = await api.searchDriverTrips({
+            target_date: search.date, destination_latitude: search.to.lat, destination_longitude: search.to.lng,
+            pickup_latitude: origin.lat, pickup_longitude: origin.lng,
+          })
+          trips = rows
+            .filter(t => t.driver_id !== currentUserId && t.seats_available - t.seats_reserved >= search.seats && !excludeTripIds.has(t.id))
+            .sort((a, b) => tripScore(a, search) - tripScore(b, search))
+        }
+        if (trips.length === 0) {
+          if (aliveRef.current) setPhase({ kind: 'ended', reason: 'No drivers are going your way yet.' })
+          return
+        }
+        queueRef.current = trips
+        const pickupLabel = origin.label || (await reverseGeocode(origin.lat, origin.lng))
+        const [p, d] = await Promise.all([
+          api.createLocation(pickupLabel, origin.lat, origin.lng),
+          api.createLocation(search.to.label, search.to.lat, search.to.lng),
+        ])
+        const rr = await api.createRideRequest({
+          pickup_location_id: p.id, destination_location_id: d.id, target_date: search.date, flexibility: 'flexible',
+          passenger_count: search.seats, tags: [], departure_time: search.time || null,
+        })
+        requestIdRef.current = rr.id
+        await requestNext()
+      } catch (e) {
+        if (aliveRef.current) setPhase({ kind: 'ended', reason: e instanceof Error ? e.message : 'Could not send your request.' })
+      }
+    })()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const abandon = useCallback(async (connectionId: string) => {
+    await api.transitionConnection(connectionId, 'cancel').catch(() => {})
+  }, [])
+
+  // While waiting: watch for the driver's answer and the answer window.
+  useEffect(() => {
+    if (phase.kind !== 'waiting') return
+    const { connectionId, trip, deadline } = phase
+    let busy = false
+    const driverName = trip.driver_name ?? 'The driver'
+    const id = setInterval(async () => {
+      const t = Date.now()
+      setNow(t)
+      if (busy) return
+      busy = true
+      try {
+        if (t >= deadline) {
+          await abandon(connectionId)
+          cb.current.onTripPassed(trip.id)
+          cb.current.showToast(`${driverName} didn’t answer in time`, 'error')
+          await (firstTrip ? Promise.resolve(setPhase({ kind: 'ended', reason: `${driverName} didn’t answer in time.` })) : requestNext())
+          return
+        }
+        const mine = (await api.getMyConnections()).find(c => c.id === connectionId)
+        if (!mine || !aliveRef.current || phaseRef.current !== phase) return
+        if (mine.status === 'accepted') {
+          clearInterval(id)
+          requestIdRef.current = null // now owned by the accepted connection
+          await cb.current.onAccepted(connectionId)
+        } else if (mine.status !== 'pending') {
+          cb.current.onTripPassed(trip.id)
+          cb.current.showToast(`${driverName} can’t take you this time`, 'error')
+          if (firstTrip) setPhase({ kind: 'ended', reason: `${driverName} can’t take you this time.` })
+          else await requestNext()
+        }
+      } catch { /* transient — next tick retries */ }
+      finally { busy = false }
+    }, pollMs)
+    return () => clearInterval(id)
+  }, [phase, pollMs, abandon, requestNext, firstTrip])
+
+  const cancel = async () => {
+    if (phase.kind === 'waiting') await abandon(phase.connectionId)
+    closeRequest()
+    onBack()
+  }
+  const tryNext = async () => {
+    if (phase.kind !== 'waiting') return
+    await abandon(phase.connectionId)
+    cb.current.onTripPassed(phase.trip.id)
+    setPhase({ kind: 'searching' })
+    await requestNext()
+  }
+
+  return (
+    <div className="max-w-md mx-auto flex flex-col gap-5 pb-8">
+      <div className="flex items-center gap-2.5">
+        <IconButton label="Cancel and go back" onClick={cancel}><ChevronLeft className="size-5" /></IconButton>
+        <div className="flex-1 min-w-0 flex flex-col">
+          <span className="text-[15px] font-semibold truncate">{search.from?.label || 'Current location'} → {search.to?.label}</span>
+          <span className="text-xs text-muted-foreground">{dayLabel(search.date)}{search.time ? `, around ${fmtTime(search.time)}` : ''} · {search.seats} seat{search.seats === 1 ? '' : 's'}</span>
+        </div>
+      </div>
+
+      {phase.kind === 'searching' && (
+        <div role="status" className="rounded-[20px] border border-border bg-card p-8 flex flex-col items-center gap-4 text-center">
+          <div className="size-10 rounded-full border-4 border-primary/25 border-t-primary animate-spin" />
+          <p className="font-display text-xl font-bold">Finding your best match…</p>
+        </div>
+      )}
+
+      {phase.kind === 'waiting' && (() => {
+        const t = phase.trip
+        const name = t.driver_name ?? 'Driver'
+        const { depart, arrive } = tripTimes(t)
+        const left = Math.max(0, Math.ceil((phase.deadline - now) / 1000))
+        return (
+          <div role="status" aria-live="polite" className="rounded-[20px] border border-primary bg-card p-5 flex flex-col gap-4">
+            <div>
+              <p className="font-display text-2xl font-bold">Waiting for {name}…</p>
+              <p className="text-[13px] text-muted-foreground">Request sent — you’ll be taken to your trip as soon as they accept.</p>
+            </div>
+            <div className="flex items-center gap-3">
+              <Avatar initials={toInitials(name)} photoUrl={t.driver_photo_url} size="lg" />
+              <div className="min-w-0 flex flex-col gap-0.5">
+                <span className="text-[15px] font-semibold flex items-center gap-1.5">{name}{t.driver_stats?.id_verified && <VerifiedIcon />}</span>
+                <span className="text-[13px] text-muted-foreground truncate">{driverLine(t)}</span>
+              </div>
+              <span className="ml-auto font-display text-xl font-bold shrink-0">{fmtMoney(t.pricing?.price_per_seat_cents)}</span>
+            </div>
+            <p className="text-[13px] text-secondary-foreground flex items-center gap-1.5">
+              <Clock className="size-3.5 shrink-0" />{depart}{arrive && <> → {arrive}</>}
+              <span className="text-muted-foreground">· Pickup near {formatPlace(t.pickup.label)}</span>
+            </p>
+            <div className="h-1.5 rounded-full bg-muted overflow-hidden" aria-hidden>
+              <div className="h-full bg-primary transition-[width] duration-1000 ease-linear" style={{ width: `${(left / answerWindowS) * 100}%` }} />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {firstTrip ? `Waiting up to ${Math.ceil(left / 60)} min for an answer` : `If ${name} doesn’t answer in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}, we’ll ask the next best driver.`}
+            </p>
+            <div className="flex gap-2">
+              {!firstTrip && <button type="button" onClick={tryNext} className="flex-1 min-h-11 rounded-xl border border-border text-sm font-semibold hover:bg-muted">Try next driver</button>}
+              <button type="button" onClick={cancel} className="flex-1 min-h-11 rounded-xl border border-border text-sm font-semibold text-destructive hover:bg-destructive/10">Cancel request</button>
+            </div>
+          </div>
+        )
+      })()}
+
+      {phase.kind === 'ended' && (
+        <div role="status" className="rounded-[20px] border border-border bg-card p-6 flex flex-col gap-4">
+          <p className="font-display text-xl font-bold">{phase.reason}</p>
+          <div className="flex flex-col gap-2">
+            {firstTrip && <PrimaryButton onClick={onFindAnother}>Find me another ride</PrimaryButton>}
+            <button type="button" onClick={onSeeAll} className="min-h-11 rounded-xl border border-border text-sm font-semibold hover:bg-muted">See all rides</button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
