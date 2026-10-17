@@ -15,6 +15,8 @@ import { useTheme } from 'next-themes'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
+import { searchPlaces, reverseGeocode } from '../lib/googleMaps'
+import type { PlaceResult } from '../lib/googleMaps'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
 import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
@@ -104,39 +106,7 @@ export interface LocationValue {
 
 // ─── Location autocomplete ────────────────────────────────────────────────────
 
-interface NominatimResult {
-  place_id: number
-  display_name: string
-  name: string
-  lat: string
-  lon: string
-  address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
-}
-
-export async function reverseGeocode(lat: number, lng: number): Promise<string> {
-  try {
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
-      { headers: { 'Accept-Language': 'en' } },
-    )
-    const data: NominatimResult = await res.json()
-    const label = shortLabel(data)
-    return label || 'My location'
-  } catch {
-    return 'My location'
-  }
-}
-
-function shortLabel(r: NominatimResult): string {
-  const parts = [r.name || r.display_name.split(',')[0]]
-  const a = r.address ?? {}
-  const city = a.city ?? a.town ?? a.village
-  if (city) parts.push(city)
-  if (a.state) parts.push(a.state)
-  // formatPlace drops the repeat when the place *is* the city ("Sacramento,
-  // Sacramento, California" → "Sacramento, CA").
-  return formatPlace(parts.filter(Boolean).join(', '))
-}
+export { reverseGeocode }
 
 export function LocationInput({
   label, value, onChange, placeholder, required, nearCoords, variant = 'form',
@@ -151,7 +121,7 @@ export function LocationInput({
   nearCoords?: { lat: number; lng: number } | null
 }) {
   const [query, setQuery] = useState(value?.label ?? '')
-  const [suggestions, setSuggestions] = useState<NominatimResult[]>([])
+  const [suggestions, setSuggestions] = useState<PlaceResult[]>([])
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -168,25 +138,14 @@ export function LocationInput({
     debounceRef.current = setTimeout(async () => {
       setLoading(true)
       try {
-        // Bias (not restrict) toward the user's area: a ~1° box (~100km) around
-        // their location tells Nominatim to rank local matches higher, without
-        // `bounded=1` — which would hide a deliberate search for a far-away
-        // place entirely. The client-side distance sort below is what actually
-        // guarantees the nearest match comes first, since viewbox alone is only
-        // a soft hint and a same-named city on the other side of the world can
-        // still outrank it on Nominatim's own "importance" score.
-        const viewbox = nearCoords
-          ? `&viewbox=${nearCoords.lng - 1},${nearCoords.lat + 1},${nearCoords.lng + 1},${nearCoords.lat - 1}`
-          : ''
-        const res = await fetch(
-          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1${viewbox}`,
-          { headers: { 'Accept-Language': 'en' } },
-        )
-        const data: NominatimResult[] = await res.json()
+        // Google geocoding biased (not restricted) toward the user's area; the
+        // distance sort guarantees the nearest match comes first, since bias is
+        // only a soft hint. Falls back to Nominatim if Google is unavailable.
+        const data = await searchPlaces(q, nearCoords)
         if (nearCoords) {
           data.sort((a, b) =>
-            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(a.lat), parseFloat(a.lon)]) -
-            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(b.lat), parseFloat(b.lon)]),
+            distanceMeters([nearCoords.lat, nearCoords.lng], [a.lat, a.lng]) -
+            distanceMeters([nearCoords.lat, nearCoords.lng], [b.lat, b.lng]),
           )
         }
         setSuggestions(data)
@@ -207,10 +166,9 @@ export function LocationInput({
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
-  const select = (r: NominatimResult) => {
-    const lbl = shortLabel(r)
-    setQuery(lbl)
-    onChange({ label: lbl, lat: parseFloat(r.lat), lng: parseFloat(r.lon) })
+  const select = (r: PlaceResult) => {
+    setQuery(r.label)
+    onChange({ label: r.label, lat: r.lat, lng: r.lng })
     setOpen(false)
     setSuggestions([])
   }
@@ -251,7 +209,7 @@ export function LocationInput({
             className="absolute z-50 top-full mt-1.5 w-full bg-card border border-border rounded-2xl shadow-xl overflow-hidden"
           >
             {suggestions.map(r => (
-              <li key={r.place_id} role="option" aria-selected={false}>
+              <li key={r.id} role="option" aria-selected={false}>
                 <button
                   type="button"
                   onMouseDown={e => { e.preventDefault(); select(r) }}
@@ -259,8 +217,8 @@ export function LocationInput({
                 >
                   <MapPin className="size-3.5 text-primary shrink-0 mt-0.5" />
                   <div className="min-w-0">
-                    <p className="font-medium text-foreground truncate">{shortLabel(r)}</p>
-                    <p className="text-xs text-muted-foreground truncate mt-0.5">{r.display_name}</p>
+                    <p className="font-medium text-foreground truncate">{r.label}</p>
+                    <p className="text-xs text-muted-foreground truncate mt-0.5">{r.detail}</p>
                   </div>
                 </button>
               </li>

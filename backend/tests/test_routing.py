@@ -6,7 +6,7 @@ import time
 import httpx
 
 from backend.app import routing
-from backend.app.routing import OSRMClient
+from backend.app.routing import GoogleRoutesClient, OSRMClient
 
 OK_BODY = {
     "code": "Ok",
@@ -85,3 +85,45 @@ def test_concurrent_requests_are_capped(monkeypatch) -> None:
     for t in threads:
         t.join()
     assert peak == 2
+
+
+GOOGLE_BODY = {
+    "routes": [{
+        "distanceMeters": 2500, "duration": "300s",
+        "polyline": {"geoJsonLinestring": {"coordinates": [[0.0, 0.0], [0.02, 0.0]]}},
+    }],
+}
+
+
+def test_google_routes_parses_response_and_sends_key(monkeypatch) -> None:
+    seen = {}
+
+    def fake_post(url, json, headers, timeout):
+        seen.update(url=url, json=json, headers=headers)
+        return FakeResponse(GOOGLE_BODY)
+
+    monkeypatch.setattr(routing.httpx, "post", fake_post)
+    result = GoogleRoutesClient("k").route([(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)])
+    assert result is not None
+    assert (result.distance_m, result.duration_s) == (2500.0, 300.0)
+    assert result.coordinates == [(0.0, 0.0), (0.02, 0.0)]
+    assert seen["headers"]["X-Goog-Api-Key"] == "k"
+    assert len(seen["json"]["intermediates"]) == 1
+
+
+def test_google_routes_falls_back_to_osrm(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(routing.httpx, "post", boom)
+    monkeypatch.setattr(routing.httpx, "get", lambda *a, **k: FakeResponse(OK_BODY))
+    result = GoogleRoutesClient("k", fallback=OSRMClient("http://osrm")).route([(1.0, 2.0), (3.0, 4.0)])
+    assert result is not None and result.distance_m == 1000.0
+
+
+def test_google_routes_without_fallback_returns_none(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(routing.httpx, "post", boom)
+    assert GoogleRoutesClient("k").route([(1.0, 2.0), (3.0, 4.0)]) is None

@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, DriverTrip, Store, User
-from backend.app.routing import OSRMClient
+from backend.app.routing import GoogleRoutesClient, OSRMClient
 
 
 class Settings(BaseSettings):
@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     # disables routing: trips are stored without a route and search falls back
     # to endpoint-radius matching.
     osrm_base_url: str = "http://localhost:5001"
+
+    # Google Maps Platform key (env MAP_API_KEY). Primary map provider: served
+    # to the browser via /config/maps for the Maps JavaScript API (so restrict
+    # it by HTTP referrer), and used server-side for the Routes API, with OSRM
+    # as the fallback router. Unset: the app falls back to OSRM + OpenStreetMap.
+    map_api_key: str | None = None
 
     # Supabase project URL (must match the frontend's VITE_SUPABASE_URL). Access
     # tokens are verified against its JWKS endpoint. Required for /auth/login.
@@ -276,9 +282,9 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.store = store or Store(
-        s.database_url, router=OSRMClient(s.osrm_base_url) if s.osrm_base_url else None,
-    )
+    osrm = OSRMClient(s.osrm_base_url) if s.osrm_base_url else None
+    router = GoogleRoutesClient(s.map_api_key, fallback=osrm) if s.map_api_key else osrm
+    app.state.store = store or Store(s.database_url, router=router)
     app.state.settings = s
     app.state.ws_manager = ConnectionManager()
 
@@ -287,6 +293,13 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     # ── Core ──────────────────────────────────────────────────────────────────
+
+    @app.get("/config/maps")
+    def maps_config() -> dict[str, Any]:
+        # Public on purpose: the Maps JavaScript API key is necessarily visible
+        # to the browser; it is secured by its HTTP-referrer restriction.
+        return {"provider": "google" if app.state.settings.map_api_key else None,
+                "api_key": app.state.settings.map_api_key}
 
     @app.get("/")
     def root() -> dict[str, Any]:

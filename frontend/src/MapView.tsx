@@ -1,20 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from "react"
-import * as maplibregl from "maplibre-gl"
-import "maplibre-gl/dist/maplibre-gl.css"
-import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
+import { loadGoogleMaps, searchPlaces, fetchRoute } from "./lib/googleMaps"
+import type { LineString, PlaceResult, RouteGeometry } from "./lib/googleMaps"
 import {
   MapPin, Navigation, X, Car, Search, Crosshair, ChevronUp, ChevronDown,
 } from "lucide-react"
-
-// Bundlers don't reliably auto-detect the `new Worker(new URL(...))` call
-// inside maplibre-gl's own source (it 404s under Vite's dev optimizer and
-// silently drops out of the Rollup production bundle too — tile parsing then
-// never happens and the map paints blank). Resolving the worker file
-// ourselves via Vite's `?url` import and pointing maplibre-gl at it explicitly
-// sidesteps that bundler detection entirely, in both dev and prod.
-maplibregl.setWorkerUrl(maplibreWorkerUrl)
 
 export interface TripRoute {
   pickupLat: number
@@ -38,33 +29,34 @@ export interface DrivingTarget {
   partnerName: string
 }
 
-interface OsrmResult {
-  distanceMeters: number
-  durationSeconds: number
-  geometry: GeoJSON.LineString
-}
+type OsrmResult = RouteGeometry
 
 const CAR_EMOJIS: Record<string, string> = {
   suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", sedan: "🚗", other: "🚗",
 }
 
-// ── Dark vector basemap ─────────────────────────────────────────────────────
-// CARTO's hosted Dark Matter GL style: a real vector basemap (rotatable and
-// pitchable, unlike flat raster tiles) whose high-contrast street network and
-// labels read well under the app's dark, Uber-style map chrome. The map stays
-// dark regardless of the app's light/dark theme, since every overlay on it is
-// styled for a dark canvas. Vite only exposes VITE_-prefixed vars to the
-// client, which is expected for a browser map key restricted by domain.
-const CARTO_API_KEY = import.meta.env.VITE_CARTO_API_KEY as string | undefined
-const CARTO_KEY_PARAM = CARTO_API_KEY ? `?key=${CARTO_API_KEY}` : ""
-const STYLE_URL = `https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json${CARTO_KEY_PARAM}`
+// ── Dark Google basemap ────────────────────────────────────────────────────
+// Google Maps is the primary basemap. The map stays dark regardless of the
+// app theme, since every overlay on it is styled for a dark canvas.
+const DARK_MAP_STYLES: google.maps.MapTypeStyle[] = [
+  { elementType: "geometry", stylers: [{ color: "#1d2433" }] },
+  { elementType: "labels.text.fill", stylers: [{ color: "#9aa7bd" }] },
+  { elementType: "labels.text.stroke", stylers: [{ color: "#1d2433" }] },
+  { featureType: "administrative", elementType: "geometry.stroke", stylers: [{ color: "#3a4560" }] },
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "road", elementType: "geometry", stylers: [{ color: "#2c3650" }] },
+  { featureType: "road", elementType: "geometry.stroke", stylers: [{ color: "#1d2433" }] },
+  { featureType: "road.highway", elementType: "geometry", stylers: [{ color: "#3b4a6e" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+  { featureType: "water", elementType: "geometry", stylers: [{ color: "#0f1626" }] },
+]
 const ACCENT = "#38bdf8"
 
 // ── Marker motion interpolation (pure, unit-testable) ──────────────────────────
 // Smoothly glides a marker between successive polled positions instead of
 // snapping, the way Uber/Google Maps animate a live driver dot. Coordinates
-// here are plain [lat, lng] tuples — conversion to MapLibre's [lng, lat]
-// order happens only at the point of calling a maplibre-gl API.
+// here are plain [lat, lng] tuples — conversion to GeoJSON's [lng, lat]
+// order happens only where route geometry is read or written.
 
 export function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t
@@ -103,16 +95,86 @@ export function distanceMeters(a: [number, number], b: [number, number]): number
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)))
 }
 
-/** [lat, lng] -> MapLibre's [lng, lat] ordering. */
+/** [lat, lng] -> GeoJSON's [lng, lat] ordering. */
 function toLngLat(p: [number, number]): [number, number] {
   return [p[1], p[0]]
 }
 
-function boundsOf(points: [number, number][]): maplibregl.LngLatBoundsLike {
-  const lngLats = points.map(toLngLat)
-  const lngs = lngLats.map(p => p[0])
-  const lats = lngLats.map(p => p[1])
-  return [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]]
+function toLatLngLiteral(p: [number, number]): google.maps.LatLngLiteral {
+  return { lat: p[0], lng: p[1] }
+}
+
+function fitPoints(map: google.maps.Map, points: [number, number][], padding: number) {
+  const bounds = new google.maps.LatLngBounds()
+  points.forEach(p => bounds.extend(toLatLngLiteral(p)))
+  map.fitBounds(bounds, padding)
+}
+
+/** Smoothly recenters (and zooms) the map. */
+function flyTo(map: google.maps.Map, p: [number, number], zoom: number) {
+  map.panTo(toLatLngLiteral(p))
+  map.setZoom(zoom)
+}
+
+// A Google OverlayView that hosts an arbitrary DOM element at a lat/lng, so the
+// animated car / pin markers keep their existing DOM+CSS look. Built lazily
+// because `google.maps.OverlayView` only exists once the API has loaded.
+interface DomMarker {
+  setElement(el: HTMLElement): void
+  getElement(): HTMLElement
+  setLatLng(p: [number, number]): void
+  getLatLng(): [number, number]
+  /** Click shows an info window with a bold title and optional lines (text only). */
+  setPopup(title: string, ...lines: string[]): void
+  onClick(cb: () => void): void
+  remove(): void
+}
+type DomMarkerCtor = new (map: google.maps.Map, el: HTMLElement, pos: [number, number]) => DomMarker
+
+let domMarkerCtor: DomMarkerCtor | null = null
+function getDomMarkerCtor(): DomMarkerCtor {
+  if (domMarkerCtor) return domMarkerCtor
+  class Impl extends google.maps.OverlayView implements DomMarker {
+    private wrap = document.createElement("div")
+    private info: google.maps.InfoWindow | null = null
+    private clickCb: (() => void) | null = null
+    constructor(private gmap: google.maps.Map, private el: HTMLElement, private pos: [number, number]) {
+      super()
+      this.wrap.style.cssText = "position:absolute;transform:translate(-50%,-50%);cursor:pointer"
+      this.wrap.appendChild(el)
+      this.wrap.addEventListener("click", () => {
+        this.clickCb?.()
+        if (this.info) { this.info.setPosition(toLatLngLiteral(this.pos)); this.info.open({ map: this.gmap }) }
+      })
+      this.setMap(gmap)
+    }
+    onAdd() { this.getPanes()?.overlayMouseTarget.appendChild(this.wrap) }
+    draw() {
+      const pt = this.getProjection()?.fromLatLngToDivPixel(new google.maps.LatLng(this.pos[0], this.pos[1]))
+      if (pt) { this.wrap.style.left = `${pt.x}px`; this.wrap.style.top = `${pt.y}px` }
+    }
+    onRemove() { this.wrap.remove() }
+    setElement(el: HTMLElement) { this.wrap.replaceChildren(el); this.el = el }
+    getElement() { return this.el }
+    setLatLng(p: [number, number]) { this.pos = p; this.draw() }
+    getLatLng() { return this.pos }
+    setPopup(title: string, ...lines: string[]) {
+      const box = document.createElement("div")
+      box.style.cssText = "font-size:12px;color:#0f172a"
+      const b = document.createElement("b"); b.textContent = title; box.appendChild(b)
+      lines.forEach(l => { box.appendChild(document.createElement("br")); box.appendChild(document.createTextNode(l)) })
+      this.info ??= new google.maps.InfoWindow({ disableAutoPan: false })
+      this.info.setContent(box)
+    }
+    onClick(cb: () => void) { this.clickCb = cb }
+    remove() { this.info?.close(); this.setMap(null) }
+  }
+  domMarkerCtor = Impl
+  return Impl
+}
+
+function newMarker(map: google.maps.Map, el: HTMLElement, pos: [number, number]): DomMarker {
+  return new (getDomMarkerCtor())(map, el, pos)
 }
 
 interface MarkerAnimation {
@@ -183,24 +245,6 @@ function makeDestEl(): HTMLDivElement {
   return el.firstElementChild as HTMLDivElement
 }
 
-async function fetchOSRMRoute(pickupLat: number, pickupLng: number, destLat: number, destLng: number): Promise<OsrmResult | null> {
-  try {
-    const res = await fetch(
-      `https://router.project-osrm.org/route/v1/driving/${pickupLng},${pickupLat};${destLng},${destLat}?overview=full&geometries=geojson`,
-      { headers: { Accept: "application/json" } },
-    )
-    const data = await res.json()
-    if (data.code === "Ok" && data.routes?.length) {
-      return {
-        distanceMeters: data.routes[0].legs[0].distance,
-        durationSeconds: data.routes[0].legs[0].duration,
-        geometry: data.routes[0].geometry,
-      }
-    }
-  } catch { /* fall through to null */ }
-  return null
-}
-
 function formatDuration(seconds: number): string {
   const mins = Math.round(seconds / 60)
   if (mins < 60) return `${mins} min`
@@ -214,15 +258,7 @@ function formatDistance(meters: number): string {
 
 const MONO: React.CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
-// ── Lightweight "Where to?" search (Nominatim) ──────────────────────────────
-interface NominatimResult {
-  place_id: number
-  display_name: string
-  name: string
-  lat: string
-  lon: string
-}
-
+// ── Lightweight "Where to?" search (Google geocoding) ──────────────────────────────
 interface Props {
   userCoords: { lat: number; lng: number } | null
   currentUserId: string
@@ -236,18 +272,20 @@ interface Props {
 export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
   const accentColor = ACCENT
 
-  const mapRef = useRef<maplibregl.Map | null>(null)
+  const mapRef = useRef<google.maps.Map | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const mapReadyRef = useRef(false)
   const [mapReady, setMapReady] = useState(false)
-  const markersRef = useRef<Record<string, maplibregl.Marker>>({})
+  const [mapUnavailable, setMapUnavailable] = useState(false)
+  const routeLineRef = useRef<google.maps.Polyline | null>(null)
+  const markersRef = useRef<Record<string, DomMarker>>({})
   const markerHeadingsRef = useRef<Record<string, number>>({})
   const animsRef = useRef<Record<string, MarkerAnimation>>({})
   const rafIdRef = useRef<number | null>(null)
-  const userMarkerRef = useRef<maplibregl.Marker | null>(null)
-  const pickupMarkerRef = useRef<maplibregl.Marker | null>(null)
-  const destMarkerRef = useRef<maplibregl.Marker | null>(null)
-  const searchMarkerRef = useRef<maplibregl.Marker | null>(null)
+  const userMarkerRef = useRef<DomMarker | null>(null)
+  const pickupMarkerRef = useRef<DomMarker | null>(null)
+  const destMarkerRef = useRef<DomMarker | null>(null)
+  const searchMarkerRef = useRef<DomMarker | null>(null)
 
   const [drivers, setDrivers] = useState<NearbyDriver[]>([])
   const [selected, setSelected] = useState<NearbyDriver | null>(null)
@@ -258,7 +296,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const [watchId, setWatchId] = useState<number | null>(null)
 
   // ── "Start Driving" navigation-to-rider mode ────────────────────────────────
-  const drivingPickupMarkerRef = useRef<maplibregl.Marker | null>(null)
+  const drivingPickupMarkerRef = useRef<DomMarker | null>(null)
   const drivingLastRouteFetchRef = useRef<{ pos: [number, number]; time: number } | null>(null)
   const drivingFitOnceRef = useRef(false)
   const [drivingSample, setDrivingSample] = useState<{ pos: [number, number]; heading: number } | null>(null)
@@ -269,7 +307,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   // ── Mobile immersive chrome ──────────────────────────────────────────────────
   const [sheetExpanded, setSheetExpanded] = useState(false)
   const [searchText, setSearchText] = useState("")
-  const [searchResults, setSearchResults] = useState<NominatimResult[]>([])
+  const [searchResults, setSearchResults] = useState<PlaceResult[]>([])
   const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ── Bottom sheet drag gesture ───────────────────────────────────────────────
@@ -322,69 +360,55 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   // ── Init map ────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return
-    const center: [number, number] = userCoords ? [userCoords.lng, userCoords.lat] : [-122.4194, 37.7749]
-    // No +/- zoom buttons: pinch/scroll zoom, drag pan and two-finger
-    // pitch/rotate are all on by default. The OSM/CARTO credit is legally
-    // required, so it stays — but only as a collapsed "i" button, not a bar.
-    const map = new maplibregl.Map({
-      container: containerRef.current,
-      style: STYLE_URL,
-      center, zoom: 14, pitch: 45,
-      attributionControl: false,
+    let cancelled = false
+    loadGoogleMaps().then(maps => {
+      if (cancelled || !containerRef.current || mapRef.current) return
+      if (!maps) { setMapUnavailable(true); return }
+      const map = new maps.Map(containerRef.current, {
+        center: userCoords ? toLatLngLiteral([userCoords.lat, userCoords.lng]) : { lat: 37.7749, lng: -122.4194 },
+        zoom: 14,
+        styles: DARK_MAP_STYLES,
+        disableDefaultUI: true,
+        zoomControl: false,
+        clickableIcons: false,
+        gestureHandling: "greedy",
+      })
+      routeLineRef.current = new maps.Polyline({ map, strokeColor: accentColor, strokeWeight: 5, strokeOpacity: 0.9, clickable: false })
+      mapRef.current = map
+      mapReadyRef.current = true
+      setMapReady(true)
     })
-    map.addControl(new maplibregl.AttributionControl({ compact: true }), "top-left")
-    map.on("load", () => {
-      mapReadyRef.current = true; setMapReady(true)
-      containerRef.current?.querySelector(".maplibregl-ctrl-attrib")?.classList.remove("maplibregl-compact-show")
-    })
-    mapRef.current = map
-    return () => { map.remove(); mapRef.current = null; mapReadyRef.current = false; setMapReady(false) }
+    return () => {
+      cancelled = true
+      routeLineRef.current?.setMap(null); routeLineRef.current = null
+      Object.values(markersRef.current).forEach(m => m.remove()); markersRef.current = {}
+      mapRef.current = null; mapReadyRef.current = false
+    }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Shared route line source/layer (used by trip-route + driving modes) ────
-  const ensureRouteLayer = useCallback((map: maplibregl.Map) => {
-    if (map.getSource("carpool-route")) return
-    map.addSource("carpool-route", { type: "geojson", data: { type: "FeatureCollection", features: [] } })
-    map.addLayer({
-      id: "carpool-route-line", type: "line", source: "carpool-route",
-      paint: { "line-color": accentColor, "line-width": 5, "line-opacity": 0.9 },
-      layout: { "line-cap": "round", "line-join": "round" },
+  // ── Shared route line (used by trip-route + driving modes) ─────────────────
+  const setRouteLine = useCallback((geometry: LineString | null, dashed = false) => {
+    const line = routeLineRef.current
+    if (!line) return
+    line.setPath(geometry ? geometry.coordinates.map(([lng, lat]) => ({ lat, lng })) : [])
+    line.setOptions({
+      strokeColor: accentColor,
+      strokeOpacity: dashed ? 0 : 0.9,
+      icons: dashed
+        ? [{ icon: { path: "M 0,-1 0,1", strokeOpacity: 0.9, strokeColor: accentColor, scale: 3 }, offset: "0", repeat: "12px" }]
+        : [],
     })
   }, [accentColor])
-
-  const setRouteLine = useCallback((geometry: GeoJSON.LineString | null, dashed = false) => {
-    const map = mapRef.current
-    if (!map) return
-    ensureRouteLayer(map)
-    const src = map.getSource("carpool-route") as maplibregl.GeoJSONSource | undefined
-    src?.setData(geometry ? { type: "Feature", properties: {}, geometry } : { type: "FeatureCollection", features: [] })
-    if (map.getLayer("carpool-route-line")) {
-      map.setPaintProperty("carpool-route-line", "line-dasharray", dashed ? [2, 2] : [1, 0])
-      map.setPaintProperty("carpool-route-line", "line-color", accentColor)
-    }
-  }, [ensureRouteLayer, accentColor])
-
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map) return
-    const setup = () => ensureRouteLayer(map)
-    if (mapReady) setup()
-    map.on("styledata", setup)
-    return () => { map.off("styledata", setup) }
-  }, [mapReady, ensureRouteLayer])
 
   // ── User marker (browse mode only) ──────────────────────────────────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map || !mapReady || !userCoords || mode !== "browse") return
     if (userMarkerRef.current) {
-      userMarkerRef.current.setLngLat(toLngLat([userCoords.lat, userCoords.lng]))
+      userMarkerRef.current.setLatLng([userCoords.lat, userCoords.lng])
     } else {
-      userMarkerRef.current = new maplibregl.Marker({ element: makeUserEl(accentColor) })
-        .setLngLat(toLngLat([userCoords.lat, userCoords.lng]))
-        .addTo(map)
-      map.flyTo({ center: toLngLat([userCoords.lat, userCoords.lng]), zoom: 14 })
+      userMarkerRef.current = newMarker(map, makeUserEl(accentColor), [userCoords.lat, userCoords.lng])
+      flyTo(map, [userCoords.lat, userCoords.lng], 14)
     }
   }, [userCoords, mode, accentColor, mapReady])
 
@@ -407,27 +431,22 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
     const { pickupLat, pickupLng, pickupLabel, destLat, destLng, destLabel } = tripRoute
 
-    pickupMarkerRef.current = new maplibregl.Marker({ element: makePickupEl() })
-      .setLngLat(toLngLat([pickupLat, pickupLng]))
-      .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>Pickup</b><br>${pickupLabel}`))
-      .addTo(map)
-    destMarkerRef.current = new maplibregl.Marker({ element: makeDestEl() })
-      .setLngLat(toLngLat([destLat, destLng]))
-      .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>Destination</b><br>${destLabel}`))
-      .addTo(map)
+    pickupMarkerRef.current = newMarker(map, makePickupEl(), [pickupLat, pickupLng])
+    pickupMarkerRef.current.setPopup("Pickup", pickupLabel)
+    destMarkerRef.current = newMarker(map, makeDestEl(), [destLat, destLng])
+    destMarkerRef.current.setPopup("Destination", destLabel)
 
-    map.fitBounds(boundsOf([[pickupLat, pickupLng], [destLat, destLng]]), { padding: 80 })
+    fitPoints(map, [[pickupLat, pickupLng], [destLat, destLng]], 80)
 
     setLoadingRoute(true)
     setOsrmResult(null)
-    fetchOSRMRoute(pickupLat, pickupLng, destLat, destLng).then(result => {
+    fetchRoute(pickupLat, pickupLng, destLat, destLng).then(result => {
       if (!mapRef.current) return
       if (result) {
         setRouteLine(result.geometry, false)
         const coords = result.geometry.coordinates as [number, number][]
         if (coords.length > 0) {
-          const lngs = coords.map(c => c[0]); const lats = coords.map(c => c[1])
-          mapRef.current.fitBounds([[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]], { padding: 80 })
+          fitPoints(mapRef.current, coords.map(([lng, lat]) => [lat, lng] as [number, number]), 80)
         }
         setOsrmResult(result)
       } else {
@@ -461,7 +480,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       if (!marker || !anim) { delete animsRef.current[uid]; continue }
       const t = Math.min(1, (now - anim.start) / anim.duration)
       const pos = lerpLatLng(anim.from, anim.to, t)
-      marker.setLngLat(toLngLat(pos))
+      marker.setLatLng(pos)
       const heading = lerpAngle(anim.fromHeading, anim.toHeading, t)
       markerHeadingsRef.current[uid] = heading
       const el = marker.getElement()
@@ -496,7 +515,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       if (marker) {
         const prevAnim = animsRef.current[d.user_id]
         const t = prevAnim ? Math.min(1, (now - prevAnim.start) / prevAnim.duration) : 1
-        const currentPos: [number, number] = prevAnim ? lerpLatLng(prevAnim.from, prevAnim.to, t) : (() => { const p = marker.getLngLat(); return [p.lat, p.lng] })()
+        const currentPos: [number, number] = prevAnim ? lerpLatLng(prevAnim.from, prevAnim.to, t) : marker.getLatLng()
         const currentHeading = prevAnim ? lerpAngle(prevAnim.fromHeading, prevAnim.toHeading, t) : (markerHeadingsRef.current[d.user_id] ?? targetHeading)
         animsRef.current[d.user_id] = {
           from: currentPos, to: [d.latitude, d.longitude],
@@ -506,17 +525,14 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
         if (trackingRef.current[d.user_id] !== tracking) {
           trackingRef.current[d.user_id] = tracking
           const newEl = makeCarEl(currentHeading, { tracking, accent: accentColor })
-          marker.getElement().replaceWith(newEl)
-          marker.setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`))
+          marker.setElement(newEl)
         }
       } else {
         trackingRef.current[d.user_id] = tracking
         markerHeadingsRef.current[d.user_id] = targetHeading
-        const m = new maplibregl.Marker({ element: makeCarEl(targetHeading, { tracking, accent: accentColor }) })
-          .setLngLat(toLngLat([d.latitude, d.longitude]))
-          .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${d.display_name}</b><br>${d.vehicle ?? d.car_type ?? "Driver"}<br>${d.distance_meters}m away`))
-          .addTo(map)
-        m.getElement().addEventListener("click", () => { setSelected(d); setSheetExpanded(true) })
+        const m = newMarker(map, makeCarEl(targetHeading, { tracking, accent: accentColor }), [d.latitude, d.longitude])
+        m.setPopup(d.display_name, d.vehicle ?? d.car_type ?? "Driver", `${d.distance_meters}m away`)
+        m.onClick(() => { setSelected(d); setSheetExpanded(true) })
         markersRef.current[d.user_id] = m
       }
     }
@@ -550,7 +566,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       .then(r => {
         setNearbyRoute(r)
         setRouteLine({ type: "LineString", coordinates: [toLngLat([userCoords.lat, userCoords.lng]), toLngLat([selected.latitude, selected.longitude])] }, true)
-        mapRef.current!.fitBounds(boundsOf([[userCoords.lat, userCoords.lng], [selected.latitude, selected.longitude]]), { padding: 60 })
+        fitPoints(mapRef.current!, [[userCoords.lat, userCoords.lng], [selected.latitude, selected.longitude]], 60)
       })
       .catch(() => {})
       .finally(() => setLoadingRoute(false))
@@ -610,7 +626,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     if (marker) {
       const prevAnim = animsRef.current[DRIVING_SELF_KEY]
       const t = prevAnim ? Math.min(1, (now - prevAnim.start) / prevAnim.duration) : 1
-      const currentPos: [number, number] = prevAnim ? lerpLatLng(prevAnim.from, prevAnim.to, t) : (() => { const p = marker.getLngLat(); return [p.lat, p.lng] })()
+      const currentPos: [number, number] = prevAnim ? lerpLatLng(prevAnim.from, prevAnim.to, t) : marker.getLatLng()
       const currentHeading = prevAnim ? lerpAngle(prevAnim.fromHeading, prevAnim.toHeading, t) : (markerHeadingsRef.current[DRIVING_SELF_KEY] ?? heading)
       animsRef.current[DRIVING_SELF_KEY] = {
         from: currentPos, to: pos, fromHeading: currentHeading, toHeading: heading,
@@ -618,15 +634,13 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       }
     } else {
       markerHeadingsRef.current[DRIVING_SELF_KEY] = heading
-      const m = new maplibregl.Marker({ element: makeCarEl(heading, { tracking: true, accent: accentColor }) })
-        .setLngLat(toLngLat(pos))
-        .setPopup(new maplibregl.Popup({ closeButton: false }).setText("You"))
-        .addTo(map)
+      const m = newMarker(map, makeCarEl(heading, { tracking: true, accent: accentColor }), pos)
+      m.setPopup("You")
       markersRef.current[DRIVING_SELF_KEY] = m
-      map.flyTo({ center: toLngLat(pos), zoom: 16 })
+      flyTo(map, pos, 16)
     }
     if (rafIdRef.current == null) rafIdRef.current = requestAnimationFrame(stepMarkerAnimations)
-    map.panTo(toLngLat(pos), { duration: 800 })
+    map.panTo(toLatLngLiteral(pos))
   }, [drivingSample, mode, accentColor, stepMarkerAnimations, mapReady])
 
   // ── "Start Driving" mode: pickup marker + route to the rider ───────────────
@@ -643,10 +657,8 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     }
 
     if (!drivingPickupMarkerRef.current) {
-      drivingPickupMarkerRef.current = new maplibregl.Marker({ element: makePickupEl() })
-        .setLngLat(toLngLat([drivingTo.pickupLat, drivingTo.pickupLng]))
-        .setPopup(new maplibregl.Popup({ closeButton: false }).setHTML(`<b>${drivingTo.partnerName}</b><br>${drivingTo.pickupLabel}`))
-        .addTo(map)
+      drivingPickupMarkerRef.current = newMarker(map, makePickupEl(), [drivingTo.pickupLat, drivingTo.pickupLng])
+      drivingPickupMarkerRef.current.setPopup(drivingTo.partnerName, drivingTo.pickupLabel)
     }
 
     if (!drivingSample) return
@@ -657,7 +669,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
     drivingLastRouteFetchRef.current = { pos: drivingSample.pos, time: performance.now() }
     setDrivingLoadingRoute(true)
-    fetchOSRMRoute(drivingSample.pos[0], drivingSample.pos[1], drivingTo.pickupLat, drivingTo.pickupLng).then(result => {
+    fetchRoute(drivingSample.pos[0], drivingSample.pos[1], drivingTo.pickupLat, drivingTo.pickupLng).then(result => {
       if (!mapRef.current || mode !== "driving") return
       if (result) {
         setRouteLine(result.geometry, false)
@@ -674,7 +686,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     const map = mapRef.current
     if (!map || mode !== "driving" || !drivingTo || !drivingSample || drivingFitOnceRef.current) return
     drivingFitOnceRef.current = true
-    map.fitBounds(boundsOf([drivingSample.pos, [drivingTo.pickupLat, drivingTo.pickupLng]]), { padding: 80 })
+    fitPoints(map, [drivingSample.pos, [drivingTo.pickupLat, drivingTo.pickupLng]], 80)
   }, [mode, drivingTo, drivingSample])
 
   // Clean up the self marker once driving mode ends.
@@ -689,27 +701,25 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     }
   }, [mode])
 
-  // ── "Where to?" search (Nominatim) ──────────────────────────────────────────
+  // ── "Where to?" search (Google geocoding, Nominatim fallback) ───────────────
   const runSearch = useCallback((q: string) => {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current)
     if (!q.trim()) { setSearchResults([]); return }
     searchDebounceRef.current = setTimeout(async () => {
       try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=5`, { headers: { "Accept-Language": "en" } })
-        setSearchResults(await res.json())
+        setSearchResults(await searchPlaces(q, userCoords))
       } catch { /* ignore */ }
     }, 350)
-  }, [])
+  }, [userCoords])
 
-  const selectSearchResult = useCallback((r: NominatimResult) => {
+  const selectSearchResult = useCallback((r: PlaceResult) => {
     const map = mapRef.current
-    setSearchText(r.display_name.split(",")[0])
+    setSearchText(r.label.split(",")[0])
     setSearchResults([])
-    const lat = parseFloat(r.lat), lng = parseFloat(r.lon)
     if (!map) return
     searchMarkerRef.current?.remove()
-    searchMarkerRef.current = new maplibregl.Marker({ element: makeDestEl() }).setLngLat([lng, lat]).addTo(map)
-    map.flyTo({ center: [lng, lat], zoom: 15 })
+    searchMarkerRef.current = newMarker(map, makeDestEl(), [r.lat, r.lng])
+    flyTo(map, [r.lat, r.lng], 15)
     setSheetExpanded(false)
   }, [])
 
@@ -717,8 +727,8 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const recenter = useCallback(() => {
     const map = mapRef.current
     if (!map) return
-    if (mode === "driving" && drivingSample) map.flyTo({ center: toLngLat(drivingSample.pos), zoom: 16 })
-    else if (userCoords) map.flyTo({ center: toLngLat([userCoords.lat, userCoords.lng]), zoom: 14 })
+    if (mode === "driving" && drivingSample) flyTo(map, drivingSample.pos, 16)
+    else if (userCoords) flyTo(map, [userCoords.lat, userCoords.lng], 14)
   }, [mode, drivingSample, userCoords])
 
   // ── Fare estimate from OSRM result ──────────────────────────────────────────
@@ -736,6 +746,11 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           over it. */}
       <div className="fixed inset-x-0 top-0 bottom-16 z-0 xl:relative xl:inset-auto xl:bottom-auto xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden bg-[#0e1626]">
         <div ref={containerRef} className="absolute inset-0 w-full h-full z-0" />
+        {mapUnavailable && (
+          <div className="absolute inset-0 z-[1] flex items-center justify-center bg-muted p-6 text-center text-sm text-muted-foreground">
+            The map couldn't be loaded. Check that MAP_API_KEY is set on the backend and the Maps JavaScript API is enabled for it.
+          </div>
+        )}
 
         {/* ── Floating header ── */}
         <div className="absolute top-4 left-4 right-4 z-10 flex items-center justify-between gap-3 pointer-events-none">
@@ -808,10 +823,10 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                 {searchResults.length > 0 ? (
                   <ul className="space-y-1">
                     {searchResults.map(r => (
-                      <li key={r.place_id}>
+                      <li key={r.id}>
                         <button onClick={() => selectSearchResult(r)} className="w-full text-left px-3 py-2.5 rounded-xl hover:bg-white/10 flex items-start gap-2.5">
                           <MapPin className="size-3.5 text-white/50 shrink-0 mt-0.5" />
-                          <span className="text-sm truncate">{r.display_name}</span>
+                          <span className="text-sm truncate">{r.detail}</span>
                         </button>
                       </li>
                     ))}
@@ -961,11 +976,6 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
         }
 
         /* Minimize the MapLibre attribution control to a small floating icon */
-        .maplibregl-ctrl-attrib { background: rgba(15,23,42,.55) !important; border-radius: 8px; }
-        .maplibregl-ctrl-attrib a { color: #cbd5e1 !important; }
-        .maplibregl-ctrl-top-left { top: 64px; }
-        .maplibregl-popup-content { background:#111a2e; color:#e2e8f0; border-radius:10px; font-size:12px; padding:8px 10px; }
-        .maplibregl-popup-tip { border-top-color:#111a2e !important; border-bottom-color:#111a2e !important; }
       `}</style>
     </div>
   )
