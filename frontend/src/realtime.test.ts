@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BASE, POLL_INTERVAL_MS, createRealtime, type WsMessage } from "./api";
+import { BASE, PENDING_POLL_INTERVAL_MS, POLL_INTERVAL_MS, createRealtime, type WsMessage } from "./api";
 
 // Under jsdom BASE is not localhost in these tests only if VITE_API_BASE_URL says
 // so; force the polling strategy explicitly so the test is environment-independent.
@@ -64,5 +64,22 @@ describe("polling real-time fallback", () => {
     state.connections = [conn("c1", "accepted")];
     await tick();
     expect(events).toEqual([]);
+  });
+});
+
+describe("adaptive polling", () => {
+  it("polls faster while a connection is pending, slower once settled", async () => {
+    const calls = () => (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([u]) => String(u).endsWith("/me/connections")).length;
+    const stop = createRealtime("u", () => {}).close;
+    await vi.advanceTimersByTimeAsync(0);
+    const start = calls();
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS * 2 + 10);
+    expect(calls() - start).toBeGreaterThanOrEqual(2);
+    state.connections = [conn("c1", "accepted")];
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS + 10);
+    const settled = calls();
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS * 2);
+    expect(calls()).toBe(settled);
+    stop();
   });
 });

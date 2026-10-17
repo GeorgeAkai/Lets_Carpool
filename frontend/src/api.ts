@@ -281,6 +281,9 @@ function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): W
 // behind the same `createRealtime` interface.
 
 export const POLL_INTERVAL_MS = 8000;
+// While a request is waiting on an answer, poll faster so accept/decline
+// shows up within seconds instead of up to POLL_INTERVAL_MS.
+export const PENDING_POLL_INTERVAL_MS = 3000;
 
 export type RealtimeStrategy = "websocket" | "polling";
 
@@ -296,6 +299,10 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
   let primed = false;
   let stopped = false;
   let running = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const nextDelay = () =>
+    [...statuses.values()].includes("pending") ? PENDING_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+  const schedule = () => { if (!stopped) timer = setTimeout(() => void poll().finally(schedule), nextDelay()); };
 
   const poll = async () => {
     if (stopped || running || document.hidden) return;
@@ -330,12 +337,11 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
     finally { running = false; }
   };
 
-  void poll();
-  const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+  void poll().finally(schedule);
   const onVisible = () => { if (!document.hidden) void poll(); };
   document.addEventListener("visibilitychange", onVisible);
   return {
-    close: () => { stopped = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); },
+    close: () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); },
   };
 }
 
