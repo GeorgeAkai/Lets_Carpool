@@ -15,7 +15,7 @@ def test_non_admin_cannot_reach_admin_routes() -> None:
 def test_admin_stats_and_user_list() -> None:
     c = client()
     _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
-    _, rider_headers = auth(c, "rider@example.com", "Rider")
+    _, rider_headers = auth(c, "passenger@example.com", "Rider")
 
     stats = c.get("/admin/stats", headers=admin_headers).json()
     assert stats["total_users"] == 2
@@ -23,13 +23,13 @@ def test_admin_stats_and_user_list() -> None:
     users = c.get("/admin/users", headers=admin_headers).json()
     assert users["total"] == 2
     emails = {u["email"] for u in users["users"]}
-    assert {"rider@example.com", ADMIN_EMAIL} == emails
+    assert {"passenger@example.com", ADMIN_EMAIL} == emails
 
 
 def test_suspend_locks_out_user_and_hides_listings() -> None:
     c = client()
     _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
-    rider, rider_headers = auth(c, "rider2@example.com", "Rider Two")
+    passenger, rider_headers = auth(c, "rider2@example.com", "Passenger Two")
 
     pickup = location(c, rider_headers, "Pickup", 37.0, -122.0)
     dest = location(c, rider_headers, "Dest", 37.5, -122.5)
@@ -48,9 +48,9 @@ def test_suspend_locks_out_user_and_hides_listings() -> None:
         headers=other_user_headers,
         params={"destination_latitude": 37.5, "destination_longitude": -122.5, "destination_radius_meters": 5000},
     ).json()
-    assert any(r["rider_id"] == rider["id"] for r in visible)
+    assert any(r["rider_id"] == passenger["id"] for r in visible)
 
-    suspend_resp = c.post(f"/admin/users/{rider['id']}/suspend", headers=admin_headers, json={"reason": "test"})
+    suspend_resp = c.post(f"/admin/users/{passenger['id']}/suspend", headers=admin_headers, json={"reason": "test"})
     assert suspend_resp.status_code == 200
     assert suspend_resp.json()["status"] == "suspended"
 
@@ -62,9 +62,9 @@ def test_suspend_locks_out_user_and_hides_listings() -> None:
         headers=other_user_headers,
         params={"destination_latitude": 37.5, "destination_longitude": -122.5, "destination_radius_meters": 5000},
     ).json()
-    assert not any(r["rider_id"] == rider["id"] for r in visible_after)
+    assert not any(r["rider_id"] == passenger["id"] for r in visible_after)
 
-    unsuspend_resp = c.post(f"/admin/users/{rider['id']}/unsuspend", headers=admin_headers)
+    unsuspend_resp = c.post(f"/admin/users/{passenger['id']}/unsuspend", headers=admin_headers)
     assert unsuspend_resp.status_code == 200
     assert unsuspend_resp.json()["status"] == "active"
     assert c.get("/me", headers=rider_headers).status_code == 200
@@ -104,7 +104,7 @@ def test_reports_queue_dismiss_and_block() -> None:
 def test_popular_destinations_and_active_routes() -> None:
     c = client()
     _, admin_headers = auth(c, ADMIN_EMAIL, "Admin")
-    _, rider_headers = auth(c, "rider3@example.com", "Rider Three")
+    _, rider_headers = auth(c, "rider3@example.com", "Passenger Three")
 
     pickup = location(c, rider_headers, "Pickup", 37.0, -122.0)
     dest = location(c, rider_headers, "SMF Airport", 38.6, -121.5)

@@ -18,7 +18,7 @@ export interface TripRoute {
   date: string
 }
 
-// A driver's active "go pick up this rider" navigation target — the rider's
+// A driver's active "go pick up this passenger" navigation target — the passenger's
 // pickup point is autodetected from their (now-revealed, post-acceptance)
 // ride request, so the driver never has to type an address in.
 export interface DrivingTarget {
@@ -27,6 +27,8 @@ export interface DrivingTarget {
   pickupLng: number
   pickupLabel: string
   partnerName: string
+  // Which leg is being navigated; the coordinates above are that leg's target.
+  kind?: "pickup" | "destination"
 }
 
 type OsrmResult = RouteGeometry
@@ -195,7 +197,7 @@ const MARKER_ANIM_DURATION_MS = 9200
 // nearby-driver dots use instead of a parallel implementation.
 const DRIVING_SELF_KEY = "__driving_self__"
 
-// Re-fetch the OSRM route to the rider only when the driver has moved enough
+// Re-fetch the OSRM route to the passenger only when the driver has moved enough
 // (or enough time has passed) to make a fresh route worth the request — an
 // Uber-style nav view doesn't need a new route on every single GPS tick.
 const DRIVING_ROUTE_REFRESH_METERS = 40
@@ -204,7 +206,7 @@ const DRIVING_ROUTE_REFRESH_MS = 20000
 // ── Marker DOM factories ─────────────────────────────────────────────────────
 // A top-down SVG car (nose pointing north at 0deg) that rotates to the
 // driver's heading, Uber-style, plus a pulsing halo while it's actively
-// "en route" toward the selected rider. The rotating wrapper must stay the
+// "en route" toward the selected passenger. The rotating wrapper must stay the
 // marker element's first child — stepMarkerAnimations() rotates that node.
 const CAR_SVG = `<svg viewBox="0 0 24 40" width="22" height="36" aria-hidden="true">
   <rect x="2" y="1.5" width="20" height="37" rx="7" fill="var(--carpool-accent)" stroke="#0b1220" stroke-width="1.5"/>
@@ -295,7 +297,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const [sharing, setSharing] = useState(false)
   const [watchId, setWatchId] = useState<number | null>(null)
 
-  // ── "Start Driving" navigation-to-rider mode ────────────────────────────────
+  // ── "Start Driving" navigation-to-passenger mode ────────────────────────────────
   const drivingPickupMarkerRef = useRef<DomMarker | null>(null)
   const drivingLastRouteFetchRef = useRef<{ pos: [number, number]; time: number } | null>(null)
   const drivingFitOnceRef = useRef(false)
@@ -497,7 +499,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   }, [])
 
   // ── Update driver markers (browse mode only) ────────────────────────────────
-  // The selected driver's heading is overridden to point straight at the rider
+  // The selected driver's heading is overridden to point straight at the passenger
   // (Uber-style "driver en route to you"), rather than its raw GPS heading.
   const trackingRef = useRef<Record<string, boolean>>({})
   useEffect(() => {
@@ -591,7 +593,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   useEffect(() => () => { if (watchId != null) navigator.geolocation.clearWatch(watchId) }, [watchId])
 
   // ── "Start Driving" mode: watch the driver's own live position ─────────────
-  // Autodetects the driver's real GPS position (the rider's pickup point is
+  // Autodetects the driver's real GPS position (the passenger's pickup point is
   // already known from their accepted ride request, so no address entry is
   // needed on either side) and streams it, Uber-nav style.
   useEffect(() => {
@@ -643,7 +645,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     map.panTo(toLatLngLiteral(pos))
   }, [drivingSample, mode, accentColor, stepMarkerAnimations, mapReady])
 
-  // ── "Start Driving" mode: pickup marker + route to the rider ───────────────
+  // ── "Start Driving" mode: pickup marker + route to the passenger ───────────────
   useEffect(() => {
     const map = mapRef.current
     if (!map || !mapReady) return
@@ -681,7 +683,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     }).finally(() => setDrivingLoadingRoute(false))
   }, [drivingTo, drivingSample, mode, mapReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // First fix while driving: fit both the driver and the rider on screen.
+  // First fix while driving: fit both the driver and the passenger on screen.
   useEffect(() => {
     const map = mapRef.current
     if (!map || mode !== "driving" || !drivingTo || !drivingSample || drivingFitOnceRef.current) return
@@ -757,7 +759,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           <div className="pointer-events-auto flex items-center gap-2 px-4 py-2 rounded-full bg-slate-900/75 text-white backdrop-blur-md shadow-lg min-w-0">
             {mode === "driving" ? <Car className="size-4 shrink-0" /> : mode === "trip" ? <Navigation className="size-4 shrink-0" /> : <MapPin className="size-4 shrink-0" />}
             <span className="text-sm font-medium truncate">
-              {mode === "driving" ? `Heading to ${drivingTo?.partnerName}` : mode === "trip" ? `Trip with ${tripRoute?.partnerName}` : "Live Map"}
+              {mode === "driving" ? (drivingTo?.kind === "destination" ? `Driving ${drivingTo.partnerName} to drop-off` : `Heading to ${drivingTo?.partnerName}`) : mode === "trip" ? `Trip with ${tripRoute?.partnerName}` : "Live Map"}
             </span>
           </div>
           <div className="pointer-events-auto flex items-center gap-2 shrink-0">

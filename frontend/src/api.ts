@@ -61,7 +61,7 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the trip; only set on corridor searches
+  // Minutes this passenger would add to the trip; only set on corridor searches
   // (search with both pickup and destination coordinates).
   detour_minutes?: number | null;
   departure_time?: string | null;        // "HH:MM:SS"
@@ -93,8 +93,12 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  // Minutes this passenger would add to the driver's trip; only set on driver-side proposals.
   detour_minutes?: number | null;
+  // Driver-side matches: metres from the passenger's pickup to the trip's route,
+  // and a 0-100 match score.
+  off_route_m?: number | null;
+  match_score?: number | null;
   departure_time?: string | null;
   rider_stats?: UserStats;
 };
@@ -114,6 +118,18 @@ export type ApiConnection = {
   driver_profile?: (ApiProfile & Partial<UserStats>) | null;
   my_rating?: number | null;
   rider_at_pickup_at?: string | null;
+  // Driver confirmed the passenger is in the car — the ride is en route.
+  picked_up_at?: string | null;
+  // Automatic fare: an estimate until the ride completes, then "paid".
+  fare?: ApiFare;
+};
+
+export type ApiFare = {
+  amount_cents: number;
+  currency: string;
+  distance_km: number;
+  passengers: number;
+  status: "estimated" | "paid";
 };
 
 export type ApiProfile = {
@@ -461,7 +477,7 @@ export function createDriverTrip(data: {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
 
-// "Each rider pays" while the driver is still filling in the form.
+// "Each passenger pays" while the driver is still filling in the form.
 export function previewTripPrice(pickupLocationId: string, destinationLocationId: string, seatsAvailable: number): Promise<TripPricing & { duration_minutes: number }> {
   return request("POST", "/driver-trips/price-preview", {
     pickup_location_id: pickupLocationId, destination_location_id: destinationLocationId, seats_available: seatsAvailable,
@@ -470,6 +486,26 @@ export function previewTripPrice(pickupLocationId: string, destinationLocationId
 
 export function cancelDriverTrip(tripId: string): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/cancel`);
+}
+
+export function pauseDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/pause`);
+}
+
+export function resumeDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/resume`);
+}
+
+export type DriverTripEdit = {
+  target_date?: string;
+  flexibility?: string;
+  seats_available?: number;
+  departure_time?: string | null;
+  notes?: string | null;
+};
+
+export function updateDriverTrip(tripId: string, edit: DriverTripEdit): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("PATCH", `/driver-trips/${tripId}`, edit);
 }
 
 export function getMyDriverTrips(): Promise<ApiDriverTrip[]> {
@@ -539,6 +575,10 @@ export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: num
 
 export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
   return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function getDriverTripMatches(driverTripId: string): Promise<ApiRideRequest[]> {
+  return request<ApiRideRequest[]>("GET", `/driver-trips/${driverTripId}/matches`);
 }
 
 export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
@@ -665,6 +705,8 @@ export function rateConnection(connectionId: string, stars: number, comment?: st
 export type TripDayStatus = {
   connection_id: string;
   pickup: { label: string; latitude: number; longitude: number };
+  destination: { label: string; latitude: number; longitude: number };
+  picked_up_at: string | null;
   departure_time: string | null;
   driver: { latitude: number; longitude: number; updated_at: string; distance_to_pickup_m: number; eta_minutes: number } | null;
   rider_at_pickup_at: string | null;
@@ -672,6 +714,10 @@ export type TripDayStatus = {
 
 export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {
   return request("GET", `/connections/${connectionId}/live`);
+}
+
+export function markPickedUp(connectionId: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/picked-up`);
 }
 
 export function markAtPickup(connectionId: string): Promise<ApiConnection> {

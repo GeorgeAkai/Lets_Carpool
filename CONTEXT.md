@@ -4,7 +4,7 @@ This document is the working product and architecture context for the Carpool ap
 
 ## Product Goal
 
-Carpool helps riders and drivers find each other for shared rides to similar destinations. The MVP focuses on general user-facing marketplace behavior: authentication, profiles, ride/trip listings, search, connections, chat coordination, and gas split confirmation.
+Carpool helps passengers and drivers find each other for shared rides to similar destinations. The MVP focuses on general user-facing marketplace behavior: authentication, profiles, ride/trip listings, search, connections, chat coordination, and gas split confirmation.
 
 The MVP is not trying to solve full trust, payments, live safety tracking, AI matching, or specialized logistics workflows yet.
 
@@ -12,27 +12,26 @@ The MVP is not trying to solve full trust, payments, live safety tracking, AI ma
 
 In scope:
 
-- Users sign in, create a profile, and can act as both rider and driver.
-- Each session, a user picks an explicit mode (rider or driver) that gates the Discover feed and its primary actions; switchable anytime from Profile.
-- Riders publish ride requests.
+- Users sign in, create a profile, and can act as both passenger and driver.
+- Each session, a user picks an explicit mode (passenger or driver) that gates the Discover feed and its primary actions; switchable anytime from Profile.
+- Passengers publish ride requests.
 - Drivers publish driver trips.
 - Either side can browse relevant opposite-side listings, with manual filters for date, tag, seats, car type, and luggage size.
-- Either side can initiate a connection manually. Riders with an open request (and drivers with an open trip) are also shown a system-proposed best match they can request/offer or skip. See Proposed Matches.
+- Either side can initiate a connection manually. Passengers with an open request (and drivers with an open trip) are also shown a system-proposed best match they can request/offer or skip. See Proposed Matches.
 - Users coordinate through a limited pending chat flow and full chat after acceptance, delivered in real time over WebSocket.
 - Users can confirm a gas split in app, while payment happens outside the app.
 - Drivers provide self-declared vehicle and driving eligibility information.
 - Listings support lightweight tags: `airport`, `student`, `church`, `college`, `work`, `event`.
-- Organizers can publish one-off group trips ("Pools") that riders join directly, alongside the primary request/trip/connection flow. See Group Trips (Pools).
-- Once a connection is accepted, drivers can start live, GPS-based navigation to the rider's pickup point, with a routed map, dynamically-refreshing ETA/distance, and a live position shared with the rider. See Live Location & Navigation.
+- Organizers can publish one-off group trips ("Pools") that passengers join directly, alongside the primary request/trip/connection flow. See Group Trips (Pools).
+- Once a connection is accepted, drivers can start live, GPS-based navigation to the passenger's pickup point, with a routed map, dynamically-refreshing ETA/distance, and a live position shared with the passenger. See Live Location & Navigation.
 - Basic admin moderation tooling: suspend/unsuspend users, send warnings, review and action reports, remove listings, and an audit log. See Admin & Moderation.
 
 Out of scope for MVP:
 
 - Full ID, insurance, or driving record verification.
-- In-app payments, card storage, refunds, or payment disputes.
+- Real card processing, card storage, refunds, or payment disputes. (The automatic fare is marked paid in-app when a ride completes; no money moves yet. See Fare & Payment Confirmation.)
 - SOS or emergency workflows.
-- Live tracking beyond the pickup leg of an already-accepted connection — no background tracking for the full ride, and no tracking outside an active "Start Driving" session.
-- Ratings and reviews.
+- Background tracking outside an active "Start Driving" session. Live position sharing covers the pickup leg and, once the driver confirms the passenger is on board, the leg to the drop-off — only while the driver is navigating.
 - AI/ML-based matching, dynamic pricing, or flight alerts. (Car type and luggage size are supported today only as self-declared fields and manual search filters, not automated matching.)
 - Moving help. This is not a carpool use case for the MVP.
 - Recurring carpools. Pools are one-off group trips (a single `trip_date`), not recurring series.
@@ -52,14 +51,14 @@ Provider responses should not become the source of truth. Persist normalized app
 - `User`: authenticated account. A single user can ride or drive.
 - `Profile`: user-facing identity details: display name, profile photo, short bio, verified email/domain.
 - `Vehicle`: driver-owned vehicle details and self-declared eligibility information.
-- `RideRequest`: a rider's request for a ride.
+- `RideRequest`: a passenger's request for a ride.
 - `DriverTrip`: a driver's planned trip with available seats.
 - `Connection`: an initiated relationship between one ride request and one driver trip.
 - `ChatThread`: conversation attached to a connection.
 - `Message`: chat content within a thread.
 - `GasSplitConfirmation`: confirmed gas split amount and metadata.
 - `Notification`: in-app or email notification for important marketplace events.
-- `Pool`: an organizer-created, one-off group trip (community tag, date, departure time, pickup/destination, capacity) that riders join directly. See Group Trips (Pools).
+- `Pool`: an organizer-created, one-off group trip (community tag, date, departure time, pickup/destination, capacity) that passengers join directly. See Group Trips (Pools).
 - `PoolMembership` / `PoolMessage`: a joined user's membership in a pool, and chat content within a pool.
 - `DriverLocation`: a driver's latest live lat/lng/heading/speed, used both for nearby-driver browsing and for live navigation to a pickup.
 - `Report`: a user-filed report against another user, reviewed and actioned by an admin.
@@ -68,14 +67,14 @@ Provider responses should not become the source of truth. Persist normalized app
 
 The MVP is two-sided:
 
-- Riders create `RideRequest` listings.
+- Passengers create `RideRequest` listings.
 - Drivers create `DriverTrip` listings.
 
 Both are first-class marketplace objects. This decision may be revisited later if the team decides to move toward suggestions-only matching, but the MVP should support symmetric manual discovery and initiation.
 
 Listings are one-off ride occurrences only. Do not model recurring rides in the MVP.
 
-Alongside this two-sided model, `Pool` is a separate, simpler group-trip listing: an organizer publishes it directly (no opposite-side match needed), and riders join or leave up to `max_participants` without an accept/decline handshake. Pools do not go through `Connection`. See Group Trips (Pools).
+Alongside this two-sided model, `Pool` is a separate, simpler group-trip listing: an organizer publishes it directly (no opposite-side match needed), and passengers join or leave up to `max_participants` without an accept/decline handshake. Pools do not go through `Connection`. See Group Trips (Pools).
 
 ## Time Model
 
@@ -107,10 +106,20 @@ Before a connection is accepted, show approximate area/place labels rather than 
 
 Drivers can opt in to sharing a live GPS position (`DriverLocation`: lat/lng/heading/speed), used in two ways:
 
-- **Nearby-driver browsing**: riders in browse mode see nearby sharing drivers as animated markers on the map, polled periodically.
-- **"Start Driving" pickup navigation**: once a connection is `accepted`, the driver can start navigation to the rider's (now-revealed) pickup point. The map draws a routed line to the pickup, and the ETA/distance panel refreshes as the driver moves — enough movement or elapsed time triggers a fresh route, not every GPS tick. The driver ends this by marking arrival.
+- **Nearby-driver browsing**: passengers in browse mode see nearby sharing drivers as animated markers on the map, polled periodically.
+- **"Start Driving" pickup navigation**: once a connection is `accepted`, the driver can start navigation to the passenger's (now-revealed) pickup point. The map draws a routed line to the pickup, and the ETA/distance panel refreshes as the driver moves — enough movement or elapsed time triggers a fresh route, not every GPS tick. The driver ends this by marking arrival.
 
 This is scoped to the pickup leg of one accepted connection, not a standing background service or full-ride tracking, and it is distinct from SOS/emergency journey sharing, which remains out of scope.
+
+## Fare & Payment Confirmation
+
+The passenger never types a gas amount. The fare is calculated automatically from the passenger's pickup → destination distance (gas cost per passenger × party size) and shown as `fare` on every connection: `estimated` until the ride completes, then `paid`. Completing a ride records the fare (a `GasSplitConfirmation` with `method: auto_fare`) and notifies both sides ("Payment processed" / "Payment received"). This is a confirmation, not a processor — no card is charged.
+
+After completion both people are prompted to rate each other (1–5 stars); the ride moves to past trips in My Rides.
+
+## Trip Lifecycle on the Day
+
+`accepted` → passenger checks in at pickup (optional) → driver taps "in the car" (`picked_up_at`, the ride is en route; the destination route shows for both) → driver marks complete. The passenger's trip-day screen shows a live "car approaching" Google Map, then the route to the destination.
 
 ## Matching and Search
 
@@ -121,14 +130,14 @@ MVP search is based on tight endpoint matching:
 - Authenticated users search the opposite listing type.
 - Search filters can include destination radius, date/flexibility, tag, pickup proximity, car type, and luggage size. These are exact-match filters over self-declared fields, not ML-based matching.
 
-Driver trips store their OSRM route, and rider searches that carry both a pickup and destination match on a direction-aware 1000 m route corridor, returning `detour_minutes` (see `docs/adr/0001-proposed-matches-on-route-corridor.md`). Trips without a stored route fall back to the endpoint-radius filters above.
+Driver trips store their OSRM route, and passenger searches that carry both a pickup and destination match on a direction-aware 1000 m route corridor, returning `detour_minutes` (see `docs/adr/0001-proposed-matches-on-route-corridor.md`). Trips without a stored route fall back to the endpoint-radius filters above.
 
 ## Connection Flow
 
 Connections are symmetric and initiated by a person (a proposal is only a suggestion; accepting it creates a normal connection):
 
-- A rider can request to join a driver trip.
-- A driver can offer a ride on a rider request.
+- A passenger can request to join a driver trip.
+- A driver can offer a ride on a passenger request.
 - The other party accepts or declines.
 
 Connection states:
@@ -144,9 +153,9 @@ Pending connections should expire if nobody responds before the relevant ride da
 
 ## Proposed Matches
 
-- A rider with an open `RideRequest` is shown one **proposed match**: the best open `DriverTrip` on their route corridor, ranked by detour, then date/flexibility. Trips with too few free seats, more than a day off, already skipped, or already connected to that request are never proposed.
-- The rider **requests** it (a normal `pending` `Connection` the driver accepts/declines) or **skips** it (recorded per request in `match_skips`; the next-best is proposed).
-- Drivers get the mirror image for an open `DriverTrip`: the best open `RideRequest` along their route (both points in the corridor, destination ahead of pickup, enough seats for the passenger count). They **offer a ride** (a driver-initiated `pending` `Connection`) or **skip** it (`driver_match_skips`). Rider and driver skips are independent.
+- A passenger with an open `RideRequest` is shown one **proposed match**: the best open `DriverTrip` on their route corridor, ranked by detour, then date/flexibility. Trips with too few free seats, more than a day off, already skipped, or already connected to that request are never proposed.
+- The passenger **requests** it (a normal `pending` `Connection` the driver accepts/declines) or **skips** it (recorded per request in `match_skips`; the next-best is proposed).
+- Drivers get the mirror image for an open `DriverTrip`: the best open `RideRequest` along their route (both points in the corridor, destination ahead of pickup, enough seats for the passenger count). They **offer a ride** (a driver-initiated `pending` `Connection`) or **skip** it (`driver_match_skips`). Passenger and driver skips are independent.
 - There is no `proposed` connection state.
 
 Gas split confirmation is separate from connection state. Do not add payment or split states directly into the connection state machine.
@@ -165,12 +174,13 @@ The reason is product safety: users need enough communication to coordinate flex
 Listing states:
 
 - `open`
+- `paused` (driver trips only)
 - `expired`
 - `matched`
 - `cancelled`
 - `completed`
 
-Use automatic expiry after the target date/flexibility window has passed. Avoid `draft` and `paused` in MVP unless a later product decision explicitly adds them.
+Use automatic expiry after the target date/flexibility window has passed. `draft` is not used. Driver trips can be `paused` (hidden from search and proposals, existing bookings kept; resumable), edited (date, flexibility, seats, note — not the route) or cancelled from Discover and My Rides.
 
 ## Seats and Passenger Count
 
@@ -181,6 +191,8 @@ Ride requests declare passenger count.
 Accepted connections reserve seats and must prevent overbooking. If one driver trip accepts multiple ride requests, available seats must decrement consistently.
 
 ## Gas Split
+
+(Superseded for the passenger flow by Fare & Payment Confirmation; the suggestion endpoint is still the fare calculator.)
 
 The product should use "confirm split" language, not "sign agreement."
 
@@ -267,11 +279,11 @@ A `Pool` is an organizer-published, one-off group trip, separate from the `RideR
 - A pool has its own group chat (`PoolMessage`), separate from the pending/accepted-gated `ChatThread` model used for connections.
 - Pool status: `open`, `full`, `cancelled`, `completed`. It fills automatically once membership hits `max_participants`, and reopens if a member leaves a full pool.
 
-Use this model for organized/community group trips (e.g. an event or campus group going to the same place); use the `RideRequest`/`DriverTrip`/`Connection` flow for one-to-one rider/driver matching.
+Use this model for organized/community group trips (e.g. an event or campus group going to the same place); use the `RideRequest`/`DriverTrip`/`Connection` flow for one-to-one passenger/driver matching.
 
 ## Key Invariants
 
-- A user can be both rider and driver, but picks one mode per session for the Discover feed.
+- A user can be both passenger and driver, but picks one mode per session for the Discover feed.
 - A listing represents exactly one planned ride occurrence.
 - Exact geocoded points are stored, but precise locations should be revealed carefully.
 - Search uses endpoint radius matching first, not route-corridor matching.
@@ -279,8 +291,7 @@ Use this model for organized/community group trips (e.g. an event or campus grou
 - Accepted connections reserve driver seats.
 - Live position tracking is scoped to the pickup leg of one accepted connection (the driver's "Start Driving" session), not a standing background service or full-ride tracking.
 - A `Pool` is joined directly (no accept/decline) and is not modeled as a `Connection`.
-- Gas split confirmation is not payment.
-- "Confirm split" is the product term; avoid "sign agreement."
+- The fare is calculated by the app; passengers do not enter or negotiate an amount. Paid status is in-app only until a payment processor exists.
 - Security/trust features should not be quietly pulled into MVP unless explicitly reprioritized — the admin/moderation tooling that exists today (suspend, warn, report review, audit log) was an explicit, scoped exception, not a precedent for e.g. ID verification or SOS.
 
 ## Revisit Candidates

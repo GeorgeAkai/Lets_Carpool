@@ -2,7 +2,7 @@
 
 Connecting people to save gas and money.
 
-A two-sided carpool marketplace MVP. Riders publish ride requests, drivers publish trips, and either side can search, connect, coordinate in chat, and confirm a gas split.
+A two-sided carpool marketplace MVP. Passengers publish ride requests, drivers publish trips, and either side can search, connect, coordinate in chat, and confirm a gas split.
 
 For product scope and domain language, see [`CONTEXT.md`](CONTEXT.md). For implementation slices, see [`ISSUES.md`](ISSUES.md).
 

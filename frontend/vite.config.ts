@@ -13,7 +13,7 @@ export default defineConfig({
       manifest: {
         name: "Let's Carpool",
         short_name: "Carpool",
-        description: "Connect with drivers and riders near you. Split gas costs and travel smarter.",
+        description: "Connect with drivers and passengers near you. Split gas costs and travel smarter.",
         start_url: "/",
         scope: "/",
         display: "standalone",

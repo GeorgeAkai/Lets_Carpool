@@ -114,7 +114,7 @@ def location(client: TestClient, headers: dict[str, str], label: str, lat: float
 def make_request_and_trip(
     client: TestClient, passenger_count: int = 2, seats_available: int = 2
 ) -> tuple[dict, dict[str, str], dict, dict[str, str], dict, dict]:
-    rider, rider_headers = auth(client, "rider@example.edu", "Riley Rider")
+    passenger, rider_headers = auth(client, "passenger@example.edu", "Riley Passenger")
     driver, driver_headers = auth(client, "driver@example.com", "Dee Driver")
     pickup = location(client, rider_headers, "1 Main St, Berkeley, CA", 37.8715, -122.2730)
     destination = location(client, rider_headers, "SFO Terminal 2, San Francisco, CA", 37.6213, -122.3790)
@@ -143,7 +143,7 @@ def make_request_and_trip(
             "tags": ["airport"],
         },
     ).json()
-    return rider, rider_headers, driver, driver_headers, ride_request, driver_trip
+    return passenger, rider_headers, driver, driver_headers, ride_request, driver_trip
 
 
 def test_healthcheck_reports_postgres_backed_database() -> None:
@@ -324,16 +324,16 @@ def test_riders_and_drivers_publish_searchable_one_off_listings() -> None:
     # Search/listing cards must show the actual poster's name, not a generic
     # "Driver"/"Rider" placeholder.
     assert trips[0]["driver_name"] == "Dee Driver"
-    assert requests[0]["rider_name"] == "Riley Rider"
+    assert requests[0]["rider_name"] == "Riley Passenger"
 
 
 def test_driver_trips_and_ride_requests_carry_an_optional_free_text_note() -> None:
     # Lets a driver write "Heading to SFO, anyone going the same way?" or a
-    # rider write "Need a ride Friday morning, one small bag" on their own
+    # passenger write "Need a ride Friday morning, one small bag" on their own
     # listing — free text alongside the structured fields, not a replacement
     # for them.
     api = client()
-    _, rider_headers = auth(api, "notes-rider@example.edu", "Nora Rider")
+    _, rider_headers = auth(api, "notes-passenger@example.edu", "Nora Passenger")
     _, driver_headers = auth(api, "notes-driver@example.com", "Dana Driver")
     pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
     destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
@@ -387,7 +387,7 @@ def test_driver_trips_and_ride_requests_carry_an_optional_free_text_note() -> No
 
 def test_search_excludes_the_searching_users_own_listings() -> None:
     # Discover is meant to surface *other* people's rides. Without an
-    # explicit self-exclusion clause, a driver's own trip (or a rider's own
+    # explicit self-exclusion clause, a driver's own trip (or a passenger's own
     # request) would show up in their own feed alongside everyone else's —
     # "My Listings" is the dedicated place to manage your own posts.
     api = client()
@@ -402,12 +402,12 @@ def test_search_excludes_the_searching_users_own_listings() -> None:
 
 def test_search_excludes_listings_with_a_past_target_date() -> None:
     # Search must never show a stale listing on its own, regardless of
-    # whether the hourly expire sweep has run yet — a driver/rider shouldn't
+    # whether the hourly expire sweep has run yet — a driver/passenger shouldn't
     # see (or be offered) a ride for a date that's already passed. Use a date
     # unambiguously outside the 1-day timezone-safety grace period (see the
     # next test for why exactly "yesterday" is deliberately still visible).
     api = client()
-    _, rider_headers = auth(api, "past-rider@example.edu", "Past Rider")
+    _, rider_headers = auth(api, "past-passenger@example.edu", "Past Passenger")
     _, driver_headers = auth(api, "past-driver@example.com", "Past Driver")
     pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
     destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
@@ -445,12 +445,12 @@ def test_search_excludes_listings_with_a_past_target_date() -> None:
 
 def test_search_keeps_yesterdays_listings_visible_as_a_timezone_safety_buffer() -> None:
     # Regression test: a listing dated "yesterday" by the DB server's (UTC)
-    # clock can still be "today" for a rider/driver west of UTC — which is
+    # clock can still be "today" for a passenger/driver west of UTC — which is
     # every US timezone. Without this buffer, refreshing the page in the
     # evening could make a same-day listing vanish (and get archived) purely
     # from a UTC-vs-local date mismatch, not because it actually expired.
     api = client()
-    _, rider_headers = auth(api, "tz-rider@example.edu", "TZ Rider")
+    _, rider_headers = auth(api, "tz-passenger@example.edu", "TZ Passenger")
     _, driver_headers = auth(api, "tz-driver@example.com", "TZ Driver")
     pickup = location(api, rider_headers, "Cambridge", 42.3736, -71.1097)
     destination = location(api, rider_headers, "Providence, RI", 41.8240, -71.4128)
@@ -538,7 +538,7 @@ def test_nearby_drivers_excludes_locations_outside_the_radius() -> None:
 
 def test_expire_endpoints_reject_a_regular_signed_in_user() -> None:
     api = client()
-    _, rider_headers = auth(api, "rider3@example.edu", "Riley Rider")
+    _, rider_headers = auth(api, "rider3@example.edu", "Riley Passenger")
 
     for path in ("/ride-requests/expire", "/driver-trips/expire", "/connections/expire"):
         response = api.post(path, headers=rider_headers, json={"today": date.today().isoformat()})
@@ -564,7 +564,7 @@ def test_expire_endpoints_reject_missing_or_wrong_cron_secret() -> None:
 
 def test_cron_expire_sweeps_both_listings_and_connections_with_the_shared_secret() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
     api.post(
         "/connections",
         headers=rider_headers,
@@ -579,7 +579,7 @@ def test_cron_expire_sweeps_both_listings_and_connections_with_the_shared_secret
 
 def test_listings_can_be_cancelled_and_expired_out_of_discovery() -> None:
     api = client()
-    _, rider_headers = auth(api, "rider@example.com", "Rider")
+    _, rider_headers = auth(api, "passenger@example.com", "Rider")
     pickup = location(api, rider_headers, "A, Berkeley, CA", 37.87, -122.27)
     destination = location(api, rider_headers, "B, Oakland, CA", 37.80, -122.27)
     request = api.post(
@@ -607,7 +607,7 @@ def test_listings_can_be_cancelled_and_expired_out_of_discovery() -> None:
 
 def test_connection_chat_gas_split_notifications_completion_and_seat_reservation() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
 
     connection = api.post(
         "/connections",
@@ -659,7 +659,7 @@ def test_connection_chat_gas_split_notifications_completion_and_seat_reservation
     assert completed["status"] == "completed"
     assert {n["type"] for n in driver_notifications} >= {"connection_received", "chat_message", "gas_split_confirmed"}
     assert {n["type"] for n in rider_notifications} >= {"connection_accepted", "chat_unlocked"}
-    assert rider["id"] != driver["id"]
+    assert passenger["id"] != driver["id"]
 
     by_type = {n["type"]: n for n in driver_notifications}
     assert by_type["connection_received"]["related_id"] == connection["id"]
@@ -669,7 +669,7 @@ def test_connection_chat_gas_split_notifications_completion_and_seat_reservation
 
 def test_rider_can_update_pickup_address_once_connection_is_accepted() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
 
     connection = api.post(
         "/connections",
@@ -701,12 +701,12 @@ def test_rider_can_update_pickup_address_once_connection_is_accepted() -> None:
     assert accepted_conn["ride_request"]["pickup"]["label"] == "123 Telegraph Ave, Berkeley, CA"
     assert forbidden.status_code == 403
     assert missing_location.status_code == 404
-    assert rider["id"] != driver["id"]
+    assert passenger["id"] != driver["id"]
 
 
 def test_notifications_mark_all_read_and_dismiss() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
 
     api.post(
         "/connections",
@@ -734,7 +734,7 @@ def test_notifications_mark_all_read_and_dismiss() -> None:
 
 def test_cannot_dismiss_another_users_notification() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(api)
 
     api.post(
         "/connections",
@@ -758,7 +758,7 @@ def test_public_profile_exposes_icebreaker_fields() -> None:
         headers=driver_headers,
         json={"display_name": "Dee Driver", "interests": ["Afrobeat", "Coffee"], "nationality": "Kenyan"},
     )
-    rider, rider_headers = auth(client=api, email="rider2@example.edu", name="Riley Rider")
+    passenger, rider_headers = auth(client=api, email="rider2@example.edu", name="Riley Passenger")
 
     response = api.get(f"/users/{driver['id']}/profile", headers=rider_headers)
     assert response.status_code == 200
@@ -824,7 +824,7 @@ def test_driver_offer_happy_path_can_be_accepted_and_completed() -> None:
 def test_driver_trip_cannot_be_overbooked() -> None:
     api = client()
     _, rider_headers, _, driver_headers, ride_request, driver_trip = make_request_and_trip(api, passenger_count=2, seats_available=3)
-    second_rider, second_headers = auth(api, "rider2@example.com", "Second Rider")
+    second_rider, second_headers = auth(api, "rider2@example.com", "Second Passenger")
     pickup = location(api, second_headers, "2 Main St, Berkeley, CA", 37.8716, -122.2731)
     destination = location(api, second_headers, "SFO Terminal 2, San Francisco, CA", 37.6213, -122.3790)
     second_request = api.post(
@@ -999,12 +999,12 @@ def post_trip(api: TestClient, headers: dict, pickup: dict, destination: dict) -
 
 
 def test_corridor_search_matches_riders_along_the_route_in_the_same_direction() -> None:
-    # Driver goes Oakland → San Jose (roughly south-east along I-880). A rider
+    # Driver goes Oakland → San Jose (roughly south-east along I-880). A passenger
     # in Fremont heading to Milpitas is on the corridor; the opposite-direction
-    # rider (Milpitas → Fremont) and a rider far off the route must not match.
+    # passenger (Milpitas → Fremont) and a passenger far off the route must not match.
     router = FakeRouter()
     api = corridor_client(router)
-    _, rider_headers = auth(api, "corr-rider@example.edu", "Cora Rider")
+    _, rider_headers = auth(api, "corr-passenger@example.edu", "Cora Passenger")
     _, driver_headers = auth(api, "corr-driver@example.com", "Cal Driver")
     oakland = location(api, driver_headers, "Oakland, CA", 37.8044, -122.2712)
     san_jose = location(api, driver_headers, "San Jose, CA", 37.3382, -121.8863)
@@ -1033,13 +1033,13 @@ def test_corridor_search_matches_riders_along_the_route_in_the_same_direction() 
 def test_corridor_search_reports_detour_minutes_for_off_route_pickups() -> None:
     router = FakeRouter()
     api = corridor_client(router)
-    _, rider_headers = auth(api, "det-rider@example.edu", "Dina Rider")
+    _, rider_headers = auth(api, "det-passenger@example.edu", "Dina Passenger")
     _, driver_headers = auth(api, "det-driver@example.com", "Dev Driver")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
     post_trip(api, driver_headers, a, b)
 
-    # Rider ~890 m north of the line (inside the 1000 m buffer), mid-route: the
+    # Passenger ~890 m north of the line (inside the 1000 m buffer), mid-route: the
     # insertion route is longer than the direct one, so detour is > 0.
     trips = api.get(
         "/driver-trips/search", headers=rider_headers,
@@ -1050,13 +1050,13 @@ def test_corridor_search_reports_detour_minutes_for_off_route_pickups() -> None:
     ).json()
     assert len(trips) == 1
     assert trips[0]["detour_minutes"] > 0
-    # driver pickup → rider pickup → rider destination → driver destination
+    # driver pickup → passenger pickup → passenger destination → driver destination
     assert len(router.calls[-1]) == 4
 
 
 def test_trips_without_a_stored_route_fall_back_to_endpoint_radius_matching() -> None:
     # No router configured (or OSRM down at creation): the trip has no
-    # route_geog, and a rider search with both points still finds it through the
+    # route_geog, and a passenger search with both points still finds it through the
     # old pickup/destination radius rules instead of silently excluding it.
     api = client()
     _, rider_headers, _, _, _, driver_trip = make_request_and_trip(api)
@@ -1087,7 +1087,7 @@ def test_corridor_search_results_never_expose_coordinates_or_route_data() -> Non
     # Detour/ETA is computed server-side from stored lat/lng; the pre-connection
     # response must carry only the derived number, not exact pins or the route.
     api = corridor_client(FakeRouter())
-    _, rider_headers = auth(api, "priv-rider@example.edu", "Pia Rider")
+    _, rider_headers = auth(api, "priv-passenger@example.edu", "Pia Passenger")
     _, driver_headers = auth(api, "priv-driver@example.com", "Pat Driver")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
@@ -1111,8 +1111,8 @@ def test_corridor_search_results_never_expose_coordinates_or_route_data() -> Non
 # ─── Proposed matches (Empower-style) ─────────────────────────────────────────
 
 def make_rider_request(api: TestClient, headers: dict, pickup: tuple[float, float], dest: tuple[float, float]) -> dict:
-    p = location(api, headers, "Rider pickup", *pickup)
-    d = location(api, headers, "Rider dest", *dest)
+    p = location(api, headers, "Passenger pickup", *pickup)
+    d = location(api, headers, "Passenger dest", *dest)
     response = api.post(
         "/ride-requests", headers=headers,
         json={
@@ -1127,11 +1127,11 @@ def make_rider_request(api: TestClient, headers: dict, pickup: tuple[float, floa
 
 def test_proposal_is_the_lowest_detour_trip_and_skipping_advances_to_the_next() -> None:
     api = corridor_client(FakeRouter())
-    _, rider_headers = auth(api, "prop-rider@example.edu", "Pru Rider")
+    _, rider_headers = auth(api, "prop-passenger@example.edu", "Pru Passenger")
     _, near_headers = auth(api, "prop-near@example.com", "Near Driver")
     _, far_headers = auth(api, "prop-far@example.com", "Far Driver")
 
-    # Two trips sharing the corridor; the rider sits on the first one's line and
+    # Two trips sharing the corridor; the passenger sits on the first one's line and
     # ~890 m off the second's, so the first has the smaller detour.
     a1 = location(api, near_headers, "A1", 37.0, -122.0)
     b1 = location(api, near_headers, "B1", 37.0, -121.98)
@@ -1165,7 +1165,7 @@ def test_proposal_is_the_lowest_detour_trip_and_skipping_advances_to_the_next() 
 
 def test_accepting_a_proposal_uses_the_normal_connection_flow_and_stops_reproposing_it() -> None:
     api = corridor_client(FakeRouter())
-    _, rider_headers = auth(api, "acc-rider@example.edu", "Ada Rider")
+    _, rider_headers = auth(api, "acc-passenger@example.edu", "Ada Passenger")
     _, driver_headers = auth(api, "acc-driver@example.com", "Abe Driver")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
@@ -1183,7 +1183,7 @@ def test_accepting_a_proposal_uses_the_normal_connection_flow_and_stops_repropos
 
 def test_only_the_rider_can_get_or_skip_proposals_for_their_request() -> None:
     api = corridor_client(FakeRouter())
-    _, rider_headers = auth(api, "own-rider@example.edu", "Olga Rider")
+    _, rider_headers = auth(api, "own-passenger@example.edu", "Olga Passenger")
     _, other_headers = auth(api, "own-other@example.com", "Otto Other")
     rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
     assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=other_headers).status_code == 403
@@ -1194,7 +1194,7 @@ def test_only_the_rider_can_get_or_skip_proposals_for_their_request() -> None:
 
 def test_proposals_skip_trips_without_enough_free_seats() -> None:
     api = corridor_client(FakeRouter())
-    _, rider_headers = auth(api, "seat-rider@example.edu", "Sia Rider")
+    _, rider_headers = auth(api, "seat-passenger@example.edu", "Sia Passenger")
     _, driver_headers = auth(api, "seat-driver@example.com", "Sam Driver")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
@@ -1212,13 +1212,13 @@ def test_proposals_skip_trips_without_enough_free_seats() -> None:
     assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"] is None
 
 
-# ─── Proposed riders (driver side) ────────────────────────────────────────────
+# ─── Proposed passengers (driver side) ────────────────────────────────────────────
 
 def test_driver_is_proposed_the_lowest_detour_rider_and_skipping_advances() -> None:
     api = corridor_client(FakeRouter())
     _, driver_headers = auth(api, "dp-driver@example.com", "Dora Driver")
-    _, near_headers = auth(api, "dp-near@example.edu", "Near Rider")
-    _, far_headers = auth(api, "dp-far@example.edu", "Far Rider")
+    _, near_headers = auth(api, "dp-near@example.edu", "Near Passenger")
+    _, far_headers = auth(api, "dp-far@example.edu", "Far Passenger")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
     trip = post_trip(api, driver_headers, a, b)
@@ -1226,7 +1226,7 @@ def test_driver_is_proposed_the_lowest_detour_rider_and_skipping_advances() -> N
     near = make_rider_request(api, near_headers, (37.0, -121.995), (37.0, -121.985))      # on the line
     far = make_rider_request(api, far_headers, (37.008, -121.995), (37.008, -121.985))    # ~890 m off
     # Opposite direction on the same road: never proposed.
-    _, back_headers = auth(api, "dp-back@example.edu", "Back Rider")
+    _, back_headers = auth(api, "dp-back@example.edu", "Back Passenger")
     make_rider_request(api, back_headers, (37.0, -121.985), (37.0, -121.995))
 
     first = api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()
@@ -1240,15 +1240,36 @@ def test_driver_is_proposed_the_lowest_detour_rider_and_skipping_advances() -> N
     second = api.get(f"/driver-trips/{trip['id']}/proposal", headers=driver_headers).json()
     assert second["request"]["id"] == far["id"] and second["remaining"] == 0
 
-    # A driver's skip must not hide the trip from the rider's own proposals.
+    # A driver's skip must not hide the trip from the passenger's own proposals.
     rider_view = api.get(f"/ride-requests/{near['id']}/proposal", headers=near_headers).json()
     assert rider_view["trip"]["id"] == trip["id"]
+
+
+def test_driver_matches_list_riders_with_score_and_distance_off_route() -> None:
+    api = corridor_client(FakeRouter())
+    _, driver_headers = auth(api, "dm-driver@example.com", "Dora Driver")
+    _, near_headers = auth(api, "dm-near@example.edu", "Near Passenger")
+    _, far_headers = auth(api, "dm-far@example.edu", "Far Passenger")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    near = make_rider_request(api, near_headers, (37.0, -121.995), (37.0, -121.985))
+    far = make_rider_request(api, far_headers, (37.008, -121.995), (37.008, -121.985))
+
+    matches = api.get(f"/driver-trips/{trip['id']}/matches", headers=driver_headers).json()
+    assert [m["id"] for m in matches] == [near["id"], far["id"]]
+    assert matches[0]["match_score"] >= matches[1]["match_score"]
+    assert matches[0]["off_route_m"] < matches[1]["off_route_m"]
+    # Skipping a passenger from the single-proposal card doesn't hide them from the list.
+    api.post(f"/driver-trips/{trip['id']}/proposal/skip", headers=driver_headers, json={"ride_request_id": near["id"]})
+    assert len(api.get(f"/driver-trips/{trip['id']}/matches", headers=driver_headers).json()) == 2
+    assert api.get(f"/driver-trips/{trip['id']}/matches", headers=near_headers).status_code == 403
 
 
 def test_driver_accepting_a_proposed_rider_creates_a_pending_connection() -> None:
     api = corridor_client(FakeRouter())
     _, driver_headers = auth(api, "da-driver@example.com", "Dan Driver")
-    _, rider_headers = auth(api, "da-rider@example.edu", "Rae Rider")
+    _, rider_headers = auth(api, "da-passenger@example.edu", "Rae Passenger")
     a = location(api, driver_headers, "A", 37.0, -122.0)
     b = location(api, driver_headers, "B", 37.0, -121.98)
     trip = post_trip(api, driver_headers, a, b)

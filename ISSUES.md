@@ -57,7 +57,7 @@ Let users maintain their public profile and driver readiness details from the sa
 - [ ] Users can edit display name, profile photo, and short bio.
 - [ ] Users can add and edit basic vehicle details.
 - [ ] Users can self-declare license, insurance, and good driving record.
-- [ ] Driver readiness fields are visible where relevant to rider-facing views.
+- [ ] Driver readiness fields are visible where relevant to passenger-facing views.
 - [ ] The app does not request document uploads or perform verification review.
 - [ ] Tests cover profile updates, vehicle updates, and self-declaration persistence.
 
@@ -71,7 +71,7 @@ Let users maintain their public profile and driver readiness details from the sa
 
 ## What to build
 
-Create the location foundation used by rider requests, driver trips, search, and privacy-aware display. The app should use a managed geocoding provider through a replaceable integration while storing normalized app-owned location data.
+Create the location foundation used by passenger requests, driver trips, search, and privacy-aware display. The app should use a managed geocoding provider through a replaceable integration while storing normalized app-owned location data.
 
 ## Acceptance criteria
 
@@ -88,11 +88,11 @@ Create the location foundation used by rider requests, driver trips, search, and
 
 ---
 
-## 5. Publish Rider Ride Requests
+## 5. Publish Passenger Ride Requests
 
 ## What to build
 
-Allow riders to create, view, cancel, and expire one-off `RideRequest` listings with geocoded pickup/dropoff, flexible timing, passenger count, and lightweight tags.
+Allow passengers to create, view, cancel, and expire one-off `RideRequest` listings with geocoded pickup/dropoff, flexible timing, passenger count, and lightweight tags.
 
 ## Acceptance criteria
 
@@ -100,7 +100,7 @@ Allow riders to create, view, cancel, and expire one-off `RideRequest` listings 
 - [ ] Ride requests include pickup, destination, target date/flexibility, passenger count, and optional tags.
 - [ ] Supported MVP tags include `airport` and `student`.
 - [ ] Ride requests are created with `open` status.
-- [ ] Riders can cancel their own ride requests.
+- [ ] Passengers can cancel their own ride requests.
 - [ ] Ride requests expire after the relevant date/flexibility window.
 - [ ] Stale or cancelled ride requests do not appear in active discovery.
 - [ ] Tests cover creation, validation, cancellation, expiry, and tag persistence.
@@ -140,11 +140,11 @@ Allow drivers to create, view, cancel, and expire one-off `DriverTrip` listings 
 
 ## What to build
 
-Let authenticated users discover relevant opposite-side listings. Riders search driver trips. Drivers search rider requests. Search should use endpoint destination radius, pickup proximity, target date/flexibility, and tags. Route-corridor matching is intentionally out of scope.
+Let authenticated users discover relevant opposite-side listings. Passengers search driver trips. Drivers search passenger requests. Search should use endpoint destination radius, pickup proximity, target date/flexibility, and tags. Route-corridor matching is intentionally out of scope.
 
 ## Acceptance criteria
 
-- [ ] Riders can search open driver trips.
+- [ ] Passengers can search open driver trips.
 - [ ] Drivers can search open ride requests.
 - [ ] Search supports destination-radius filtering.
 - [ ] Search supports pickup-proximity filtering.
@@ -155,7 +155,7 @@ Let authenticated users discover relevant opposite-side listings. Riders search 
 
 ## Blocked by
 
-- Issue 5. Publish Rider Ride Requests
+- Issue 5. Publish Passenger Ride Requests
 - Issue 6. Publish Driver Trips
 
 ---
@@ -164,11 +164,11 @@ Let authenticated users discover relevant opposite-side listings. Riders search 
 
 ## What to build
 
-Support symmetric manual connection initiation. A rider can request to join a driver trip, and a driver can offer a ride on a rider request. The recipient can accept, decline, or allow the connection to expire.
+Support symmetric manual connection initiation. A passenger can request to join a driver trip, and a driver can offer a ride on a passenger request. The recipient can accept, decline, or allow the connection to expire.
 
 ## Acceptance criteria
 
-- [ ] Riders can create a pending connection from a driver trip.
+- [ ] Passengers can create a pending connection from a driver trip.
 - [ ] Drivers can create a pending connection from a ride request.
 - [ ] Connection states include `pending`, `expired`, `accepted`, `declined`, `cancelled`, and `completed`.
 - [ ] Recipients can accept or decline pending connections.
@@ -327,8 +327,8 @@ Add end-to-end coverage for the core marketplace loops so the MVP can be validat
 
 ## Acceptance criteria
 
-- [ ] E2E test covers rider creates request, driver finds it, driver offers, rider accepts, chat unlocks, split is confirmed, and ride is completed.
-- [ ] E2E test covers driver creates trip, rider finds it, rider requests to join, driver accepts, seats are reserved, split is confirmed, and ride is completed.
+- [ ] E2E test covers passenger creates request, driver finds it, driver offers, passenger accepts, chat unlocks, split is confirmed, and ride is completed.
+- [ ] E2E test covers driver creates trip, passenger finds it, passenger requests to join, driver accepts, seats are reserved, split is confirmed, and ride is completed.
 - [ ] E2E test covers stale listing or pending connection expiry.
 - [ ] E2E test covers overbooking prevention for limited driver seats.
 - [ ] E2E test covers approximate location before acceptance and exact details after acceptance.
@@ -430,12 +430,12 @@ None - can start immediately.
 
 ## What to build
 
-One account already supports acting as both rider and driver, but there is no explicit UI for switching between them. Add a toggle at the top of the home screen that switches between Passenger and Driver views (which listing type is created/searched, which actions are shown) for users already set up in both roles.
+One account already supports acting as both passenger and driver, but there is no explicit UI for switching between them. Add a toggle at the top of the home screen that switches between Passenger and Driver views (which listing type is created/searched, which actions are shown) for users already set up in both roles.
 
 ## Acceptance criteria
 
 - [ ] A mode toggle is visible at the top of the home screen.
-- [ ] Switching modes changes the home screen's primary actions/views between rider-facing and driver-facing.
+- [ ] Switching modes changes the home screen's primary actions/views between passenger-facing and driver-facing.
 - [ ] The toggle state persists across a session (at minimum) so the app doesn't reset to a default mode on every navigation.
 - [ ] Switching is seamless (no extra confirmation step) for a user already verified/set up for both roles.
 - [ ] Tests cover toggling mode and the resulting view/action changes.
@@ -578,7 +578,7 @@ Generated from a follow-up spec covering the remaining `PRD.md` "Future improvem
 
 ## Blocked by
 
-- Issue 5. Publish Rider Ride Requests
+- Issue 5. Publish Passenger Ride Requests
 - Issue 6. Publish Driver Trips
 - Issue 8. Create And Manage Connections
 - Issue 24. Verify Neon Auth JWT Server-Side
@@ -704,20 +704,20 @@ Replace the flat marketplace feed with a ranked "Best Matches" card deck showing
 
 ## What to build
 
-Pre-fill driver vehicle specs automatically from profile settings when creating a trip, and hide driver-only fields when posting a ride request (and rider-only fields when posting a trip) instead of showing one undifferentiated form. The gas-split estimator itself already exists (issue 11, $3.50/gal at 28 MPG) and needs no new work here.
+Pre-fill driver vehicle specs automatically from profile settings when creating a trip, and hide driver-only fields when posting a ride request (and passenger-only fields when posting a trip) instead of showing one undifferentiated form. The gas-split estimator itself already exists (issue 11, $3.50/gal at 28 MPG) and needs no new work here.
 
 ## Acceptance criteria
 
 - [ ] Creating a driver trip pre-fills vehicle make/model/color/seats/car type from the user's saved `vehicles` row when one exists.
 - [ ] The ride-request form does not show driver-only fields (e.g. seats available, vehicle specs).
-- [ ] The driver-trip form does not show rider-only fields (e.g. passenger count-only fields not relevant to drivers).
+- [ ] The driver-trip form does not show passenger-only fields (e.g. passenger count-only fields not relevant to drivers).
 - [ ] Pre-filled fields remain editable before submission.
 - [ ] Tests cover pre-fill from an existing vehicle, pre-fill absence when no vehicle exists, and field visibility for each listing type.
 
 ## Blocked by
 
 - Issue 3. Edit Profile And Driver Readiness
-- Issue 5. Publish Rider Ride Requests
+- Issue 5. Publish Passenger Ride Requests
 - Issue 6. Publish Driver Trips
 
 ---

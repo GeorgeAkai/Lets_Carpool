@@ -15,7 +15,7 @@ from backend.app.db import close_pool, get_conn, init_pool, run_migrations
 from backend.app.routing import OSRMClient
 
 
-ListingStatus = Literal["open", "expired", "matched", "cancelled", "completed"]
+ListingStatus = Literal["open", "paused", "expired", "matched", "cancelled", "completed"]
 ConnectionStatus = Literal["pending", "expired", "accepted", "declined", "cancelled", "completed"]
 LuggageSize = Literal["none", "small", "medium", "large", "oversized"]
 CarType = Literal["sedan", "suv", "van", "minivan", "truck", "other"]
@@ -29,7 +29,7 @@ _GAS_PRICE_PER_GALLON_USD = 3.50
 _MPG_DEFAULT = 28.0
 _KM_PER_MILE = 1.60934
 
-# Corridor matching: how far a rider's pickup/destination may be from the
+# Corridor matching: how far a passenger's pickup/destination may be from the
 # driver's route, and how many corridor survivors get a (routed) detour estimate.
 ROUTE_BUFFER_METERS = 1000
 MAX_DETOUR_CANDIDATES = 10
@@ -160,8 +160,12 @@ class RideRequest:
     preferred_car_type: str | None = None
     notes: str | None = None
     departure_time: time | None = None
-    # Minutes this rider would add to a driver's trip; only set on driver-side proposals.
+    # Minutes this passenger would add to a driver's trip; only set on driver-side proposals.
     detour_minutes: float | None = None
+    # Driver-side matches only: how far the passenger's pickup sits from the trip's
+    # route (metres) and a 0-100 match score (detour + date/flexibility).
+    off_route_m: float | None = None
+    match_score: int | None = None
 
 
 @dataclass
@@ -186,8 +190,8 @@ class DriverTrip:
     series_id: str | None = None
     route_distance_m: float | None = None
     route_duration_s: float | None = None
-    # Minutes added to this trip if the searching rider is picked up. Only set
-    # on corridor-search results (needs the rider's pickup + destination).
+    # Minutes added to this trip if the searching passenger is picked up. Only set
+    # on corridor-search results (needs the passenger's pickup + destination).
     detour_minutes: float | None = None
 
 
@@ -202,6 +206,7 @@ class Connection:
     updated_at: datetime
     completed_confirmed_by: list[str] = field(default_factory=list)
     rider_at_pickup_at: datetime | None = None
+    picked_up_at: datetime | None = None
 
 
 @dataclass
@@ -416,6 +421,7 @@ def _row_to_connection(r: dict) -> Connection:
         updated_at=r["updated_at"],
         completed_confirmed_by=list(r["completed_confirmed_by"] or []),
         rider_at_pickup_at=r.get("rider_at_pickup_at"),
+        picked_up_at=r.get("picked_up_at"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -708,7 +714,7 @@ class Store:
                 raise DomainError("Ride request not found", 404)
             rr = _row_to_ride_request(row)
             if rr.rider_id != user_id:
-                raise DomainError("Only the rider can cancel this request", 403)
+                raise DomainError("Only the passenger can cancel this request", 403)
             cur.execute("UPDATE ride_requests SET status = 'cancelled' WHERE id = %s", (request_id,))
             rr.status = "cancelled"
             return rr
@@ -716,7 +722,7 @@ class Store:
     def update_ride_request_pickup(self, user_id: str, request_id: str, pickup_location_id: str) -> RideRequest:
         rr = self.get_ride_request(request_id)
         if rr.rider_id != user_id:
-            raise DomainError("Only the rider can update this request's pickup", 403)
+            raise DomainError("Only the passenger can update this request's pickup", 403)
         self.get_location(pickup_location_id)  # 404s if it doesn't exist
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -806,7 +812,7 @@ class Store:
     def create_driver_trip_series(self, driver_id: str, data: dict[str, Any], weekdays: list[int]) -> list[DriverTrip]:
         """'Repeat on weekdays': one trip per matching day in the 7 days starting
         at target_date (target_date itself always included), linked by series_id
-        so riders can book any day of the week. Each day stays an ordinary
+        so passengers can book any day of the week. Each day stays an ordinary
         one-off trip for search, seats and expiry."""
         if any(d not in range(7) for d in weekdays):
             raise DomainError("Weekdays must be 0 (Mon) to 6 (Sun)")
@@ -892,6 +898,65 @@ class Store:
             trip.status = "cancelled"
             return trip
 
+    def _own_trip(self, user_id: str, trip_id: str, action: str) -> DriverTrip:
+        trip = self.get_driver_trip(trip_id)
+        if trip.driver_id != user_id:
+            raise DomainError(f"Only the driver can {action} this trip", 403)
+        return trip
+
+    def pause_driver_trip(self, user_id: str, trip_id: str) -> DriverTrip:
+        """Hide an open trip from search and proposals without cancelling it.
+        Passengers already accepted keep their seats."""
+        trip = self._own_trip(user_id, trip_id, "pause")
+        if trip.status != "open":
+            raise DomainError("Only open trips can be paused")
+        with get_conn() as conn:
+            self._cur(conn).execute("UPDATE driver_trips SET status = 'paused' WHERE id = %s", (trip_id,))
+        trip.status = "paused"
+        return trip
+
+    def resume_driver_trip(self, user_id: str, trip_id: str) -> DriverTrip:
+        trip = self._own_trip(user_id, trip_id, "resume")
+        if trip.status != "paused":
+            raise DomainError("Only paused trips can be resumed")
+        status = "matched" if trip.seats_reserved >= trip.seats_available else "open"
+        with get_conn() as conn:
+            self._cur(conn).execute("UPDATE driver_trips SET status = %s WHERE id = %s", (status, trip_id))
+        trip.status = status
+        return trip
+
+    def update_driver_trip(self, user_id: str, trip_id: str, data: dict[str, Any]) -> DriverTrip:
+        """Edit the schedule, seats and note of a trip that hasn't run yet. The
+        route stays fixed (post a new trip to change it)."""
+        trip = self._own_trip(user_id, trip_id, "edit")
+        if trip.status not in {"open", "paused", "matched"}:
+            raise DomainError("This trip can no longer be edited")
+        if data.get("seats_available") is not None:
+            seats = int(data["seats_available"])
+            if seats < max(1, trip.seats_reserved):
+                raise DomainError("Seats can't be fewer than the seats already booked")
+            trip.seats_available = seats
+            if trip.status == "matched" and seats > trip.seats_reserved:
+                trip.status = "open"
+            elif trip.status == "open" and seats <= trip.seats_reserved:
+                trip.status = "matched"
+        if data.get("target_date") is not None:
+            trip.target_date = data["target_date"]
+        if data.get("flexibility") is not None:
+            trip.flexibility = data["flexibility"]
+        if "departure_time" in data:
+            trip.departure_time = data["departure_time"]
+        if "notes" in data:
+            trip.notes = (data.get("notes") or "").strip() or None
+        with get_conn() as conn:
+            self._cur(conn).execute(
+                """UPDATE driver_trips SET seats_available = %s, target_date = %s, flexibility = %s,
+                       departure_time = %s, notes = %s, status = %s WHERE id = %s""",
+                (trip.seats_available, trip.target_date, trip.flexibility, trip.departure_time,
+                 trip.notes, trip.status, trip_id),
+            )
+        return trip
+
     def get_driver_trip(self, trip_id: str) -> DriverTrip:
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -913,7 +978,7 @@ class Store:
     def expire_listings(self, today: date) -> None:
         # `today` (and CURRENT_DATE in the search queries) is evaluated in the
         # DB server's timezone (UTC), but a listing's target_date reflects the
-        # rider/driver's own local "today". Once it's past midnight UTC — early
+        # passenger/driver's own local "today". Once it's past midnight UTC — early
         # evening in any US timezone — a listing dated "today" locally already
         # reads as "yesterday" server-side. A 1-day grace period keeps this from
         # archiving (or hiding) a still-relevant same-day listing; it just delays
@@ -927,7 +992,7 @@ class Store:
                 (cutoff,),
             )
             cur.execute(
-                "UPDATE driver_trips SET status = 'expired' WHERE status = 'open' AND target_date < %s",
+                "UPDATE driver_trips SET status = 'expired' WHERE status IN ('open', 'paused') AND target_date < %s",
                 (cutoff,),
             )
 
@@ -980,9 +1045,9 @@ class Store:
     # ─── Proposed matches (Empower-style) ─────────────────────────────────────
 
     def propose_match(self, user_id: str, ride_request_id: str) -> dict[str, Any]:
-        """The system's single best driver trip for a rider's open request.
+        """The system's single best driver trip for a passenger's open request.
 
-        Not a new connection state: a proposal is just a ranked search the rider
+        Not a new connection state: a proposal is just a ranked search the passenger
         answers by accepting (POST /connections, as before) or skipping
         (skip_match). Candidates are the corridor search over the request's own
         pickup/destination, minus trips already skipped or connected to this
@@ -990,7 +1055,7 @@ class Store:
         apart. Ranked mostly by detour, with date/flexibility closeness second."""
         rr = self.get_ride_request(ride_request_id)
         if rr.rider_id != user_id:
-            raise DomainError("Only the rider can get proposals for this request", 403)
+            raise DomainError("Only the passenger can get proposals for this request", 403)
         if rr.status != "open":
             return {"trip": None, "remaining": 0}
         pickup = self.get_location(rr.pickup_location_id)
@@ -1017,7 +1082,7 @@ class Store:
 
     def propose_rider(self, user_id: str, driver_trip_id: str) -> dict[str, Any]:
         """Driver-side mirror of propose_match: the best open ride request along
-        a driver's own trip. Same corridor rules (both of the rider's points
+        a driver's own trip. Same corridor rules (both of the passenger's points
         within the buffer of the trip's route, destination ahead of pickup);
         trips with no stored route fall back to endpoint radii. Accepting is a
         driver-initiated POST /connections; skipping is remembered per trip."""
@@ -1026,10 +1091,27 @@ class Store:
             raise DomainError("Only the driver can get proposals for this trip", 403)
         if trip.status != "open":
             return {"request": None, "remaining": 0}
+        requests = self._ranked_requests_for_trip(user_id, trip, include_skipped=False)
+        return {"request": requests[0] if requests else None, "remaining": max(len(requests) - 1, 0)}
+
+    def rider_matches(self, user_id: str, driver_trip_id: str, limit: int = 10) -> list[RideRequest]:
+        """Every open ride request along the driver's trip, best first, each with
+        its detour, distance off the route and match score. Skips don't hide a
+        passenger here; passengers already connected to the trip do."""
+        trip = self.get_driver_trip(driver_trip_id)
+        if trip.driver_id != user_id:
+            raise DomainError("Only the driver can see matches for this trip", 403)
+        if trip.status != "open":
+            return []
+        return self._ranked_requests_for_trip(user_id, trip, include_skipped=True)[:limit]
+
+    def _ranked_requests_for_trip(self, user_id: str, trip: DriverTrip, include_skipped: bool) -> list[RideRequest]:
         with get_conn() as conn:
             cur = self._cur(conn)
-            cur.execute("SELECT ride_request_id FROM driver_match_skips WHERE driver_trip_id = %s", (trip.id,))
-            excluded = {r["ride_request_id"] for r in cur.fetchall()}
+            excluded: set[str] = set()
+            if not include_skipped:
+                cur.execute("SELECT ride_request_id FROM driver_match_skips WHERE driver_trip_id = %s", (trip.id,))
+                excluded |= {r["ride_request_id"] for r in cur.fetchall()}
             cur.execute("SELECT ride_request_id FROM connections WHERE driver_trip_id = %s", (trip.id,))
             excluded |= {r["ride_request_id"] for r in cur.fetchall()}
             cur.execute(
@@ -1038,7 +1120,10 @@ class Store:
                           rd.latitude AS rider_dest_lat, rd.longitude AS rider_dest_lng,
                           tp.latitude AS trip_pickup_lat, tp.longitude AS trip_pickup_lng,
                           td.latitude AS trip_dest_lat, td.longitude AS trip_dest_lng,
-                          t.route_duration_s
+                          t.route_duration_s,
+                          CASE WHEN t.route_geog IS NOT NULL
+                               THEN ST_Distance(t.route_geog, rp.geog)
+                               ELSE ST_Distance(tp.geog, rp.geog) END AS off_route_m
                    FROM ride_requests rr
                    JOIN locations rp ON rp.id = rr.pickup_location_id
                    JOIN locations rd ON rd.id = rr.destination_location_id
@@ -1075,8 +1160,11 @@ class Store:
         rows = [r for r in rows if abs((r["target_date"] - trip.target_date).days) <= 1]
         requests = [_row_to_ride_request(r) for r in rows]
         self._attach_request_detours(requests, rows)
-        requests.sort(key=lambda rr: -_proposal_score(rr.detour_minutes, trip, rr))
-        return {"request": requests[0] if requests else None, "remaining": max(len(requests) - 1, 0)}
+        for rr, r in zip(requests, rows):
+            rr.off_route_m = None if r.get("off_route_m") is None else round(r["off_route_m"])
+            rr.match_score = round(100 * _proposal_score(rr.detour_minutes, trip, rr))
+        requests.sort(key=lambda rr: -(rr.match_score or 0))
+        return requests
 
     def _attach_request_detours(self, requests: list[RideRequest], rows: list[dict]) -> None:
         """Per-request insertion detour against the trip's stored route duration
@@ -1121,7 +1209,7 @@ class Store:
     def skip_match(self, user_id: str, ride_request_id: str, driver_trip_id: str) -> None:
         rr = self.get_ride_request(ride_request_id)
         if rr.rider_id != user_id:
-            raise DomainError("Only the rider can skip proposals for this request", 403)
+            raise DomainError("Only the passenger can skip proposals for this request", 403)
         self.get_driver_trip(driver_trip_id)  # 404s if it doesn't exist
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -1133,7 +1221,7 @@ class Store:
 
     @staticmethod
     def _corridor_search(query: dict[str, Any]) -> tuple[str, str, list[Any]] | None:
-        """Route-corridor filter, used when the search carries both the rider's
+        """Route-corridor filter, used when the search carries both the passenger's
         pickup and destination: the driver's stored route must pass within the
         buffer of both points, with the destination *ahead* of the pickup along
         the route (ST_LineLocatePoint fractions) so an opposite-direction driver
@@ -1162,8 +1250,8 @@ class Store:
         return "", f"AND ({corridor} OR {fallback})", params
 
     def _attach_detours(self, trips: list[DriverTrip], rows: list[dict], query: dict[str, Any]) -> None:
-        """Minutes each candidate's trip grows by if the rider is inserted
-        (driver pickup → rider pickup → rider dest → driver dest, vs. the stored
+        """Minutes each candidate's trip grows by if the passenger is inserted
+        (driver pickup → passenger pickup → passenger dest → driver dest, vs. the stored
         direct route). Only runs on corridor survivors, capped, in parallel."""
         if self.router is None:
             return
@@ -1253,7 +1341,7 @@ class Store:
         if rr.rider_id == trip.driver_id:
             raise DomainError("Cannot connect to your own listing", 400)
         if user_id not in {rr.rider_id, trip.driver_id}:
-            raise DomainError("Only the rider or driver can initiate this connection", 403)
+            raise DomainError("Only the passenger or driver can initiate this connection", 403)
         if self.is_blocked(rr.rider_id, trip.driver_id):
             raise DomainError("Blocked users cannot connect", 403)
 
@@ -1274,7 +1362,7 @@ class Store:
                  conn_obj.created_at, conn_obj.updated_at, []),
             )
         recipient = trip.driver_id if user_id == rr.rider_id else rr.rider_id
-        # Driver opted in to auto-accepting ID-verified riders: skip the wait.
+        # Driver opted in to auto-accepting ID-verified passengers: skip the wait.
         if (user_id == rr.rider_id and trip.auto_accept_verified
                 and self.user_for_id(rr.rider_id).id_verified):
             return self.transition_connection(trip.driver_id, conn_obj.id, "accept")
@@ -1379,6 +1467,7 @@ class Store:
                 cur.execute("UPDATE driver_trips SET status = 'completed' WHERE id = %s", (trip.id,))
             connection.status = "completed"
             connection.completed_confirmed_by = confirmed
+            self._settle_fare(connection, rr, trip)
         else:
             raise DomainError(f"Unsupported connection action: {action}")
 
@@ -1501,6 +1590,46 @@ class Store:
         self.notify(other_id, "gas_split_confirmed", "Gas split confirmed",
                     "A participant confirmed the gas split.", related_id=confirmation.connection_id)
         return confirmation
+
+    def connection_fare(self, connection: Connection) -> dict[str, Any]:
+        """The automatic fare for a ride: the passenger's share of gas for the
+        pickup→destination distance, times their party size. Once the ride is
+        completed it reports the settled amount instead of the estimate."""
+        settled = self.get_gas_splits(connection.id) if connection.status == "completed" else []
+        suggestion = self.suggest_gas_split(connection.id)
+        passengers = suggestion["assumptions"]["passenger_count"]
+        estimate = suggestion["amount_cents"] * passengers
+        if settled:
+            return {"amount_cents": settled[-1].amount_cents, "currency": settled[-1].currency,
+                    "distance_km": suggestion["assumptions"]["distance_km"], "passengers": passengers,
+                    "status": "paid"}
+        return {"amount_cents": estimate, "currency": suggestion["currency"],
+                "distance_km": suggestion["assumptions"]["distance_km"], "passengers": passengers,
+                "status": "estimated"}
+
+    def _settle_fare(self, connection: Connection, rr: RideRequest, trip: DriverTrip) -> None:
+        """Record the fare as settled when a ride completes and tell both sides.
+        There is no card processor behind this: it marks the fare as paid in-app
+        so the passenger and driver see the same confirmation."""
+        if self.get_gas_splits(connection.id):
+            amount_cents = self.get_gas_splits(connection.id)[-1].amount_cents
+        else:
+            fare = self.connection_fare(connection)
+            amount_cents = fare["amount_cents"]
+            with get_conn() as conn:
+                self._cur(conn).execute(
+                    """INSERT INTO gas_split_confirmations (id, connection_id, confirmer_id,
+                           amount_cents, currency, assumptions, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (new_id("gsc"), connection.id, rr.rider_id, amount_cents, fare["currency"],
+                     json.dumps({"method": "auto_fare", "distance_km": fare["distance_km"],
+                                 "passenger_count": fare["passengers"]}), now_utc()),
+                )
+        amount = f"${amount_cents / 100:.2f}"
+        self.notify(rr.rider_id, "payment_processed", "Payment processed",
+                    f"Your fare of {amount} has been paid. Thanks for riding!", related_id=connection.id)
+        self.notify(trip.driver_id, "payment_processed", "Payment received",
+                    f"You received {amount} for this ride.", related_id=connection.id)
 
     def get_gas_splits(self, connection_id: str) -> list[GasSplitConfirmation]:
         with get_conn() as conn:
@@ -1839,7 +1968,7 @@ class Store:
 
     def user_stats(self, user_id: str) -> dict[str, Any]:
         """Public trust signals: average stars, number of ratings, completed rides
-        (as driver or rider) and the admin-set ID check."""
+        (as driver or passenger) and the admin-set ID check."""
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
@@ -1934,7 +2063,7 @@ class Store:
         return alert
 
     def _fulfil_ride_alerts(self, trip: DriverTrip) -> None:
-        """Notify riders waiting on a ride to near this trip's destination that day.
+        """Notify passengers waiting on a ride to near this trip's destination that day.
         Each alert fires once."""
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -1956,7 +2085,7 @@ class Store:
 
     def trip_day_status(self, user_id: str, connection_id: str) -> dict[str, Any]:
         """Live pickup status for an accepted ride: the driver's last shared
-        position (if fresh), straight-line distance to the rider's pickup and a
+        position (if fresh), straight-line distance to the passenger's pickup and a
         rough ETA. Participants only."""
         connection = self.get_connection(connection_id)
         rr = self.get_ride_request(connection.ride_request_id)
@@ -1966,6 +2095,7 @@ class Store:
         if connection.status != "accepted":
             raise DomainError("Live status is only available for accepted rides")
         pickup = self.get_location(rr.pickup_location_id)
+        destination = self.get_location(rr.destination_location_id)
         stale_before = now_utc() - timedelta(minutes=self.DRIVER_LOCATION_TTL_MINUTES)
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -1988,17 +2118,37 @@ class Store:
         return {
             "connection_id": connection_id,
             "pickup": {"label": pickup.label, "latitude": pickup.latitude, "longitude": pickup.longitude},
+            "destination": {"label": destination.label, "latitude": destination.latitude, "longitude": destination.longitude},
             "departure_time": trip.departure_time,
             "driver": driver,
             "rider_at_pickup_at": connection.rider_at_pickup_at,
+            "picked_up_at": connection.picked_up_at,
         }
+
+    def mark_picked_up(self, user_id: str, connection_id: str) -> Connection:
+        """Driver confirms the passenger is in the car; the ride is now en route."""
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id != trip.driver_id:
+            raise DomainError("Only the driver can confirm the pickup", 403)
+        if connection.status != "accepted":
+            raise DomainError("Only accepted rides can be picked up")
+        if connection.picked_up_at is None:
+            at = now_utc()
+            with get_conn() as conn:
+                self._cur(conn).execute("UPDATE connections SET picked_up_at = %s WHERE id = %s", (at, connection_id))
+            connection.picked_up_at = at
+            self.notify(rr.rider_id, "ride_started", "Your ride has started",
+                        "You're on your way to the destination.", related_id=connection_id)
+        return connection
 
     def mark_rider_at_pickup(self, user_id: str, connection_id: str) -> Connection:
         connection = self.get_connection(connection_id)
         rr = self.get_ride_request(connection.ride_request_id)
         trip = self.get_driver_trip(connection.driver_trip_id)
         if user_id != rr.rider_id:
-            raise DomainError("Only the rider can check in at the pickup", 403)
+            raise DomainError("Only the passenger can check in at the pickup", 403)
         if connection.status != "accepted":
             raise DomainError("Only accepted rides have a pickup")
         at = now_utc()
@@ -2006,9 +2156,9 @@ class Store:
             cur = self._cur(conn)
             cur.execute("UPDATE connections SET rider_at_pickup_at = %s WHERE id = %s", (at, connection_id))
         connection.rider_at_pickup_at = at
-        rider = self.get_profile(rr.rider_id)
-        self.notify(trip.driver_id, "rider_at_pickup", "Your rider is at the pickup",
-                    f"{rider.display_name if rider else 'Your rider'} is waiting at the pickup spot.",
+        passenger = self.get_profile(rr.rider_id)
+        self.notify(trip.driver_id, "rider_at_pickup", "Your passenger is at the pickup",
+                    f"{passenger.display_name if passenger else 'Your passenger'} is waiting at the pickup spot.",
                     related_id=connection_id)
         return connection
 

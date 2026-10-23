@@ -6,6 +6,7 @@ import {
 import * as api from '../api'
 import type { ApiDriverTrip, ApiUser, SavedRoute, TripDayStatus } from '../api'
 import { formatPlace } from '../lib/places'
+import { LiveTripMap } from '../LiveTripMap'
 import {
   Avatar, LocationInput, reverseGeocode, toInitials, todayLocalISO, tripToMyListing, FLEX_LABEL,
   type Connection, type Flexibility, type LocationValue, type MyListing,
@@ -15,7 +16,7 @@ import { BottomSheet } from './discover-mobile'
 // ─── Shared search state (Home → Results → Ride details) ──────────────────────
 
 export interface RideSearch {
-  // null = the rider's current location
+  // null = the passenger's current location
   from: LocationValue | null
   to: LocationValue | null
   date: string   // YYYY-MM-DD
@@ -140,8 +141,10 @@ function VerifiedIcon({ size = 16 }: { size?: number }) {
 
 export function HomeScreen({
   mode, currentUser, hasLocation, search, setSearch, savedRoutes, onSaveRoute, onDeleteRoute,
-  nextTrip, onPrimary, onFindMe, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, children,
+  nextTrip, onPrimary, onFindMe, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, topSlot, children,
 }: {
+  // Pinned directly under the greeting, above the trip planner (e.g. a driver's published trip).
+  topSlot?: ReactNode
   onOpenMap?: () => void
   onOpenNotifications?: () => void
   unreadNotifications?: number
@@ -155,7 +158,7 @@ export function HomeScreen({
   onDeleteRoute: (id: string) => Promise<void>
   nextTrip: Connection | null
   onPrimary: () => void
-  // Rider only: skip the list and request the best-matching driver straight away.
+  // Passenger only: skip the list and request the best-matching driver straight away.
   onFindMe?: () => void
   onOpenTrip: (c: Connection) => void
   onOpenProfile: () => void
@@ -203,11 +206,13 @@ export function HomeScreen({
       </h1>
       </div>
 
+      {topSlot}
+
       <section aria-label="Plan a trip" className="bg-card border border-border rounded-[20px] p-1.5 flex flex-col">
         <div className="flex items-center gap-3 px-3 py-3.5">
           <span aria-hidden className="size-3 rounded-full border-[3px] border-info shrink-0" />
           {search.from ? (
-            <LocationInput variant="bare" label="From" value={search.from} placeholder="Starting point"
+            <LocationInput variant="bare" label="From" value={search.from} placeholder="Starting point" requireExact={!isDriver}
               onChange={v => setSearch({ ...search, from: v })} />
           ) : (
             <div className="flex-1 min-w-0">
@@ -223,7 +228,7 @@ export function HomeScreen({
         <div aria-hidden className="h-px bg-border ml-9 mr-3" />
         <div className="flex items-center gap-3 px-3 py-3.5">
           <span aria-hidden className="size-3 rounded-[3px] bg-primary shrink-0" />
-          <LocationInput variant="bare" label="To" value={search.to} placeholder="Search a destination"
+          <LocationInput variant="bare" label="To" value={search.to} placeholder={isDriver ? 'Search a destination' : 'Search a destination address'} requireExact={!isDriver}
             onChange={v => setSearch({ ...search, to: v })} />
         </div>
         <div className="flex gap-2 px-1.5 pt-1.5 pb-2">
@@ -678,13 +683,15 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 // ─── 4 · Trip day ─────────────────────────────────────────────────────────────
 
 export function TripDayScreen({
-  connection, currentUserId, onClose, onMessage, onStartDriving, onComplete, showToast,
+  connection, currentUserId, onClose, onMessage, onStartDriving, onComplete, showToast, onChanged,
 }: {
   connection: Connection
   currentUserId: string
   onClose: () => void
   onMessage: (c: Connection) => void
-  onStartDriving: (c: Connection) => void
+  onStartDriving: (c: Connection, target?: 'pickup' | 'destination') => void
+  // Called after the driver confirms pickup, so the parent can refetch.
+  onChanged?: () => void
   onComplete: (id: string) => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
 }) {
@@ -695,16 +702,17 @@ export function TripDayScreen({
   const [live, setLive] = useState<TripDayStatus | null>(null)
   const [checkedIn, setCheckedIn] = useState<string | null>(raw?.rider_at_pickup_at ?? null)
   const [safetyOpen, setSafetyOpen] = useState(false)
-  const [rating, setRating] = useState<number | null>(raw?.my_rating ?? null)
   const [busy, setBusy] = useState(false)
+  const [pickedUpAt, setPickedUpAt] = useState<string | null>(raw?.picked_up_at ?? null)
   const accepted = connection.status === 'accepted'
+  const pickedUp = !!(live?.picked_up_at ?? pickedUpAt)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     if (!accepted) return
-    const load = () => api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at) }).catch(() => {})
+    const load = () => api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at); if (s.picked_up_at) setPickedUpAt(s.picked_up_at) }).catch(() => {})
     load()
-    pollRef.current = setInterval(load, 15000)
+    pollRef.current = setInterval(load, 6000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [connection.id, accepted])
 
@@ -714,12 +722,15 @@ export function TripDayScreen({
   const car = trip?.vehicle ? [trip.vehicle.color, trip.vehicle.make, trip.vehicle.model].filter(Boolean).join(' ') : ''
   const phone = partner && 'phone' in partner ? partner.phone : null
 
+  const destLabel = live?.destination?.label ? formatPlace(live.destination.label) : connection.to
   const headline = connection.status === 'completed' ? `Ride with ${partnerFirst} complete`
     : !accepted ? `Waiting for ${partnerFirst} to accept`
+    : pickedUp ? (connection.myRole === 'rider' ? 'You’re on your way' : `On the way with ${partnerFirst}`)
     : connection.myRole === 'rider'
       ? (eta != null ? (eta <= 1 ? `${partnerFirst} is arriving now` : `${partnerFirst} arrives in ${eta} min`) : departure ? `Pickup at ${departure}` : `Pickup ${dayLabel(connection.date)}`)
       : (checkedIn ? `${partnerFirst} is at the pickup` : departure ? `Pick up ${partnerFirst} at ${departure}` : `Pick up ${partnerFirst} ${dayLabel(connection.date).toLowerCase()}`)
-  const subline = connection.myRole === 'rider'
+  const subline = pickedUp ? `Heading to ${destLabel}`
+    : connection.myRole === 'rider'
     ? (accepted ? (eta != null && eta <= 10 ? `Leave now to reach ${pickupLabel} on time` : `Meet at ${pickupLabel}`) : 'You’ll get a notification when they do')
     : `Pickup at ${pickupLabel}`
 
@@ -743,10 +754,11 @@ export function TripDayScreen({
     finally { setBusy(false) }
   }
 
-  const rate = async (stars: number) => {
-    setRating(stars)
-    try { await api.rateConnection(connection.id, stars); showToast('Thanks for rating', 'success') }
-    catch (e) { setRating(raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  const confirmPickedUp = async () => {
+    setBusy(true)
+    try { const c = await api.markPickedUp(connection.id); setPickedUpAt(c.picked_up_at ?? new Date().toISOString()); showToast(`${partnerFirst} is on board`, 'success'); onChanged?.() }
+    catch (e) { showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+    finally { setBusy(false) }
   }
 
   const tile = 'min-h-[72px] rounded-2xl border border-border bg-card text-foreground text-[13px] font-semibold flex flex-col items-center justify-center gap-1.5 disabled:opacity-40'
@@ -772,7 +784,16 @@ export function TripDayScreen({
         <p className="text-[15px] text-secondary-foreground">{subline}</p>
       </div>
 
-      {connection.myRole === 'rider' && (car || trip?.vehicle?.plate) && (
+      {accepted && live?.pickup && live.destination && (
+        <LiveTripMap
+          phase={pickedUp ? 'enroute' : 'approach'}
+          driver={live.driver ? { lat: live.driver.latitude, lng: live.driver.longitude } : null}
+          pickup={{ lat: live.pickup.latitude, lng: live.pickup.longitude, label: pickupLabel }}
+          destination={{ lat: live.destination.latitude, lng: live.destination.longitude, label: destLabel }}
+        />
+      )}
+
+      {connection.myRole === 'rider' && !pickedUp && (car || trip?.vehicle?.plate) && (
         <div className="bg-card border border-border rounded-[20px] p-4 flex items-center gap-3.5">
           <div className="flex-1 min-w-0">
             <p className="text-[13px] text-muted-foreground">Look for</p>
@@ -794,32 +815,39 @@ export function TripDayScreen({
 
       <ol className="bg-card border border-border rounded-[20px] p-4 flex flex-col">
         <TimelineStep state="done" title={accepted || connection.status === 'completed' ? 'Booked · seat confirmed' : 'Requested · waiting to be accepted'}
-          sub={trip?.pricing ? `${fmtMoney(trip.pricing.price_per_seat_cents)} per seat, settled with ${connection.myRole === 'rider' ? partnerFirst : 'your rider'}` : undefined} />
-        <TimelineStep state={connection.status === 'completed' ? 'done' : 'current'}
+          sub={trip?.pricing ? `${fmtMoney(trip.pricing.price_per_seat_cents)} per seat, settled with ${connection.myRole === 'rider' ? partnerFirst : 'your passenger'}` : undefined} />
+        <TimelineStep state={connection.status === 'completed' || pickedUp ? 'done' : 'current'}
           title={`Pickup ${departure ?? dayLabel(connection.date)} · ${pickupLabel}`}
-          sub={checkedIn ? `${connection.myRole === 'rider' ? 'You' : partnerFirst} checked in at the pickup` : undefined} />
-        <TimelineStep state={connection.status === 'completed' ? 'done' : 'next'} last
+          sub={pickedUp ? 'Picked up' : checkedIn ? `${connection.myRole === 'rider' ? 'You' : partnerFirst} checked in at the pickup` : undefined} />
+        <TimelineStep state={connection.status === 'completed' ? 'done' : pickedUp ? 'current' : 'next'} last
           title={`Drop-off${trip?.estimated_arrival_time ? ` ${fmtTime(trip.estimated_arrival_time)}` : ''} · ${connection.to}`} />
       </ol>
 
       {connection.status === 'completed' && (
-        <section className="bg-card border border-border rounded-[20px] p-4 flex flex-col gap-3 items-center">
-          <p className="text-[15px] font-semibold">{rating ? 'Your rating' : `How was the ride with ${partnerFirst}?`}</p>
-          <StarRating value={rating} onChange={rate} />
-        </section>
+        <RideOutcome connection={connection} showToast={showToast} />
       )}
 
       {accepted && (
         <StickyFooter>
           {connection.myRole === 'rider' ? (
+            pickedUp ? (
+              <p className="w-full text-center text-[15px] font-semibold text-secondary-foreground py-3">Ride in progress · enjoy the trip</p>
+            ) : (
             <>
               <PrimaryButton onClick={checkIn} disabled={busy || !!checkedIn}>{checkedIn ? 'You’re checked in' : 'I’m at the pickup spot'}</PrimaryButton>
               <button type="button" onClick={sendLate} className="w-full h-12 rounded-[14px] text-secondary-foreground text-[15px] font-semibold">Running late? Let {partnerFirst} know</button>
             </>
+            )
           ) : (
             <>
+              {!pickedUp && (
+                <PrimaryButton onClick={confirmPickedUp} disabled={busy}>{checkedIn ? `${partnerFirst} is here — start the ride` : `${partnerFirst} is in the car`}</PrimaryButton>
+              )}
               {connection.riderPickupLat != null && (
-                <PrimaryButton onClick={() => onStartDriving(connection)}><span className="inline-flex items-center gap-2"><Navigation className="size-5" />Start driving</span></PrimaryButton>
+                <button type="button" onClick={() => onStartDriving(connection, pickedUp ? 'destination' : 'pickup')}
+                  className="w-full h-12 rounded-[14px] border border-border text-foreground text-[15px] font-semibold inline-flex items-center justify-center gap-2">
+                  <Navigation className="size-5" />{pickedUp ? 'Navigate to drop-off' : 'Start driving to pickup'}
+                </button>
               )}
               <button type="button" disabled={busy}
                 onClick={async () => { setBusy(true); try { await onComplete(connection.id) } finally { setBusy(false) } }}
@@ -854,6 +882,81 @@ function TimelineStep({ state, title, sub, last = false }: { state: 'done' | 'cu
         {sub && <span className="text-[13px] text-muted-foreground">{sub}</span>}
       </div>
     </li>
+  )
+}
+
+// Payment confirmation + mutual rating, shown to both sides once a ride is
+// complete. There's no card processor behind it: the fare is calculated and
+// marked paid in-app when the ride completes.
+export function PaymentConfirmation({ fare, role, partnerFirst }: { fare: api.ApiFare | undefined; role: 'rider' | 'driver'; partnerFirst: string }) {
+  const paid = fare?.status === 'paid'
+  return (
+    <div role="status" className="w-full rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-3">
+      <span aria-hidden className="size-9 rounded-full bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 flex items-center justify-center shrink-0"><Check className="size-5" /></span>
+      <div className="min-w-0">
+        <p className="text-[15px] font-semibold">
+          {!fare ? 'Payment processing…'
+            : paid ? (role === 'rider' ? `Payment of ${fmtMoney(fare.amount_cents)} processed` : `You received ${fmtMoney(fare.amount_cents)}`)
+            : `Fare ${fmtMoney(fare.amount_cents)} · processing`}
+        </p>
+        <p className="text-[13px] text-muted-foreground">
+          {role === 'rider' ? `Paid to ${partnerFirst} for this ride` : `Paid by ${partnerFirst} for this ride`}
+          {fare ? ` · ${fare.distance_km} km` : ''}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+export function RideOutcome({ connection, showToast, onRated }: {
+  connection: Connection
+  showToast: (msg: string, type: 'success' | 'error') => void
+  onRated?: (stars: number) => void
+}) {
+  const partnerFirst = connection.withUser.name.split(' ')[0]
+  const [rating, setRating] = useState<number | null>(connection.raw?.my_rating ?? null)
+  const rate = async (stars: number) => {
+    setRating(stars)
+    try { await api.rateConnection(connection.id, stars); showToast('Thanks for rating', 'success'); onRated?.(stars) }
+    catch (e) { setRating(connection.raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
+  }
+  return (
+    <section className="flex flex-col gap-3">
+      <PaymentConfirmation fare={connection.raw?.fare} role={connection.myRole} partnerFirst={partnerFirst} />
+      <div className="bg-card border border-border rounded-[20px] p-4 flex flex-col gap-3 items-center">
+        <p className="text-[15px] font-semibold">
+          {rating ? 'Your rating' : connection.myRole === 'rider' ? `How was your driver, ${partnerFirst}?` : `How was your passenger, ${partnerFirst}?`}
+        </p>
+        <StarRating value={rating} onChange={rate} />
+      </div>
+    </section>
+  )
+}
+
+// Prompt shown right after a ride completes (and again on next visit until
+// rated): payment confirmation, then rate the other person.
+export function RideCompleteSheet({ connection, onClose, onRated, showToast }: {
+  connection: Connection
+  onClose: () => void
+  onRated: (connectionId: string, stars: number) => void
+  showToast: (msg: string, type: 'success' | 'error') => void
+}) {
+  const partnerFirst = connection.withUser.name.split(' ')[0]
+  const [rated, setRated] = useState(false)
+  return (
+    <div className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center bg-black/50 p-0 sm:p-4" role="dialog" aria-modal="true" aria-label="Ride complete">
+      <div className="w-full sm:max-w-md bg-background rounded-t-3xl sm:rounded-3xl p-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+        <div className="flex flex-col gap-1">
+          <h2 className="font-display text-[26px] font-bold tracking-[-0.02em] leading-tight">Ride complete 🎉</h2>
+          <p className="text-[15px] text-secondary-foreground">{connection.from} → {connection.to} with {partnerFirst}</p>
+        </div>
+        <RideOutcome connection={connection} showToast={showToast} onRated={s => { setRated(true); onRated(connection.id, s) }} />
+        <button type="button" onClick={onClose}
+          className="w-full h-12 rounded-[14px] bg-primary text-primary-foreground text-[15px] font-semibold">
+          {rated ? 'Done' : 'Skip for now'}
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -1019,7 +1122,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
           <Stepper value={seats} min={1} max={vehicle?.seats ? Math.max(1, vehicle.seats - 1) : 8} onChange={setSeats} label="Seats to offer" hint="Not counting you" />
           <div className="bg-card border border-border rounded-[18px] p-4 flex flex-col gap-3">
             <div className="flex justify-between items-baseline">
-              <span className="text-base font-semibold">Each rider pays</span>
+              <span className="text-base font-semibold">Each passenger pays</span>
               <span className="font-display text-[30px] font-bold">{fmtMoney(priceCents)}</span>
             </div>
             <span className="text-[13px] text-secondary-foreground leading-[1.45]">
@@ -1044,7 +1147,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
           </div>
           <div className="flex flex-col gap-1">
             <label className="flex items-center justify-between min-h-[52px] gap-3">
-              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Repeat on weekdays</span><span className="text-[13px] text-muted-foreground">Riders can book any day this week</span></span>
+              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Repeat on weekdays</span><span className="text-[13px] text-muted-foreground">Passengers can book any day this week</span></span>
               <input type="checkbox" checked={repeat} onChange={e => setRepeat(e.target.checked)} className={toggle} />
             </label>
             {repeat && (
@@ -1058,7 +1161,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
               </div>
             )}
             <label className="flex items-center justify-between min-h-[52px] gap-3">
-              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Auto-accept verified riders</span><span className="text-[13px] text-muted-foreground">Others still need your OK</span></span>
+              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Auto-accept verified passengers</span><span className="text-[13px] text-muted-foreground">Others still need your OK</span></span>
               <input type="checkbox" checked={autoAccept} onChange={e => setAutoAccept(e.target.checked)} className={toggle} />
             </label>
           </div>
@@ -1072,12 +1175,12 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
             <div className="flex justify-between gap-3"><span className="text-muted-foreground">Route</span><span className="font-semibold text-right">{from?.label} → {to?.label}</span></div>
             <div className="flex justify-between gap-3"><span className="text-muted-foreground">Leaving</span><span className="font-semibold text-right">{dayLabel(date)}, {fmtTime(time)}{repeat && weekdays.length ? ` · ${weekdaysLabel(weekdays)}` : ''}</span></div>
             <div className="flex justify-between gap-3"><span className="text-muted-foreground">Seats</span><span className="font-semibold">{seats}</span></div>
-            <div className="flex justify-between gap-3"><span className="text-muted-foreground">Each rider pays</span><span className="font-semibold">{fmtMoney(priceCents)}</span></div>
-            <div className="flex justify-between gap-3"><span className="text-muted-foreground">Verified riders</span><span className="font-semibold">{autoAccept ? 'Accepted automatically' : 'Need your OK'}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-muted-foreground">Each passenger pays</span><span className="font-semibold">{fmtMoney(priceCents)}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-muted-foreground">Verified passengers</span><span className="font-semibold">{autoAccept ? 'Accepted automatically' : 'Need your OK'}</span></div>
             {vehicle && <div className="flex justify-between gap-3"><span className="text-muted-foreground">Car</span><span className="font-semibold text-right">{[vehicle.color, vehicle.make, vehicle.model].filter(Boolean).join(' ') || '—'}</span></div>}
           </div>
           <label className="block space-y-1.5">
-            <span className="text-sm font-semibold">Note for riders <span className="text-muted-foreground font-normal">(optional)</span></span>
+            <span className="text-sm font-semibold">Note for passengers <span className="text-muted-foreground font-normal">(optional)</span></span>
             <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={3} maxLength={500} placeholder="e.g. Room for a carry-on, no big suitcases"
               className="w-full px-3 py-2.5 rounded-xl bg-input-background border border-border text-sm text-foreground resize-none" />
           </label>
@@ -1086,7 +1189,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
 
       <StickyFooter>
         <PrimaryButton onClick={next} disabled={busy}>{step === 3 ? (busy ? 'Posting…' : repeat && weekdays.length > 1 ? 'Post these rides' : 'Post ride') : 'Continue'}</PrimaryButton>
-        <p className="text-xs text-muted-foreground text-center">You can edit or cancel until the first rider books</p>
+        <p className="text-xs text-muted-foreground text-center">You can edit or cancel until the first passenger books</p>
       </StickyFooter>
     </div>
   )
@@ -1107,7 +1210,7 @@ export function pickNextTrip(connections: Connection[], role: 'rider' | 'driver'
 // ─── 4 · Find me a ride: request the top match, wait, hand over to trip day ──
 //
 // One screen replaces Results → Details → Inbox. It asks the best-ranked driver
-// (or the specific `firstTrip` the rider picked), shows a live countdown, and
+// (or the specific `firstTrip` the passenger picked), shows a live countdown, and
 // moves on to the next match if the driver declines or doesn't answer in time.
 // A single ride request is created up front and reused for every driver asked.
 
@@ -1126,7 +1229,7 @@ export function FindRideScreen({
   userCoords: { lat: number; lng: number } | null
   currentUserId: string
   excludeTripIds: Set<string>
-  // Set when the rider chose a specific driver: ask only them, no auto-advance.
+  // Set when the passenger chose a specific driver: ask only them, no auto-advance.
   firstTrip?: ApiDriverTrip | null
   onBack: () => void
   onSeeAll: () => void

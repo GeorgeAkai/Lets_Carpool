@@ -33,6 +33,9 @@ export function loadGoogleMaps(): Promise<Maps | null> {
         google.maps.importLibrary("maps"),
         google.maps.importLibrary("geocoding"),
         google.maps.importLibrary("routes"),
+        // Optional: Places (New) powers address autocomplete, but the app
+        // still geocodes by text when the API isn't enabled for the key.
+        google.maps.importLibrary("places").catch(() => null),
       ])
       return google.maps
     } catch {
@@ -51,13 +54,36 @@ export interface PlaceResult {
   label: string
   /** Full address, shown as the secondary line. */
   detail: string
+  /** NaN until `resolve()` is called, for autocomplete predictions. */
   lat: number
   lng: number
+  /** Street-level (house number, building or named place) rather than a city or region. */
+  exact?: boolean
+  /** Autocomplete predictions carry no coordinates; this fetches them on selection. */
+  resolve?: () => Promise<PlaceResult>
 }
 
 type NominatimResult = {
   place_id: number; display_name: string; name: string; lat: string; lon: string
-  address?: { city?: string; town?: string; village?: string; state?: string }
+  class?: string; type?: string
+  address?: { city?: string; town?: string; village?: string; state?: string; house_number?: string }
+}
+
+const EXACT_TYPES = new Set([
+  "street_address", "premise", "subpremise", "establishment", "point_of_interest",
+  "airport", "university", "school", "hospital", "train_station", "transit_station",
+  "shopping_mall", "park", "church", "place_of_worship", "stadium", "lodging",
+])
+
+/** True when a Google result pins a specific address or place, not an area. */
+function isExactGoogle(types: string[], components: { types: string[] }[] = []): boolean {
+  if (types.some(t => EXACT_TYPES.has(t))) return true
+  return components.some(c => c.types.includes("street_number"))
+}
+
+function isExactNominatim(r: NominatimResult): boolean {
+  if (r.address?.house_number) return true
+  return ["amenity", "shop", "tourism", "aeroway", "building", "leisure", "office", "railway"].includes(r.class ?? "")
 }
 
 function nominatimLabel(r: NominatimResult): string {
@@ -81,6 +107,44 @@ function googleLabel(r: google.maps.GeocoderResult): string {
   return formatPlace(parts.join(", "))
 }
 
+/**
+ * Google Places autocomplete (as-you-type address suggestions). Predictions
+ * have no coordinates yet; `resolve()` fetches them when the user picks one.
+ * Returns null when Places isn't available so callers can fall back to
+ * `searchPlaces`.
+ */
+export async function autocompletePlaces(query: string, near?: { lat: number; lng: number } | null): Promise<PlaceResult[] | null> {
+  const maps = await loadGoogleMaps()
+  const places = maps?.places as (typeof google.maps.places & { AutocompleteSuggestion?: any }) | undefined
+  if (!maps || !places?.AutocompleteSuggestion) return null
+  try {
+    const { suggestions } = await places.AutocompleteSuggestion.fetchAutocompleteSuggestions({
+      input: query,
+      locationBias: near ? { center: near, radius: 50_000 } : undefined,
+    })
+    return (suggestions as { placePrediction: any }[]).filter(s => s.placePrediction).slice(0, 6).map(({ placePrediction: p }) => {
+      const base: PlaceResult = {
+        id: p.placeId,
+        label: formatPlace(p.mainText?.text ? [p.mainText.text, p.secondaryText?.text].filter(Boolean).join(", ") : p.text.text),
+        detail: p.text.text, lat: NaN, lng: NaN,
+        exact: isExactGoogle(p.types ?? []),
+      }
+      base.resolve = async () => {
+        const place = p.toPlace()
+        await place.fetchFields({ fields: ["location", "addressComponents", "types"] })
+        const comps = (place.addressComponents ?? []).map((c: { types: string[] }) => ({ types: c.types }))
+        return {
+          ...base, lat: place.location.lat(), lng: place.location.lng(),
+          exact: isExactGoogle(place.types ?? p.types ?? [], comps), resolve: undefined,
+        }
+      }
+      return base
+    })
+  } catch {
+    return null
+  }
+}
+
 /** Forward geocode, biased (not restricted) toward `near` when given. */
 export async function searchPlaces(query: string, near?: { lat: number; lng: number } | null): Promise<PlaceResult[]> {
   const maps = await loadGoogleMaps()
@@ -93,6 +157,7 @@ export async function searchPlaces(query: string, near?: { lat: number; lng: num
       return results.slice(0, 6).map(r => ({
         id: r.place_id, label: googleLabel(r), detail: r.formatted_address,
         lat: r.geometry.location.lat(), lng: r.geometry.location.lng(),
+        exact: isExactGoogle(r.types, r.address_components),
       }))
     } catch (e) {
       // ZERO_RESULTS is a real answer; anything else (key/API problems) falls through.
@@ -107,7 +172,7 @@ export async function searchPlaces(query: string, near?: { lat: number; lng: num
   const data: NominatimResult[] = await res.json()
   return data.map(r => ({
     id: String(r.place_id), label: nominatimLabel(r), detail: r.display_name,
-    lat: parseFloat(r.lat), lng: parseFloat(r.lon),
+    lat: parseFloat(r.lat), lng: parseFloat(r.lon), exact: isExactNominatim(r),
   }))
 }
 

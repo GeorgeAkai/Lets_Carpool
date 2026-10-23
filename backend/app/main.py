@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
 
     # Base URL of the self-hosted OSRM (see docker-compose.yml `osrm`). Used
-    # server-side to store driver routes and compute rider detours. Empty
+    # server-side to store driver routes and compute passenger detours. Empty
     # disables routing: trips are stored without a route and search falls back
     # to endpoint-radius matching.
     osrm_base_url: str = "http://localhost:5001"
@@ -100,7 +100,7 @@ class VehicleUpdate(BaseModel):
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
-    # Omitted = keep the stored plate. Shown to riders only once accepted.
+    # Omitted = keep the stored plate. Shown to passengers only once accepted.
     plate: str | None = Field(default=None, max_length=12)
 
 
@@ -147,6 +147,14 @@ class PricePreview(BaseModel):
     pickup_location_id: str
     destination_location_id: str
     seats_available: int = Field(..., ge=1, le=8)
+
+
+class DriverTripUpdate(BaseModel):
+    target_date: date | None = None
+    flexibility: str | None = None
+    seats_available: int | None = Field(default=None, ge=1, le=8)
+    departure_time: time | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class RatingCreate(BaseModel):
@@ -444,7 +452,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.patch("/ride-requests/{request_id}/pickup")
     async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser) -> dict[str, Any]:
         request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
-        # Lets a driver who already accepted this rider see the corrected pickup
+        # Lets a driver who already accepted this passenger see the corrected pickup
         # point without polling — mirrors the transition_connection broadcast below.
         for c in app.state.store.get_user_connections(user.id):
             if c.ride_request_id == request.id and c.status == "accepted":
@@ -483,7 +491,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.post("/driver-trips/price-preview")
     def driver_trip_price_preview(payload: PricePreview, user: CurrentUser) -> dict[str, Any]:
-        """'Each rider pays' while a driver is still filling in the post form."""
+        """'Each passenger pays' while a driver is still filling in the post form."""
         _ = user
         app.state.store._validate_location_ids(payload.pickup_location_id, payload.destination_location_id)
         draft = DriverTrip(
@@ -503,6 +511,19 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/driver-trips/{trip_id}/cancel")
     def cancel_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
         trip = app.state.store.cancel_driver_trip(user.id, trip_id)
+        return serialize_driver_trip(app.state.store, trip, exact=True)
+
+    @app.post("/driver-trips/{trip_id}/pause")
+    def pause_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        return serialize_driver_trip(app.state.store, app.state.store.pause_driver_trip(user.id, trip_id), exact=True)
+
+    @app.post("/driver-trips/{trip_id}/resume")
+    def resume_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        return serialize_driver_trip(app.state.store, app.state.store.resume_driver_trip(user.id, trip_id), exact=True)
+
+    @app.patch("/driver-trips/{trip_id}")
+    def update_driver_trip(trip_id: str, payload: DriverTripUpdate, user: CurrentUser) -> dict[str, Any]:
+        trip = app.state.store.update_driver_trip(user.id, trip_id, payload.model_dump(exclude_unset=True))
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.get("/driver-trips/search")
@@ -532,6 +553,11 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
             "remaining": result["remaining"],
         }
+
+    @app.get("/driver-trips/{trip_id}/matches")
+    def driver_trip_matches(trip_id: str, user: CurrentUser) -> list[dict[str, Any]]:
+        matches = app.state.store.rider_matches(user.id, trip_id)
+        return [serialize_ride_request(app.state.store, rr, exact=False) for rr in matches]
 
     @app.post("/driver-trips/{trip_id}/proposal/skip")
     def skip_driver_trip_proposal(trip_id: str, payload: DriverProposalSkip, user: CurrentUser) -> dict[str, Any]:
@@ -697,6 +723,13 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.get("/connections/{connection_id}/live")
     def connection_live_status(connection_id: str, user: CurrentUser) -> dict[str, Any]:
         return serialize(app.state.store.trip_day_status(user.id, connection_id))
+
+    @app.post("/connections/{connection_id}/picked-up")
+    async def driver_picked_up(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        connection = app.state.store.mark_picked_up(user.id, connection_id)
+        rr = app.state.store.get_ride_request(connection.ride_request_id)
+        await app.state.ws_manager.broadcast([rr.rider_id], {"type": "connection_update", "connection_id": connection_id, "status": connection.status})
+        return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/{connection_id}/at-pickup")
     async def rider_at_pickup(connection_id: str, user: CurrentUser) -> dict[str, Any]:
@@ -991,7 +1024,7 @@ def serialize_driver_trip(store: Store, trip: Any, exact: bool) -> dict[str, Any
     data["driver_photo_url"] = driver_profile.photo_url if driver_profile else None
     data["driver_stats"] = store.user_stats(trip.driver_id)
     vehicle = store.get_vehicle(trip.driver_id)
-    # Make/model/color help riders spot the car; the plate waits for acceptance.
+    # Make/model/color help passengers spot the car; the plate waits for acceptance.
     data["vehicle"] = ({"make": vehicle.make, "model": vehicle.model, "color": vehicle.color,
                         "car_type": vehicle.car_type} if vehicle else None)
     data["pricing"] = store.trip_pricing(trip)
@@ -1010,18 +1043,19 @@ def serialize_connection(store: Store, connection: Any, viewer_id: str | None = 
     data["rider_profile"] = _public_profile(store, rr.rider_id)
     data["driver_profile"] = _public_profile(store, trip.driver_id)
     # Contact details unlock once the ride is accepted: the other party's
-    # phone and, for the rider, the plate to look for at pickup.
+    # phone and, for the passenger, the plate to look for at pickup.
     if exact:
-        rider = store.get_profile(rr.rider_id)
+        passenger = store.get_profile(rr.rider_id)
         driver = store.get_profile(trip.driver_id)
         vehicle = store.get_vehicle(trip.driver_id)
         if data["rider_profile"] is not None:
-            data["rider_profile"]["phone"] = rider.phone if rider else None
+            data["rider_profile"]["phone"] = passenger.phone if passenger else None
         if data["driver_profile"] is not None:
             data["driver_profile"]["phone"] = driver.phone if driver else None
         data["driver_trip"]["vehicle"] = {**(data["driver_trip"]["vehicle"] or {}),
                                           "plate": vehicle.plate if vehicle else None}
     data["my_rating"] = store.my_rating_for(viewer_id, connection.id) if viewer_id else None
+    data["fare"] = store.connection_fare(connection)
     return data
 
 

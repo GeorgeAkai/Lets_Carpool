@@ -165,7 +165,7 @@ def run_migrations(database_url: str) -> None:
     """)
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS notes TEXT")
     # The driver's actual road route (from OSRM at creation time), so search can
-    # match riders against a corridor rather than just the two endpoints. NULL
+    # match passengers against a corridor rather than just the two endpoints. NULL
     # for trips created before this existed or while routing was unavailable;
     # search falls back to endpoint-radius matching for those.
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_geog GEOGRAPHY(LINESTRING, 4326)")
@@ -173,7 +173,7 @@ def run_migrations(database_url: str) -> None:
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_duration_s DOUBLE PRECISION")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_driver_trips_route_geog ON driver_trips USING GIST (route_geog)")
 
-    # Trips a rider has skipped when the system proposed their next match, so
+    # Trips a passenger has skipped when the system proposed their next match, so
     # the same trip isn't proposed again for that request. No FKs: a skip is
     # just a hint and shouldn't block deleting/archiving either listing.
     cur.execute("""
@@ -186,7 +186,7 @@ def run_migrations(database_url: str) -> None:
     """)
 
     # Same idea from the driver's side: ride requests a driver skipped when the
-    # system proposed a rider for their trip. Separate from match_skips so one
+    # system proposed a passenger for their trip. Separate from match_skips so one
     # side's skip never hides the listing from the other.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS driver_match_skips (
@@ -323,7 +323,7 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
-    # ── Trip-planning, trust and trip-day data (rider/driver redesign) ──────
+    # ── Trip-planning, trust and trip-day data (passenger/driver redesign) ──────
     # Optional exact departure time alongside the date + flexibility window;
     # arrival is derived from the stored route duration, never stored.
     cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS departure_time TIME")
@@ -339,8 +339,10 @@ def run_migrations(database_url: str) -> None:
     # Set by an admin after checking ID; drives the "Verified" badge/filter
     # and auto-accept.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_verified BOOLEAN NOT NULL DEFAULT FALSE")
-    # Trip-day: when the rider tapped "I'm at the pickup spot".
+    # Trip-day: when the passenger tapped "I'm at the pickup spot".
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS rider_at_pickup_at TIMESTAMPTZ")
+    # Driver confirmed the passenger is in the car (the ride is en route).
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (

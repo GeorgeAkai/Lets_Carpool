@@ -4,7 +4,7 @@ import { Avatar } from './home'
 import type { Connection } from './home'
 
 // One-tap handling of ride requests from anywhere in the app: whoever receives
-// a pending connection (the driver for a rider's request, or the rider for a
+// a pending connection (the driver for a passenger's request, or the passenger for a
 // driver's offer) sees it here with the pickup and Accept / Decline, instead
 // of having to open the inbox thread first. After accepting, the card offers
 // the next action (navigate to the pickup, or open the chat).

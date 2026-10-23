@@ -22,7 +22,7 @@ const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String
 
 const ME = {
   id: "usr_me", email: "sam@example.com", email_domain: "example.com", status: "active",
-  profile: { user_id: "usr_me", display_name: "Sam Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+  profile: { user_id: "usr_me", display_name: "Sam Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
   vehicle: { user_id: "usr_me", make: "Honda", model: "Fit", color: "Red", seats: 5, car_type: "sedan", has_license: true, has_insurance: true, has_good_driving_record: true },
 };
 
@@ -52,7 +52,9 @@ function stubApi(routes: Record<string, unknown | Handler>) {
     if (raw.startsWith("https://nominatim.openstreetmap.org")) {
       if (raw.includes("/reverse")) return { ok: true, json: async () => ({ display_name: "Elm St, Chico, California", address: { road: "Elm St", city: "Chico", state: "California" } }) };
       const q = new URL(raw).searchParams.get("q") ?? "";
-      return { ok: true, json: async () => [{ place_id: 9, name: q, display_name: `${q}, California, United States`, lat: "38.58", lon: "-121.49", address: { city: q, state: "California" } }] };
+      return { ok: true, json: async () => [{ place_id: 9, name: q, display_name: `${q}, California, United States`, lat: "38.58", lon: "-121.49",
+        // "Area …" queries geocode to a whole city (no house number); anything else to a street address.
+        address: q.startsWith("Area") ? { city: q, state: "California" } : { house_number: "100", road: q, city: q, state: "California" } }] };
     }
     const method = (init?.method ?? "GET").toUpperCase();
     const path = raw.replace(BASE, "").split("?")[0];
@@ -88,7 +90,7 @@ async function pickDestination(user: ReturnType<typeof userEvent.setup>, text: s
   fireEvent.mouseDown(within(option).getByRole("button"));
 }
 
-describe("Rider flow: Home → Results → Ride details", () => {
+describe("Passenger flow: Home → Results → Ride details", () => {
   useMobileViewport();
   beforeEach(() => {
     // A real pickup point is required to open a ride request.
@@ -97,6 +99,20 @@ describe("Rider flow: Home → Results → Ride details", () => {
     } });
   });
   afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); Reflect.deleteProperty(navigator, "geolocation"); });
+
+  it("asks passengers for a street address instead of accepting a whole city", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    stubApi({ ...BASE_ROUTES });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await user.type(await screen.findByPlaceholderText(/search a destination/i), "Area Sacramento");
+    const option = await screen.findByRole("option", { name: /area sacramento/i });
+    fireEvent.mouseDown(within(option).getByRole("button"));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/full street address/i);
+    expect(screen.getByRole("button", { name: /find me a ride/i })).toBeDisabled();
+  });
 
   it("finds rides, sorts them, and requests a seat with the real destination", async () => {
     const user = userEvent.setup();
@@ -177,7 +193,7 @@ describe("Rider flow: Home → Results → Ride details", () => {
     const conn = calls.find(c => c.key === "POST /connections")!.body as Record<string, unknown>;
     expect(conn.driver_trip_id).toBe(PRIYA.id);
 
-    // Once Priya accepts, the rider lands on the trip-day screen.
+    // Once Priya accepts, the passenger lands on the trip-day screen.
     await screen.findByText(/ride confirmed/i, undefined, { timeout: 8000 });
     await screen.findByRole("button", { name: /i’m at the pickup spot/i });
     expect(screen.queryByText(/waiting for priya/i)).toBeNull();
@@ -212,7 +228,7 @@ describe("Trip day", () => {
   useMobileViewport();
   afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
 
-  it("shows the live ETA, plate and call link, and checks the rider in at pickup", async () => {
+  it("shows the live ETA, plate and call link, and checks the passenger in at pickup", async () => {
     const user = userEvent.setup();
     signIn("rider");
     const accepted = {
@@ -221,7 +237,7 @@ describe("Trip day", () => {
       ride_request: { id: "rrq_1", rider_id: "usr_me", pickup: { id: "a", label: "Elm St & 3rd, Chico, CA", exact: true, latitude: 39.7, longitude: -121.8 }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "morning", passenger_count: 1, tags: [], status: "matched", created_at: "x" },
       driver_trip: { ...PRIYA, vehicle: { ...PRIYA.vehicle, plate: "8KXR 214" } },
       driver_profile: { user_id: PRIYA.driver_id, display_name: "Priya", photo_url: null, bio: null, photo_verified: true, interests: [], nationality: null, phone: "+1 555 0100" },
-      rider_profile: { user_id: "usr_me", display_name: "Sam Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+      rider_profile: { user_id: "usr_me", display_name: "Sam Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
     };
     const calls = stubApi({
       ...BASE_ROUTES,
