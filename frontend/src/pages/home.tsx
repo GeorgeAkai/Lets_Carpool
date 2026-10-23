@@ -103,6 +103,8 @@ export interface LocationValue {
   label: string
   lat: number
   lng: number
+  // A whole city/area rather than a street address (drivers may pick these).
+  general?: boolean
 }
 
 // ─── Location autocomplete ────────────────────────────────────────────────────
@@ -188,7 +190,7 @@ export function LocationInput({
       return
     }
     setNotExact(false)
-    onChange({ label: r.label, lat: r.lat, lng: r.lng })
+    onChange({ label: r.label, lat: r.lat, lng: r.lng, general: r.exact === false })
   }
 
   const bare = variant === 'bare'
@@ -1553,8 +1555,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
     setSubmitted(true); setError('')
     try {
       const [pickupLoc, destLoc] = await Promise.all([
-        api.createLocation(from.label, from.lat, from.lng),
-        api.createLocation(to.label, to.lat, to.lng),
+        api.createLocation(from.label, from.lat, from.lng, from.general),
+        api.createLocation(to.label, to.lat, to.lng, to.general),
       ])
       if (type === 'driver') {
         const trip = await api.createDriverTrip({
@@ -3671,7 +3673,7 @@ export function Home() {
                     : userCoords ? { label: await reverseGeocode(userCoords.lat, userCoords.lng), lat: userCoords.lat, lng: userCoords.lng } : null
                   if (!from) { showToast('Turn on location or pick a start point first', 'error'); return }
                   try {
-                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng), api.createLocation(to.label, to.lat, to.lng)])
+                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng, from.general), api.createLocation(to.label, to.lat, to.lng, to.general)])
                     const route = await api.createSavedRoute({ label, pickup_location_id: p.id, destination_location_id: d.id, departure_time: rideSearch.time || null })
                     setSavedRoutes(prev => [...prev, route]); showToast('Route saved', 'success')
                   } catch (e) { showToast(e instanceof Error ? e.message : 'Could not save route', 'error') }

@@ -107,6 +107,9 @@ def run_migrations(database_url: str) -> None:
     # populate this at insert time (see Store.create_location); this backfills
     # any rows written before the column existed.
     cur.execute("ALTER TABLE locations ADD COLUMN IF NOT EXISTS geog GEOGRAPHY(POINT, 4326)")
+    # A whole city/neighbourhood rather than a street address (e.g. a driver
+    # heading to "Sacramento"); matching treats it as an area, not a point.
+    cur.execute("ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_general BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("""
         UPDATE locations SET geog = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
         WHERE geog IS NULL

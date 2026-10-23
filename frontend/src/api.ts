@@ -444,8 +444,10 @@ export function suggestRoute(
 
 // ─── Locations ────────────────────────────────────────────────────────────────
 
-export function createLocation(label: string, latitude: number, longitude: number): Promise<LocationView> {
-  return request<LocationView>("POST", "/locations", { label, latitude, longitude });
+// `isGeneral`: the point stands for a whole area (a city), not an address, so
+// searches treat it as the surrounding area rather than a pin.
+export function createLocation(label: string, latitude: number, longitude: number, isGeneral = false): Promise<LocationView> {
+  return request<LocationView>("POST", "/locations", { label, latitude, longitude, ...(isGeneral ? { is_general: true } : {}) });
 }
 
 // ─── Driver trips ─────────────────────────────────────────────────────────────

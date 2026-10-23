@@ -111,6 +111,8 @@ class LocationCreate(BaseModel):
     provider: str | None = None
     provider_place_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # True when the point stands for a whole area (a city) rather than an address.
+    is_general: bool = False
 
 
 class RideRequestCreate(BaseModel):

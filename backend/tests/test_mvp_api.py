@@ -288,7 +288,7 @@ def test_locations_are_normalized_and_can_be_shown_approximately() -> None:
     exact = api.get(f"/locations/{created['id']}?exact=true", headers=headers).json()
 
     assert created["latitude"] == 37.87
-    assert approximate == {"id": created["id"], "label": "Berkeley, CA", "exact": False}
+    assert approximate == {"id": created["id"], "label": "Berkeley, CA", "exact": False, "general": False}
     assert exact["label"] == "123 Exact St, Berkeley, CA"
     assert exact["exact"] is True
 
@@ -1295,3 +1295,27 @@ def test_only_the_driver_can_get_or_skip_proposals_for_their_trip() -> None:
     assert api.post(
         f"/driver-trips/{trip['id']}/proposal/skip", headers=other_headers, json={"ride_request_id": "x"},
     ).status_code == 403
+
+
+def test_driver_heading_to_a_general_area_is_visible_to_a_passenger_with_a_specific_address() -> None:
+    api = corridor_client(FakeRouter())
+    _, passenger_headers = auth(api, "gen-passenger@example.edu", "Gen Passenger")
+    _, exact_driver = auth(api, "gen-exact@example.com", "Exact Driver")
+    _, area_driver = auth(api, "gen-area@example.com", "Area Driver")
+
+    def loc(headers, label, lat, lng, general=False):
+        r = api.post("/locations", headers=headers, json={"label": label, "latitude": lat, "longitude": lng, "is_general": general})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    start = loc(area_driver, "Chico, CA", 37.0, -122.0, general=True)
+    # Same route twice: one ends at an exact address, one at the "city".
+    exact_trip = post_trip(api, exact_driver, loc(exact_driver, "1 Main St", 37.0, -122.0), loc(exact_driver, "9 Oak Ave", 37.0, -121.90))
+    area_trip = post_trip(api, area_driver, start, loc(area_driver, "Sacramento, CA", 37.0, -121.90, general=True))
+
+    # The passenger's address sits ~5.5 km off the line, far outside the street-level buffer.
+    params = {"pickup_latitude": 37.0, "pickup_longitude": -121.98, "destination_latitude": 37.05, "destination_longitude": -121.95}
+    found = {t["id"] for t in api.get("/driver-trips/search", headers=passenger_headers, params=params).json()}
+
+    assert area_trip["id"] in found
+    assert exact_trip["id"] not in found

@@ -169,7 +169,6 @@ export function HomeScreen({
   const [editingRoutes, setEditingRoutes] = useState(false)
   const firstName = currentUser.profile.display_name.split(' ')[0]
   const isDriver = mode === 'driver'
-  const fromLabel = search.from?.label ?? (hasLocation ? 'Current location' : 'Current location (off)')
 
   const swap = () => {
     // Swapping onto "current location" needs real coordinates on the other side.
@@ -211,15 +210,15 @@ export function HomeScreen({
       <section aria-label="Plan a trip" className="bg-card border border-border rounded-[20px] p-1.5 flex flex-col">
         <div className="flex items-center gap-3 px-3 py-3.5">
           <span aria-hidden className="size-3 rounded-full border-[3px] border-info shrink-0" />
-          {search.from ? (
-            <LocationInput variant="bare" label="From" value={search.from} placeholder="Starting point" requireExact={!isDriver}
-              onChange={v => setSearch({ ...search, from: v })} />
-          ) : (
-            <div className="flex-1 min-w-0">
-              <span className="block text-xs text-muted-foreground">From</span>
-              <button type="button" onClick={() => setSearch({ ...search, from: { label: '', lat: NaN, lng: NaN } })}
-                className="block w-full text-left text-[17px] text-foreground truncate">{fromLabel}</button>
-            </div>
+          {/* Always an editable address box. Left empty it means "use my current
+              location"; typing a street address overrides it. */}
+          <LocationInput variant="bare" label="From" value={search.from && Number.isFinite(search.from.lat) ? search.from : null}
+            placeholder={hasLocation ? 'Current location' : 'Enter a pickup address'} requireExact={!isDriver}
+            onChange={v => setSearch({ ...search, from: v })} />
+          {hasLocation && search.from && Number.isFinite(search.from.lat) && (
+            <IconButton label="Use my current location" onClick={() => setSearch({ ...search, from: null })} className="bg-muted">
+              <Navigation className="size-[18px]" />
+            </IconButton>
           )}
           <IconButton label="Swap start and destination" onClick={swap} className="bg-muted">
             <ArrowUpDown className="size-[18px]" />
@@ -1014,7 +1013,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
     if (!from || !to) throw new Error('Pick both a start and a destination')
     const key = `${from.lat},${from.lng}|${to.lat},${to.lng}`
     if (locIds?.key === key) return locIds
-    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng), api.createLocation(to.label, to.lat, to.lng)])
+    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng, from.general), api.createLocation(to.label, to.lat, to.lng, to.general)])
     const ids = { pickup: p.id, dest: d.id, key }
     setLocIds(ids)
     return ids

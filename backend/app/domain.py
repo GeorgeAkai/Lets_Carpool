@@ -32,6 +32,9 @@ _KM_PER_MILE = 1.60934
 # Corridor matching: how far a passenger's pickup/destination may be from the
 # driver's route, and how many corridor survivors get a (routed) detour estimate.
 ROUTE_BUFFER_METERS = 1000
+# A driver heading to (or leaving from) a whole area such as "Sacramento" is
+# visible to anyone whose exact address is within this distance of it.
+GENERAL_AREA_RADIUS_METERS = 15000
 MAX_DETOUR_CANDIDATES = 10
 
 PENDING_CANNED_MESSAGES = {
@@ -137,6 +140,7 @@ class Location:
     provider_place_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=now_utc)
+    is_general: bool = False
 
     @property
     def approximate_label(self) -> str:
@@ -362,6 +366,7 @@ def _row_to_location(r: dict) -> Location:
         provider_place_id=r["provider_place_id"],
         metadata=meta or {},
         created_at=r["created_at"],
+        is_general=bool(r.get("is_general")),
     )
 
 def _row_to_ride_request(r: dict) -> RideRequest:
@@ -641,16 +646,17 @@ class Store:
             provider=data.get("provider"),
             provider_place_id=data.get("provider_place_id"),
             metadata=data.get("metadata") or {},
+            is_general=bool(data.get("is_general")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
                 """INSERT INTO locations (id, label, latitude, longitude, provider,
-                       provider_place_id, metadata, created_at, geog)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                       provider_place_id, metadata, created_at, is_general, geog)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                            ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography)""",
                 (loc.id, loc.label, loc.latitude, loc.longitude, loc.provider,
-                 loc.provider_place_id, json.dumps(loc.metadata), loc.created_at,
+                 loc.provider_place_id, json.dumps(loc.metadata), loc.created_at, loc.is_general,
                  loc.longitude, loc.latitude),
             )
         return loc
@@ -1142,18 +1148,20 @@ class Store:
                    )
                    AND (
                        (t.route_geog IS NOT NULL
-                        AND ST_DWithin(t.route_geog, rp.geog, %s)
-                        AND ST_DWithin(t.route_geog, rd.geog, %s)
+                        AND ST_DWithin(t.route_geog, rp.geog, CASE WHEN tp.is_general THEN %s ELSE %s END)
+                        AND ST_DWithin(t.route_geog, rd.geog, CASE WHEN td.is_general THEN %s ELSE %s END)
                         AND ST_LineLocatePoint(t.route_geog::geometry, rp.geog::geometry)
                             < ST_LineLocatePoint(t.route_geog::geometry, rd.geog::geometry))
                        OR
                        (t.route_geog IS NULL
-                        AND ST_DWithin(tp.geog, rp.geog, 5000)
-                        AND ST_DWithin(td.geog, rd.geog, 1000))
+                        AND ST_DWithin(tp.geog, rp.geog, CASE WHEN tp.is_general THEN %s ELSE 5000 END)
+                        AND ST_DWithin(td.geog, rd.geog, CASE WHEN td.is_general THEN %s ELSE 1000 END))
                    )
                    ORDER BY rr.created_at DESC""",
                 (trip.id, user_id, trip.seats_available - trip.seats_reserved,
-                 user_id, user_id, ROUTE_BUFFER_METERS, ROUTE_BUFFER_METERS),
+                 user_id, user_id,
+                 GENERAL_AREA_RADIUS_METERS, ROUTE_BUFFER_METERS, GENERAL_AREA_RADIUS_METERS, ROUTE_BUFFER_METERS,
+                 GENERAL_AREA_RADIUS_METERS, GENERAL_AREA_RADIUS_METERS),
             )
             rows = [r for r in cur.fetchall() if r["id"] not in excluded]
 
@@ -1232,20 +1240,23 @@ class Store:
             return None
         buffer_m = query.get("route_buffer_meters", ROUTE_BUFFER_METERS)
         pickup_pt = "ST_SetSRID(ST_MakePoint(%s, %s), 4326)"
+        # A trip whose pickup/destination is a general area (tp/td.is_general)
+        # matches anything inside that area, not just within the street-level buffer.
         corridor = f"""(dt.route_geog IS NOT NULL
-                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, %s)
-                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, %s)
+                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, CASE WHEN tp.is_general THEN %s ELSE %s END)
+                AND ST_DWithin(dt.route_geog, {pickup_pt}::geography, CASE WHEN td.is_general THEN %s ELSE %s END)
                 AND ST_LineLocatePoint(dt.route_geog::geometry, {pickup_pt})
                     < ST_LineLocatePoint(dt.route_geog::geometry, {pickup_pt}))"""
         fallback = """(dt.route_geog IS NULL
-                AND ST_DWithin(tp.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
-                AND ST_DWithin(td.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s))"""
+                AND ST_DWithin(tp.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, CASE WHEN tp.is_general THEN %s ELSE %s END)
+                AND ST_DWithin(td.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, CASE WHEN td.is_general THEN %s ELSE %s END))"""
         plng, plat = query["pickup_longitude"], query["pickup_latitude"]
         dlng, dlat = query["destination_longitude"], query["destination_latitude"]
+        area = GENERAL_AREA_RADIUS_METERS
         params = [
-            plng, plat, buffer_m, dlng, dlat, buffer_m, plng, plat, dlng, dlat,
-            plng, plat, query.get("pickup_radius_meters", 5000),
-            dlng, dlat, query.get("destination_radius_meters", 1000),
+            plng, plat, area, buffer_m, dlng, dlat, area, buffer_m, plng, plat, dlng, dlat,
+            plng, plat, area, query.get("pickup_radius_meters", 5000),
+            dlng, dlat, area, query.get("destination_radius_meters", 1000),
         ]
         return "", f"AND ({corridor} OR {fallback})", params
 
@@ -1317,17 +1328,17 @@ class Store:
         params: list[Any] = []
         if query.get("destination_latitude") is not None:
             joins.append(f"JOIN locations dest_loc ON dest_loc.id = {destination_fk}")
-            conditions.append("AND ST_DWithin(dest_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)")
+            conditions.append("AND ST_DWithin(dest_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, CASE WHEN dest_loc.is_general THEN %s ELSE %s END)")
             params += [
                 query["destination_longitude"], query["destination_latitude"],
-                query.get("destination_radius_meters", 1000),
+                GENERAL_AREA_RADIUS_METERS, query.get("destination_radius_meters", 1000),
             ]
         if query.get("pickup_latitude") is not None:
             joins.append(f"JOIN locations pickup_loc ON pickup_loc.id = {pickup_fk}")
-            conditions.append("AND ST_DWithin(pickup_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)")
+            conditions.append("AND ST_DWithin(pickup_loc.geog, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, CASE WHEN pickup_loc.is_general THEN %s ELSE %s END)")
             params += [
                 query["pickup_longitude"], query["pickup_latitude"],
-                query.get("pickup_radius_meters", 5000),
+                GENERAL_AREA_RADIUS_METERS, query.get("pickup_radius_meters", 5000),
             ]
         return " ".join(joins), " ".join(conditions), params
 
@@ -2426,7 +2437,7 @@ class Store:
 
     def location_view(self, location_id: str, exact: bool) -> dict[str, Any]:
         loc = self.get_location(location_id)
-        base: dict[str, Any] = {"id": loc.id, "label": loc.label if exact else loc.approximate_label, "exact": exact}
+        base: dict[str, Any] = {"id": loc.id, "label": loc.label if exact else loc.approximate_label, "exact": exact, "general": loc.is_general}
         if exact:
             base.update({"latitude": loc.latitude, "longitude": loc.longitude})
         return base

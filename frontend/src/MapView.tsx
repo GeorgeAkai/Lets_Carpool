@@ -4,8 +4,9 @@ import type { NearbyDriver, RouteSuggestion } from "./api"
 import { loadGoogleMaps, searchPlaces, fetchRoute } from "./lib/googleMaps"
 import type { LineString, PlaceResult, RouteGeometry } from "./lib/googleMaps"
 import {
-  MapPin, Navigation, X, Car, Search, Crosshair, ChevronUp, ChevronDown,
+  MapPin, Navigation, X, Car, Search, Crosshair, ChevronUp, ChevronDown, Sun, Moon,
 } from "lucide-react"
+import { useTheme } from "next-themes"
 
 export interface TripRoute {
   pickupLat: number
@@ -37,9 +38,15 @@ const CAR_EMOJIS: Record<string, string> = {
   suv: "🚙", van: "🚐", minivan: "🚐", truck: "🚚", sedan: "🚗", other: "🚗",
 }
 
-// ── Dark Google basemap ────────────────────────────────────────────────────
-// Google Maps is the primary basemap. The map stays dark regardless of the
-// app theme, since every overlay on it is styled for a dark canvas.
+// ── Google basemap: dark or light ───────────────────────────────────────────
+// Google Maps is the primary basemap. It follows the app theme until the user
+// flips it with the sun/moon button on the map. The floating panels carry
+// their own dark backgrounds, so they read fine over either basemap.
+const LIGHT_MAP_STYLES: google.maps.MapTypeStyle[] = [
+  { featureType: "poi", stylers: [{ visibility: "off" }] },
+  { featureType: "transit", stylers: [{ visibility: "off" }] },
+]
+
 const DARK_MAP_STYLES: google.maps.MapTypeStyle[] = [
   { elementType: "geometry", stylers: [{ color: "#1d2433" }] },
   { elementType: "labels.text.fill", stylers: [{ color: "#9aa7bd" }] },
@@ -53,6 +60,16 @@ const DARK_MAP_STYLES: google.maps.MapTypeStyle[] = [
   { featureType: "water", elementType: "geometry", stylers: [{ color: "#0f1626" }] },
 ]
 const ACCENT = "#38bdf8"
+// Sky blue vanishes on a light basemap, so routes and the user dot go deeper.
+const ACCENT_LIGHT = "#2563eb"
+const MAP_THEME_KEY = "carpool_map_theme"
+
+function storedMapTheme(): "light" | "dark" | null {
+  try {
+    const v = localStorage.getItem(MAP_THEME_KEY)
+    return v === "light" || v === "dark" ? v : null
+  } catch { return null }
+}
 
 // ── Marker motion interpolation (pure, unit-testable) ──────────────────────────
 // Smoothly glides a marker between successive polled positions instead of
@@ -272,7 +289,15 @@ interface Props {
 }
 
 export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
-  const accentColor = ACCENT
+  const { resolvedTheme } = useTheme()
+  const [mapThemeChoice, setMapThemeChoice] = useState<"light" | "dark" | null>(storedMapTheme)
+  const mapTheme = mapThemeChoice ?? (resolvedTheme === "light" ? "light" : "dark")
+  const accentColor = mapTheme === "light" ? ACCENT_LIGHT : ACCENT
+  const toggleMapTheme = () => {
+    const next = mapTheme === "light" ? "dark" : "light"
+    setMapThemeChoice(next)
+    try { localStorage.setItem(MAP_THEME_KEY, next) } catch { /* private mode */ }
+  }
 
   const mapRef = useRef<google.maps.Map | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -360,6 +385,11 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   const mode: "browse" | "trip" | "driving" = drivingTo ? "driving" : tripRoute ? "trip" : "browse"
 
+  useEffect(() => {
+    mapRef.current?.setOptions({ styles: mapTheme === "light" ? LIGHT_MAP_STYLES : DARK_MAP_STYLES })
+    routeLineRef.current?.setOptions({ strokeColor: accentColor })
+  }, [mapTheme, accentColor, mapReady])
+
   // ── Init map ────────────────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false
@@ -369,7 +399,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       const map = new maps.Map(containerRef.current, {
         center: userCoords ? toLatLngLiteral([userCoords.lat, userCoords.lng]) : { lat: 37.7749, lng: -122.4194 },
         zoom: 14,
-        styles: DARK_MAP_STYLES,
+        styles: mapTheme === "light" ? LIGHT_MAP_STYLES : DARK_MAP_STYLES,
         disableDefaultUI: true,
         zoomControl: false,
         clickableIcons: false,
@@ -746,7 +776,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
           rounding. Mobile: fills the viewport above the bottom nav. Desktop:
           fills the content column below the top bar. Everything else floats
           over it. */}
-      <div className="fixed inset-x-0 top-0 bottom-16 z-0 xl:relative xl:inset-auto xl:bottom-auto xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden bg-[#0e1626]">
+      <div className={`fixed inset-x-0 top-0 bottom-16 z-0 xl:relative xl:inset-auto xl:bottom-auto xl:h-[calc(100dvh-6.5rem)] xl:overflow-hidden ${mapTheme === "light" ? "bg-[#e8eaed]" : "bg-[#0e1626]"}`}>
         <div ref={containerRef} className="absolute inset-0 w-full h-full z-0" />
         {mapUnavailable && (
           <div className="absolute inset-0 z-[1] flex items-center justify-center bg-muted p-6 text-center text-sm text-muted-foreground">
@@ -772,6 +802,14 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                 <X className="size-4" />
               </button>
             )}
+            <button
+              onClick={toggleMapTheme}
+              aria-label={mapTheme === "light" ? "Switch map to dark mode" : "Switch map to light mode"}
+              title={mapTheme === "light" ? "Dark map" : "Light map"}
+              className="size-10 rounded-full bg-slate-900/75 text-white backdrop-blur-md shadow-lg flex items-center justify-center hover:bg-slate-900"
+            >
+              {mapTheme === "light" ? <Moon className="size-4" /> : <Sun className="size-4" />}
+            </button>
             <button
               onClick={recenter}
               aria-label="Re-center map"
