@@ -56,13 +56,13 @@ echo "Deployed: $URL"
 # Daily expiry sweep (Vercel Cron equivalent). Sends the same bearer secret.
 CRON_SECRET="$(gcloud secrets versions access latest --secret carpool-cron-secret)"
 JOB="${SERVICE}-expire"
-ARGS=(--location "$REGION" --schedule "0 4 * * *" --time-zone "Etc/UTC"
-      --uri "${URL}/cron/expire" --http-method GET
-      --headers "Authorization=Bearer ${CRON_SECRET}")
+COMMON=(--location "$REGION" --schedule "0 4 * * *" --time-zone "Etc/UTC"
+        --uri "${URL}/cron/expire" --http-method GET)
+# `create` takes --headers; `update` calls it --update-headers (and rejects --headers).
 if gcloud scheduler jobs describe "$JOB" --location "$REGION" >/dev/null 2>&1; then
-  gcloud scheduler jobs update http "$JOB" "${ARGS[@]}"
+  gcloud scheduler jobs update http "$JOB" "${COMMON[@]}" --update-headers "Authorization=Bearer ${CRON_SECRET}"
 else
-  gcloud scheduler jobs create http "$JOB" "${ARGS[@]}"
+  gcloud scheduler jobs create http "$JOB" "${COMMON[@]}" --headers "Authorization=Bearer ${CRON_SECRET}"
 fi
 
 curl -fsS "${URL}/health" && echo
