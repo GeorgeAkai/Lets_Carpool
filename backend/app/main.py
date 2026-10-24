@@ -9,6 +9,7 @@ from typing import Any, Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg2.pool import PoolError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -289,6 +290,11 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     app.state.store = store or Store(s.database_url, router=router)
     app.state.settings = s
     app.state.ws_manager = manager
+
+    @app.exception_handler(PoolError)
+    async def handle_pool_busy(_: Any, exc: PoolError) -> JSONResponse:
+        # Busy, not broken: tell the client to retry (and keep CORS headers on the reply).
+        return JSONResponse(status_code=503, content={"detail": "Server is busy, please retry"}, headers={"Retry-After": "2"})
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_: Any, exc: DomainError) -> JSONResponse:

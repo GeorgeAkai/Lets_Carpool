@@ -2,35 +2,65 @@
 from __future__ import annotations
 
 import os
+import threading
 from contextlib import contextmanager
 from typing import Generator
 
 import psycopg2
 import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.pool import PoolError, ThreadedConnectionPool
 
 _pool: ThreadedConnectionPool | None = None
 
 
+# How long a request waits for a free connection before giving up (seconds).
+POOL_WAIT_SECONDS = float(os.environ.get("DB_POOL_WAIT_SECONDS", "20"))
+
+_slots: threading.BoundedSemaphore | None = None
+_local = threading.local()
+
+
 def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10) -> None:
-    global _pool
+    global _pool, _slots
     # Each Cloud Run instance holds its own pool, so total connections =
     # instances x DB_POOL_MAX — keep that under the database's limit.
     maxconn = int(os.environ.get("DB_POOL_MAX", maxconn))
     _pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
+    # psycopg2's pool raises the instant it is empty. A page load fires many
+    # requests at once, so callers queue on this semaphore for a free connection instead.
+    _slots = threading.BoundedSemaphore(maxconn)
 
 
 def close_pool() -> None:
-    global _pool
+    global _pool, _slots
     if _pool:
         _pool.closeall()
         _pool = None
+    _slots = None
 
 
 @contextmanager
 def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
-    assert _pool is not None, "DB pool not initialised — call init_pool() first"
-    conn = _pool.getconn()
+    assert _pool is not None and _slots is not None, "DB pool not initialised — call init_pool() first"
+    # Re-entrant per thread: code that opens a connection while already holding
+    # one (e.g. a helper called inside a transaction) shares it instead of
+    # needing a second slot, which could deadlock a small pool. Only the
+    # outermost block commits / rolls back / returns the connection.
+    held = getattr(_local, "conn", None)
+    if held is not None:
+        yield held
+        return
+    if not _slots.acquire(timeout=POOL_WAIT_SECONDS):
+        raise PoolError("timed out waiting for a database connection")
+    try:
+        conn = _pool.getconn()
+        if conn.closed:  # the server/pooler dropped an idle connection
+            _pool.putconn(conn, close=True)
+            conn = _pool.getconn()
+    except Exception:
+        _slots.release()
+        raise
+    _local.conn = conn
     try:
         yield conn
         conn.commit()
@@ -38,7 +68,9 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         conn.rollback()
         raise
     finally:
+        _local.conn = None
         _pool.putconn(conn)
+        _slots.release()
 
 
 def run_migrations(database_url: str) -> None:

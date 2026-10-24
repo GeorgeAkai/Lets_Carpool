@@ -15,8 +15,8 @@ REPO="${REPO:-carpool}"                      # Artifact Registry repository
 ALLOWED_ORIGINS="${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS (space-separated frontend origins)}"
 SUPABASE_URL="${SUPABASE_URL:?Set SUPABASE_URL}"
 MIN_INSTANCES="${MIN_INSTANCES:-1}"          # 1 = no cold starts (small monthly cost)
-MAX_INSTANCES="${MAX_INSTANCES:-5}"
-DB_POOL_MAX="${DB_POOL_MAX:-5}"              # per instance; keep MAX_INSTANCES x this under the DB limit
+MAX_INSTANCES="${MAX_INSTANCES:-3}"
+DB_POOL_MAX="${DB_POOL_MAX:-10}"              # per instance; keep MAX_INSTANCES x this under the DB limit
 
 # Optional: Redis for cross-instance realtime (secret carpool-redis-url holds REDIS_URL).
 # For Memorystore (private IP) also set VPC_NETWORK and VPC_SUBNET so Cloud Run can reach it.
