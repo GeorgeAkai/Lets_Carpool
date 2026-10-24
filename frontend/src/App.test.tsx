@@ -257,7 +257,8 @@ describe("Feed view", () => {
     const connectBtn = screen.getByRole("button", { name: /instant request match/i });
     await user.click(connectBtn);
 
-    await waitFor(() => screen.getByText(/track pending offers/i));
+    // The request lands the passenger on the trip screen, waiting on the driver.
+    await waitFor(() => screen.getByText(/to accept/i));
   });
 });
 
@@ -481,6 +482,8 @@ describe("Connections view", () => {
 
     // Create a connection by clicking connect
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
+    await waitFor(() => screen.getByText(/to accept/i));
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 
     // Accept the connection
@@ -529,6 +532,8 @@ describe("Connections view", () => {
     await waitFor(() => screen.getByText("Logan Airport"));
 
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
+    await waitFor(() => screen.getByText(/to accept/i));
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 
     const declineBtn = screen.getByRole("button", { name: /decline/i });

@@ -6,7 +6,7 @@ import {
   MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle, Pencil, Pause, Play,
   Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, Navigation,
+  ClipboardList, Shield, Map, Package, Volume2, VolumeX, Camera, Moon, Sun, PlusCircle, User, Navigation,
   ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive, Home as HomeIcon,
 } from 'lucide-react'
 import { motion } from 'motion/react'
@@ -23,6 +23,7 @@ import { IncomingRequests } from './incoming-requests'
 import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
+import { playSound, soundForNotification, installSoundUnlock, isMuted, setMuted } from '../lib/sounds'
 import {
   HomeScreen, ResultsScreen, RideDetailScreen, FindRideScreen, TripDayScreen, OfferRideScreen, RideOutcome, RideCompleteSheet, fmtTime, fmtMoney,
   defaultRideSearch, pickNextTrip, type RideSearch,
@@ -2895,6 +2896,7 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, ini
   onSignOut: () => void; onOpenAdmin: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
 }) {
   const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
+  const [soundOff, setSoundOff] = useState(isMuted())
   return (
     <header className="sticky top-0 z-40 bg-card text-foreground border-b border-border">
       <div className="px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
@@ -2908,6 +2910,9 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, ini
         </div>
         {currentUser ? (
           <div className="flex items-center gap-2">
+            <button onClick={() => { const next = !soundOff; setMuted(next); setSoundOff(next); if (!next) playSound('message') }} className={iconBtn} aria-label={soundOff ? 'Turn notification sounds on' : 'Turn notification sounds off'}>
+              {soundOff ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+            </button>
             <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
@@ -3184,6 +3189,8 @@ export function Home() {
   }, [])
   showToastRef.current = showToast
 
+  useEffect(() => installSoundUnlock(), [])
+
   useEffect(() => {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
     const ws = api.createRealtime(currentUser.id, (msg: WsMessage) => {
@@ -3197,13 +3204,14 @@ export function Home() {
         const senderName = conn?.withUser.name ?? 'Someone'
         const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
         showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
+        if (m.sender_id !== currentUser.id) playSound('message')
         setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
         const before = connectionsRef.current.find(c => c.id === msg.connection_id)
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
         if (before && before.initiatorUserId === currentUser.id) {
-          if (msg.status === 'accepted') showToastRef.current(`🎉 ${before.withUser.name} accepted your request`, 'success')
-          else if (msg.status === 'declined') showToastRef.current(`${before.withUser.name} declined your request`, 'error')
+          if (msg.status === 'accepted') { showToastRef.current(`🎉 ${before.withUser.name} accepted your request`, 'success'); playSound('accepted') }
+          else if (msg.status === 'declined') { showToastRef.current(`${before.withUser.name} declined your request`, 'error'); playSound('declined') }
         }
         // Accepting reveals the pickup details and changes seat counts; refetch.
         loadConnections(currentUser.id)
@@ -3211,9 +3219,15 @@ export function Home() {
       } else if (msg.type === 'pickup_updated') {
         // A connection we hadn't seen yet (someone requested us) or new pickup details.
         const known = new Set(connectionsRef.current.map(c => c.id))
-        if (!known.has(msg.connection_id)) showToastRef.current('🚗 New ride request', 'success')
+        if (!known.has(msg.connection_id)) { showToastRef.current('🚗 New ride request', 'success'); playSound('request') }
         loadConnections(currentUser.id)
         loadMyListingsRef.current()
+      } else if (msg.type === 'notification') {
+        const n = msg.notification
+        setNotifications(prev => (prev.some(x => x.id === n.id) ? prev : [n, ...prev]))
+        // Accept/decline/request/chat already sound from their own events above.
+        const snd = soundForNotification(n.type)
+        if (snd === 'driving' || snd === 'arrived' || snd === 'paid') { playSound(snd); showToastRef.current(n.title, 'success') }
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
@@ -3420,7 +3434,7 @@ export function Home() {
       const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
       setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
       if (opts?.quiet) return
-      setInboxListingFilter(null); setConnDeepLink({ connectionId: newConn.id, section: 'chat' }); setView('connections')
+      setTripDayId(newConn.id); setView('trip')
     } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error'); if (opts?.quiet) throw e }
   }, [currentUser, userCoords, showToast, setView])
 
@@ -3482,12 +3496,12 @@ export function Home() {
   const transact = useCallback(async (id: string, action: 'accept' | 'decline' | 'cancel' | 'complete') => {
     const updated = await api.transitionConnection(id, action)
     setConnections(prev => prev.map(c => c.id === id ? { ...c, status: updated.status as ConnStatus, raw: updated } : c))
+    return updated
   }, [])
 
-  const onAccept = useCallback((id: string) => transact(id, 'accept'), [transact])
-  const onDecline = useCallback((id: string) => transact(id, 'decline'), [transact])
-  const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
-  const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
+  const onDecline = useCallback(async (id: string) => { await transact(id, 'decline') }, [transact])
+  const onCancel = useCallback(async (id: string) => { await transact(id, 'cancel') }, [transact])
+  const onComplete = useCallback(async (id: string) => { await transact(id, 'complete') }, [transact])
 
   const onUpdatePickup = useCallback(async (connectionId: string, rideRequestId: string, pickup: LocationValue) => {
     const location = await api.createLocation(pickup.label, pickup.lat, pickup.lng)
@@ -3525,6 +3539,16 @@ export function Home() {
     })
     setView('map')
   }, [setView])
+
+  // Accepting a ride that's for today puts the driver straight onto the
+  // drive-to-pickup map; a future ride just confirms and waits for its day.
+  const onAccept = useCallback(async (id: string) => {
+    const updated = await transact(id, 'accept')
+    if (!currentUser) return
+    const conn = apiConnectionToConnection(updated, currentUser.id)
+    if (conn.myRole !== 'driver') return
+    if (conn.date <= todayLocalISO()) onStartDriving(conn)
+  }, [transact, currentUser, onStartDriving])
 
   const onStopDriving = useCallback(() => {
     setDrivingTo(null)

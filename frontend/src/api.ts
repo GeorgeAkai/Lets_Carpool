@@ -260,6 +260,7 @@ export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
   | { type: "pickup_updated"; connection_id: string }
+  | { type: "notification"; notification: ApiNotification }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
@@ -340,6 +341,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
         if (seenNotifications.has(n.id)) continue;
         seenNotifications.add(n.id);
         if (primed && n.type === "chat_message" && n.related_id) chatConnectionIds.add(n.related_id);
+        else if (primed) events.push({ type: "notification", notification: n });
       }
       for (const connectionId of chatConnectionIds) {
         const messages = await getMessages(connectionId);

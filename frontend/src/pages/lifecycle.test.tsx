@@ -222,3 +222,47 @@ describe("Passenger mode", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: /ride complete/i })).toBeNull());
   });
 });
+
+describe("Driver accepting a request", () => {
+  useViewport(true);
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  const pending = (date: string) => connection({
+    status: "pending", initiator_user_id: "usr_rider",
+    ride_request: { ...RIDER_REQUEST, id: "rrq_1", rider_id: "usr_rider", pickup: loc("p", "Main St, Chico, CA"), destination: loc("d", "Sacramento, CA") },
+    driver_trip: { ...MY_TRIP, id: "trp_x", driver_id: "usr_me", target_date: date },
+    rider_profile: { ...ME.profile, user_id: "usr_rider", display_name: "Rae Passenger" }, driver_profile: { ...ME.profile },
+  });
+
+  it("goes straight to the drive-to-pickup map when the ride is today", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const conn = pending(today);
+    stubApi({
+      ...BASE_ROUTES,
+      "GET /me/connections": [conn],
+      "GET /connections/con_1/messages": [],
+      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
+    });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /^accept$/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /i've arrived/i })).toBeTruthy());
+  });
+
+  it("does not start driving for a future ride", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const conn = pending("2099-01-01");
+    stubApi({
+      ...BASE_ROUTES,
+      "GET /me/connections": [conn],
+      "GET /connections/con_1/messages": [],
+      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
+    });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /^accept$/i }));
+    await screen.findByText(/request accepted/i);
+    expect(screen.queryByRole("button", { name: /i've arrived/i })).toBeNull();
+  });
+});
