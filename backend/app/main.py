@@ -860,19 +860,17 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.websocket("/ws/{user_id}")
     async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
         manager: ConnectionManager = app.state.ws_manager
-        await manager.connect(user_id, websocket)
+        # Authenticate before accepting: the socket carries a user's private
+        # updates, so a missing, invalid or someone-else's token is refused at
+        # the handshake (the client sees a failed connection).
         token = websocket.query_params.get("token")
-        if token:
-            try:
-                decoded_id = decode_access_token(token, app.state.settings.jwt_secret)
-                if decoded_id != user_id:
-                    await websocket.close(code=4001)
-                    manager.disconnect(user_id)
-                    return
-            except DomainError:
-                await websocket.close(code=4001)
-                manager.disconnect(user_id)
-                return
+        try:
+            if not token or decode_access_token(token, app.state.settings.jwt_secret) != user_id:
+                raise DomainError("Unauthorized", 401)
+        except DomainError:
+            await websocket.close(code=4001)
+            return
+        await manager.connect(user_id, websocket)
         try:
             while True:
                 data = await websocket.receive_json()
