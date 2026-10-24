@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from "react"
 import * as api from "./api"
 import type { NearbyDriver, RouteSuggestion } from "./api"
+import { createLocationUploader } from "./lib/locationUploader"
+import { snapToPath } from "./lib/geo"
+import type { LatLng } from "./lib/geo"
 import { loadGoogleMaps, searchPlaces, fetchRoute } from "./lib/googleMaps"
 import type { LineString, PlaceResult, RouteGeometry } from "./lib/googleMaps"
 import {
@@ -208,6 +211,10 @@ interface MarkerAnimation {
 // Slightly under the driver-list poll interval so a car is always gliding toward
 // its latest known position rather than snapping then sitting idle.
 const MARKER_ANIM_DURATION_MS = 9200
+// Own-position marker: glide for as long as the last fix interval (≈ the GPS rate), bounded.
+const SELF_ANIM_MIN_MS = 600
+const SELF_ANIM_MAX_MS = 2500
+const CAMERA_FOLLOW_MS = 1500
 
 // Synthetic marker id for the driver's own live position while "Start Driving"
 // is active, so it can reuse the same lerp/heading animation machinery that
@@ -308,6 +315,10 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const markersRef = useRef<Record<string, DomMarker>>({})
   const markerHeadingsRef = useRef<Record<string, number>>({})
   const animsRef = useRef<Record<string, MarkerAnimation>>({})
+  const stopShareUploadRef = useRef<(() => void) | null>(null)
+  const drivingPathRef = useRef<LatLng[] | null>(null)
+  const lastSampleAtRef = useRef<number | null>(null)
+  const lastCameraAtRef = useRef(0)
   const rafIdRef = useRef<number | null>(null)
   const userMarkerRef = useRef<DomMarker | null>(null)
   const pickupMarkerRef = useRef<DomMarker | null>(null)
@@ -609,14 +620,17 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   const toggleSharing = useCallback(() => {
     if (sharing) {
       if (watchId != null) navigator.geolocation.clearWatch(watchId)
+      stopShareUploadRef.current?.()
       setWatchId(null); setSharing(false); return
     }
     if (!navigator.geolocation) return
+    const uploader = createLocationUploader(f => api.updateLocation(f.lat, f.lng, f.heading, f.speedKmh))
     const id = navigator.geolocation.watchPosition(
-      pos => api.updateLocation(pos.coords.latitude, pos.coords.longitude, pos.coords.heading ?? undefined, pos.coords.speed != null ? pos.coords.speed * 3.6 : undefined).catch(() => {}),
+      pos => uploader.push({ lat: pos.coords.latitude, lng: pos.coords.longitude, heading: pos.coords.heading ?? undefined, speedKmh: pos.coords.speed != null ? pos.coords.speed * 3.6 : undefined }),
       () => {},
-      { enableHighAccuracy: true, maximumAge: 5000 },
+      { enableHighAccuracy: true, maximumAge: 1000 },
     )
+    stopShareUploadRef.current = uploader.stop
     setWatchId(id); setSharing(true)
   }, [sharing, watchId])
 
@@ -627,22 +641,27 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
   // already known from their accepted ride request, so no address entry is
   // needed on either side) and streams it, Uber-nav style.
   useEffect(() => {
-    if (!drivingTo) { setDrivingSample(null); setDrivingGeoError(false); return }
+    if (!drivingTo) { setDrivingSample(null); setDrivingGeoError(false); drivingPathRef.current = null; lastSampleAtRef.current = null; return }
     if (!navigator.geolocation) { setDrivingGeoError(true); return }
     let lastPos: [number, number] | null = null
+    const uploader = createLocationUploader(f => api.updateLocation(f.lat, f.lng, f.heading, f.speedKmh))
     const id = navigator.geolocation.watchPosition(
       pos => {
-        const next: [number, number] = [pos.coords.latitude, pos.coords.longitude]
+        // Keep the car on the road: snap to the current route when we're close to it.
+        const raw = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+        const path = drivingPathRef.current
+        const snapped = path ? snapToPath(path, raw) : raw
+        const next: [number, number] = [snapped.lat, snapped.lng]
         const heading = pos.coords.heading
           ?? (lastPos ? bearingDegrees(lastPos, next) : bearingDegrees(next, [drivingTo.pickupLat, drivingTo.pickupLng]))
         lastPos = next
         setDrivingSample({ pos: next, heading })
-        api.updateLocation(next[0], next[1], heading, pos.coords.speed != null ? pos.coords.speed * 3.6 : undefined).catch(() => {})
+        uploader.push({ lat: next[0], lng: next[1], heading, speedKmh: pos.coords.speed != null ? pos.coords.speed * 3.6 : undefined })
       },
       () => setDrivingGeoError(true),
-      { enableHighAccuracy: true, maximumAge: 5000 },
+      { enableHighAccuracy: true, maximumAge: 1000 },
     )
-    return () => navigator.geolocation.clearWatch(id)
+    return () => { navigator.geolocation.clearWatch(id); uploader.stop() }
   }, [drivingTo])
 
   // ── "Start Driving" mode: animate the self marker + follow it on the map ───
@@ -662,7 +681,8 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       const currentHeading = prevAnim ? lerpAngle(prevAnim.fromHeading, prevAnim.toHeading, t) : (markerHeadingsRef.current[DRIVING_SELF_KEY] ?? heading)
       animsRef.current[DRIVING_SELF_KEY] = {
         from: currentPos, to: pos, fromHeading: currentHeading, toHeading: heading,
-        start: now, duration: MARKER_ANIM_DURATION_MS,
+        start: now,
+        duration: Math.min(SELF_ANIM_MAX_MS, Math.max(SELF_ANIM_MIN_MS, lastSampleAtRef.current ? now - lastSampleAtRef.current : 1000)),
       }
     } else {
       markerHeadingsRef.current[DRIVING_SELF_KEY] = heading
@@ -671,8 +691,10 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       markersRef.current[DRIVING_SELF_KEY] = m
       flyTo(map, pos, 16)
     }
+    lastSampleAtRef.current = now
     if (rafIdRef.current == null) rafIdRef.current = requestAnimationFrame(stepMarkerAnimations)
-    map.panTo(toLatLngLiteral(pos))
+    // Re-centring on every fix restarts the map's pan animation and judders; do it at a gentler cadence.
+    if (now - lastCameraAtRef.current >= CAMERA_FOLLOW_MS) { lastCameraAtRef.current = now; map.panTo(toLatLngLiteral(pos)) }
   }, [drivingSample, mode, accentColor, stepMarkerAnimations, mapReady])
 
   // ── "Start Driving" mode: pickup marker + route to the passenger ───────────────
@@ -705,6 +727,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       if (!mapRef.current || mode !== "driving") return
       if (result) {
         setRouteLine(result.geometry, false)
+        drivingPathRef.current = result.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
         setDrivingRoute(result)
       } else {
         setRouteLine({ type: "LineString", coordinates: [toLngLat(drivingSample.pos), toLngLat([drivingTo.pickupLat, drivingTo.pickupLng])] }, true)

@@ -1,6 +1,7 @@
 """PostgreSQL connection pool and schema bootstrap."""
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Generator
 
@@ -13,6 +14,9 @@ _pool: ThreadedConnectionPool | None = None
 
 def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10) -> None:
     global _pool
+    # Each Cloud Run instance holds its own pool, so total connections =
+    # instances x DB_POOL_MAX — keep that under the database's limit.
+    maxconn = int(os.environ.get("DB_POOL_MAX", maxconn))
     _pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
 
 

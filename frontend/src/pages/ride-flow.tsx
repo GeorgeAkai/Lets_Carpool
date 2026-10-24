@@ -681,6 +681,9 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 
 // ─── 4 · Trip day ─────────────────────────────────────────────────────────────
 
+// A live ride polls fast so the car on the map stays within a couple of seconds of the driver.
+const LIVE_POLL_MS = 2000
+
 export function TripDayScreen({
   connection, currentUserId, onClose, onMessage, onStartDriving, onComplete, showToast, onChanged,
 }: {
@@ -709,9 +712,9 @@ export function TripDayScreen({
 
   useEffect(() => {
     if (!accepted) return
-    const load = () => api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at); if (s.picked_up_at) setPickedUpAt(s.picked_up_at) }).catch(() => {})
+    const load = () => document.hidden ? undefined : api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at); if (s.picked_up_at) setPickedUpAt(s.picked_up_at) }).catch(() => {})
     load()
-    pollRef.current = setInterval(load, 6000)
+    pollRef.current = setInterval(load, LIVE_POLL_MS)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [connection.id, accepted])
 
@@ -787,6 +790,7 @@ export function TripDayScreen({
         <LiveTripMap
           phase={pickedUp ? 'enroute' : 'approach'}
           driver={live.driver ? { lat: live.driver.latitude, lng: live.driver.longitude } : null}
+          driverAt={live.driver?.updated_at ? Date.parse(live.driver.updated_at) : undefined}
           pickup={{ lat: live.pickup.latitude, lng: live.pickup.longitude, label: pickupLabel }}
           destination={{ lat: live.destination.latitude, lng: live.destination.longitude, label: destLabel }}
         />

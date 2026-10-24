@@ -22,11 +22,18 @@ COPY api/ api/
 # Cloud Run) and requires the container to listen on it within the startup
 # timeout. `exec` keeps gunicorn as PID 1 so it receives SIGTERM directly for
 # a clean shutdown, instead of a wrapping shell swallowing it.
+#
+# One worker per container by default: Cloud Run scales by adding instances,
+# the sync endpoints already run on a thread pool, the DB pool is per process,
+# and the in-memory WebSocket manager (ConnectionManager) then lives in a single
+# process. Raise WEB_CONCURRENCY only together with a bigger CPU allocation.
 EXPOSE 8080
 CMD exec gunicorn api.index:app \
     --worker-class uvicorn_worker.UvicornWorker \
-    --workers "${WEB_CONCURRENCY:-2}" \
+    --workers "${WEB_CONCURRENCY:-1}" \
     --bind "0.0.0.0:${PORT:-8080}" \
     --timeout 60 \
+    --graceful-timeout 20 \
+    --keep-alive 75 \
     --access-logfile - \
     --error-logfile -

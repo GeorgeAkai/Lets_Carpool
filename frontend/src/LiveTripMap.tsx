@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react"
 import { fetchRoute, loadGoogleMaps } from "./lib/googleMaps"
+import { metersBetween, snapToPath } from "./lib/geo"
 
 type Point = { lat: number; lng: number }
 
 export interface LiveTripMapProps {
   /** The driver's latest shared position; null until they start sharing. */
   driver: Point | null
+  /** When the driver's phone took that fix (ms since epoch); lets us work out speed between fixes. */
+  driverAt?: number
   pickup: Point & { label?: string }
   destination: Point & { label?: string }
   /** "approach": driver heading to the pickup. "enroute": passenger on board, heading to the destination. */
@@ -17,16 +20,12 @@ export interface LiveTripMapProps {
 // passed, so a 5 s position poll doesn't turn into a 5 s Directions call.
 const ROUTE_REFRESH_METERS = 60
 const ROUTE_REFRESH_MS = 20_000
-const GLIDE_MS = 4_500
-
-function metersBetween(a: Point, b: Point): number {
-  const R = 6_371_000
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180
-  const dLng = ((b.lng - a.lng) * Math.PI) / 180
-  const h = Math.sin(dLat / 2) ** 2 +
-    Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2
-  return 2 * R * Math.asin(Math.sqrt(h))
-}
+// The car eases toward where it is predicted to be (last fix + velocity × time
+// since), instead of sliding to each fix and stopping, so it keeps moving
+// between updates and corrects gently when the next one lands.
+const SMOOTH_TAU_MS = 600
+const MAX_PREDICT_MS = 5_000
+const MAX_SPEED_MPS = 50
 
 function fmtEta(seconds: number): string {
   const mins = Math.max(1, Math.round(seconds / 60))
@@ -60,13 +59,19 @@ function dot(maps: typeof google.maps, color: string, scale = 8): google.maps.Sy
  * pickup (passenger's "car approaching" view), then the route to the destination
  * once the passenger is picked up. Both the passenger and the driver can use it.
  */
-export function LiveTripMap({ driver, pickup, destination, phase, className = "" }: LiveTripMapProps) {
+export function LiveTripMap({ driver, driverAt, pickup, destination, phase, className = "" }: LiveTripMapProps) {
   const elRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<google.maps.Map | null>(null)
   const carRef = useRef<google.maps.Marker | null>(null)
   const lineRef = useRef<google.maps.Polyline | null>(null)
   const pinsRef = useRef<google.maps.Marker[]>([])
   const glideRef = useRef<number | null>(null)
+  const pathRef = useRef<Point[] | null>(null)
+  const fixRef = useRef<{ pos: Point; t: number } | null>(null)
+  // Motion model: last (road-snapped) fix, its arrival time, and velocity in degrees/ms.
+  const motionRef = useRef<{ pos: Point; at: number; vLat: number; vLng: number } | null>(null)
+  const shownRef = useRef<Point | null>(null)
+  const headingRef = useRef(0)
   const lastRouteRef = useRef<{ at: number; from: Point; phase: string } | null>(null)
   const [ready, setReady] = useState<"loading" | "ok" | "unavailable">("loading")
   const [eta, setEta] = useState<{ seconds: number; meters: number } | null>(null)
@@ -106,33 +111,56 @@ export function LiveTripMap({ driver, pickup, destination, phase, className = ""
     ]
   }, [ready, pickup.lat, pickup.lng, destination.lat, destination.lng]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // The car glides to each new position rather than jumping.
+  // Each new fix: snap it to the road, work out velocity from the previous fix,
+  // and (re)start the chase loop.
   useEffect(() => {
     const map = mapRef.current
     if (ready !== "ok" || !map || !driver) return
     const maps = google.maps
+    const arrival = performance.now()
+    const snapped = pathRef.current ? snapToPath(pathRef.current, driver) : driver
+    const t = driverAt ?? arrival
+    const prev = fixRef.current
+    let vLat = 0, vLng = 0
+    if (prev) {
+      const dt = t - prev.t
+      if (dt >= 500 && dt <= 20_000) {
+        const speed = metersBetween(prev.pos, snapped) / (dt / 1000)
+        if (speed <= MAX_SPEED_MPS) { vLat = (snapped.lat - prev.pos.lat) / dt; vLng = (snapped.lng - prev.pos.lng) / dt }
+      }
+    }
+    fixRef.current = { pos: snapped, t }
+    motionRef.current = { pos: snapped, at: arrival, vLat, vLng }
+
     if (!carRef.current) {
-      carRef.current = new maps.Marker({
-        map, position: driver, title: "Driver", zIndex: 10,
-        icon: carIcon(maps, 0),
-      })
-      return
+      shownRef.current = snapped
+      carRef.current = new maps.Marker({ map, position: snapped, title: "Driver", zIndex: 10, icon: carIcon(maps, 0) })
     }
     const car = carRef.current
-    const from = car.getPosition()
-    if (!from) { car.setPosition(driver); return }
-    const start = performance.now()
-    const a = { lat: from.lat(), lng: from.lng() }
-    // Turn the car to face the way it's moving (ignore GPS jitter under ~5 m).
-    if (metersBetween(a, driver) > 5) car.setIcon(carIcon(maps, bearing(a, driver)))
     if (glideRef.current) cancelAnimationFrame(glideRef.current)
+    let lastFrame = performance.now()
     const step = (now: number) => {
-      const t = Math.min(1, (now - start) / GLIDE_MS)
-      car.setPosition({ lat: a.lat + (driver.lat - a.lat) * t, lng: a.lng + (driver.lng - a.lng) * t })
-      if (t < 1) glideRef.current = requestAnimationFrame(step)
+      const m = motionRef.current, shown = shownRef.current
+      if (!m || !shown) return
+      const ahead = Math.min(now - m.at, MAX_PREDICT_MS)
+      const target = { lat: m.pos.lat + m.vLat * ahead, lng: m.pos.lng + m.vLng * ahead }
+      const k = 1 - Math.exp(-(now - lastFrame) / SMOOTH_TAU_MS)
+      lastFrame = now
+      const next = { lat: shown.lat + (target.lat - shown.lat) * k, lng: shown.lng + (target.lng - shown.lng) * k }
+      // Face the direction of travel (ignore jitter at a standstill).
+      if (metersBetween(shown, next) > 0.05 && (m.vLat !== 0 || m.vLng !== 0)) {
+        const b = bearing(shown, { lat: shown.lat + m.vLat * 1000, lng: shown.lng + m.vLng * 1000 })
+        let d = ((b - headingRef.current + 540) % 360) - 180
+        d = Math.max(-6, Math.min(6, d)) // turn at a bounded rate
+        if (Math.abs(d) > 0.5) { headingRef.current = (headingRef.current + d + 360) % 360; car.setIcon(carIcon(maps, headingRef.current)) }
+      }
+      shownRef.current = next
+      car.setPosition(next)
+      const settled = ahead >= MAX_PREDICT_MS || (m.vLat === 0 && m.vLng === 0)
+      if (!(settled && metersBetween(next, target) < 0.3)) glideRef.current = requestAnimationFrame(step)
     }
     glideRef.current = requestAnimationFrame(step)
-  }, [ready, driver?.lat, driver?.lng]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [ready, driver?.lat, driver?.lng, driverAt]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Route: driver → pickup while approaching, pickup/driver → destination once on board.
   useEffect(() => {
@@ -151,6 +179,7 @@ export function LiveTripMap({ driver, pickup, destination, phase, className = ""
     fetchRoute(origin.lat, origin.lng, target.lat, target.lng).then(route => {
       if (cancelled || !route) return
       const path = route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
+      pathRef.current = path
       if (!lineRef.current) {
         lineRef.current = new google.maps.Polyline({ map, strokeColor: "#2563eb", strokeOpacity: 0.9, strokeWeight: 5 })
       }

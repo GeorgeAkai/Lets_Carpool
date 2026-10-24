@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time
 from typing import Any, Annotated
@@ -13,6 +14,7 @@ from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, DriverTrip, Store, User
+from backend.app.realtime import ConnectionManager, RedisBus
 from backend.app.routing import GoogleRoutesClient, OSRMClient
 
 
@@ -52,6 +54,11 @@ class Settings(BaseSettings):
     # invoking scheduled requests. Required to trigger the /cron/expire sweep
     # or the manual expire endpoints below.
     cron_secret: str | None = None
+
+    # Redis URL (env REDIS_URL, e.g. rediss://default:pw@host:6379). When set,
+    # WebSocket messages fan out across all backend instances via pub/sub; unset,
+    # they're delivered only to sockets on the same instance.
+    redis_url: str | None = None
 
     # Space-separated allowlist of emails granted access to /admin/* endpoints
     # (see AdminUser below), matched case-insensitively.
@@ -253,36 +260,21 @@ class WarnUserRequest(BaseModel):
     message: str = Field(..., min_length=1)
 
 
-# ─── WebSocket connection manager ─────────────────────────────────────────────
-
-class ConnectionManager:
-    def __init__(self) -> None:
-        self._sockets: dict[str, WebSocket] = {}
-
-    async def connect(self, user_id: str, ws: WebSocket) -> None:
-        await ws.accept()
-        self._sockets[user_id] = ws
-
-    def disconnect(self, user_id: str) -> None:
-        self._sockets.pop(user_id, None)
-
-    async def send(self, user_id: str, data: dict[str, Any]) -> None:
-        ws = self._sockets.get(user_id)
-        if ws:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                self.disconnect(user_id)
-
-    async def broadcast(self, user_ids: list[str], data: dict[str, Any]) -> None:
-        await asyncio.gather(*[self.send(uid, data) for uid in user_ids], return_exceptions=True)
-
-
 # ─── App factory ──────────────────────────────────────────────────────────────
 
 def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="Carpool API")
     s = settings or Settings()
+    manager = ConnectionManager(RedisBus(s.redis_url) if s.redis_url else None)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await manager.start()
+        try:
+            yield
+        finally:
+            await manager.stop()
+
+    app = FastAPI(title="Carpool API", lifespan=lifespan)
     origins = s.allowed_origins.split()
     app.add_middleware(
         CORSMiddleware,
@@ -296,7 +288,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     router = GoogleRoutesClient(s.map_api_key, fallback=osrm) if s.map_api_key else osrm
     app.state.store = store or Store(s.database_url, router=router)
     app.state.settings = s
-    app.state.ws_manager = ConnectionManager()
+    app.state.ws_manager = manager
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_: Any, exc: DomainError) -> JSONResponse:
