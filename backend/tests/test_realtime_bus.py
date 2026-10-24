@@ -83,3 +83,16 @@ def test_publish_failure_falls_back_to_local_delivery():
         return sock.sent
 
     assert asyncio.run(run()) == [{"type": "x"}]
+
+
+def test_redis_url_is_extracted_from_pasted_connection_strings():
+    from backend.app.realtime import build_bus, normalize_redis_url
+
+    assert normalize_redis_url("rediss://default:pw@host:6379") == "rediss://default:pw@host:6379"
+    assert normalize_redis_url("redis-cli --tls -u rediss://default:pw@host:6379") == "rediss://default:pw@host:6379"
+    assert normalize_redis_url("  'redis://h:6379'\n") == "redis://h:6379"
+    assert normalize_redis_url("my-db.upstash.io") is None
+    assert normalize_redis_url("") is None
+    # A bad value disables the bus instead of crashing app start-up.
+    assert build_bus("my-db.upstash.io") is None
+    assert build_bus(None) is None

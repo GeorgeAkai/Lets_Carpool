@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Protocol
 
 from fastapi import WebSocket
@@ -17,6 +18,33 @@ from fastapi import WebSocket
 log = logging.getLogger("carpool.realtime")
 
 CHANNEL = "carpool:ws"
+
+
+def normalize_redis_url(raw: str | None) -> str | None:
+    """Pull a usable redis:// or rediss:// URL out of a pasted value.
+
+    Providers show connection info as e.g. `redis-cli --tls -u rediss://default:pw@host:6379`,
+    so take the URL token and drop quotes/whitespace. Returns None if there is none.
+    """
+    if not raw:
+        return None
+    match = re.search(r"(rediss?|unix)://[^\s'\"]+", raw)
+    return match.group(0) if match else None
+
+
+def build_bus(raw_url: str | None) -> "RedisBus | None":
+    """A RedisBus for the configured URL, or None (local-only delivery) if it is unset or invalid."""
+    if not raw_url or not raw_url.strip():
+        return None
+    url = normalize_redis_url(raw_url)
+    if not url:
+        log.error("REDIS_URL is set but is not a redis:// or rediss:// URL; realtime will be local to this instance")
+        return None
+    try:
+        return RedisBus(url)
+    except Exception:
+        log.exception("Could not configure Redis; realtime will be local to this instance")
+        return None
 
 
 class Bus(Protocol):

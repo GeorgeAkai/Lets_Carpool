@@ -14,7 +14,7 @@ from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, DriverTrip, Store, User
-from backend.app.realtime import ConnectionManager, RedisBus
+from backend.app.realtime import ConnectionManager, build_bus
 from backend.app.routing import GoogleRoutesClient, OSRMClient
 
 
@@ -264,7 +264,7 @@ class WarnUserRequest(BaseModel):
 
 def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
     s = settings or Settings()
-    manager = ConnectionManager(RedisBus(s.redis_url) if s.redis_url else None)
+    manager = ConnectionManager(build_bus(s.redis_url))
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
