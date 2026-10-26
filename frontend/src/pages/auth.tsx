@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useState, type CSSProperties } from 'react'
 import { supabase } from '../lib/auth'
 
-const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+const SERIF: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
 
 const FEATURES = [
   { Icon: MapPin, title: 'Nearby matches', desc: 'Rides near your location' },

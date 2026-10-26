@@ -301,8 +301,8 @@ export const CAR_TYPE_EMOJI: Record<CarType, string> = {
   sedan: '🚗', suv: '🚙', van: '🚐', minivan: '🚐', truck: '🚚', other: '🚗',
 }
 
-export const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
-export const MONO: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
+export const SERIF: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+export const MONO: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -428,13 +428,27 @@ export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId
 
 // ─── Small utility components ─────────────────────────────────────────────────
 
+// Gas saved this month on completed rides you took as a rider: what driving
+// solo would have cost minus the seat price you paid.
+function monthSavings(connections: Connection[]): { cents: number; trips: number } {
+  const month = todayLocalISO().slice(0, 7)
+  let cents = 0, trips = 0
+  for (const c of connections) {
+    const p = c.raw?.driver_trip.pricing
+    if (c.status !== 'completed' || c.myRole !== 'rider' || !c.date.startsWith(month) || !p) continue
+    cents += Math.max(0, p.gas_cost_cents - p.price_per_seat_cents)
+    trips += 1
+  }
+  return { cents, trips }
+}
+
 export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'card' | 'lg'; photoUrl?: string | null }) {
   const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', 'card': 'size-10 text-sm', lg: 'size-14 text-xl' }[size]
   if (photoUrl) {
     return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
   }
   return (
-    <div style={MONO} className={`${cls} rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0`}>
+    <div style={MONO} className={`${cls} rounded-full bg-secondary text-secondary-foreground font-bold flex items-center justify-center shrink-0`}>
       {initials}
     </div>
   )
@@ -3511,6 +3525,7 @@ export function Home() {
                 onOpenMap={() => setView('map')}
                 onOpenNotifications={() => setView('notifications')}
                 unreadNotifications={unreadCount}
+                onSwitchMode={handleSetMode}
               >
                 {mode === 'driver' && (() => {
                   const requests = filteredListings.filter(l => l.type === 'rider' && l.ownerId !== currentUser.id).slice(0, 5)
@@ -3558,6 +3573,7 @@ export function Home() {
             {guardedView === 'trip' && tripDayConnection && (
               <TripDayScreen
                 connection={tripDayConnection} currentUserId={currentUser.id}
+                monthSavings={monthSavings(connections)}
                 onClose={() => setView('my-listings')}
                 onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 onStartDriving={onStartDriving}

@@ -13,7 +13,7 @@ The MVP is not trying to solve full trust, payments, live safety tracking, AI ma
 In scope:
 
 - Users sign in, create a profile, and can act as both rider and driver.
-- Each session, a user picks an explicit mode (rider or driver) that gates the Discover feed and its primary actions; switchable anytime from Profile.
+- Each session, a user picks an explicit mode (rider or driver) that gates the Discover feed and its primary actions; switchable anytime from the Find a ride / Offer a ride toggle on Home or from Profile.
 - Riders publish ride requests.
 - Drivers publish driver trips.
 - Either side can browse relevant opposite-side listings, with manual filters for date, tag, seats, car type, and luggage size.

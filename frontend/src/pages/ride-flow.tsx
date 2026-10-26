@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   ArrowUpDown, Check, ChevronLeft, ChevronRight, Clock, Footprints, MessageCircle, Minus,
-  Phone, Plus, Share2, ShieldCheck, Star, Users, X, Bell, Navigation, Map as MapIcon,
+  Phone, Plus, Share2, ShieldCheck, Star, Users, X, Bell, Navigation, Map as MapIcon, MapPin, Timer,
 } from 'lucide-react'
 import * as api from '../api'
 import type { ApiDriverTrip, ApiUser, SavedRoute, TripDayStatus } from '../api'
@@ -116,7 +116,7 @@ function IconButton({ label, onClick, children, className = '' }: { label: strin
 function PrimaryButton({ children, onClick, disabled, type = 'button' }: { children: ReactNode; onClick?: () => void; disabled?: boolean; type?: 'button' | 'submit' }) {
   return (
     <button type={type} onClick={onClick} disabled={disabled}
-      className="w-full h-14 rounded-2xl bg-primary text-primary-foreground text-[17px] font-bold hover:brightness-105 active:scale-[0.99] disabled:opacity-50 transition-all">
+      className="w-full h-14 rounded-2xl bg-primary text-primary-foreground text-base font-bold hover:brightness-105 active:scale-[0.99] disabled:opacity-50 transition-all">
       {children}
     </button>
   )
@@ -126,7 +126,7 @@ function PrimaryButton({ children, onClick, disabled, type = 'button' }: { child
 // the bottom nav when it's showing), and inline at the end of the column on desktop.
 function StickyFooter({ children, aboveNav = false }: { children: ReactNode; aboveNav?: boolean }) {
   return (
-    <div className={`fixed inset-x-0 z-30 bg-sidebar/95 backdrop-blur border-t border-border px-5 pt-3 ${aboveNav ? 'bottom-[var(--bottom-nav-h)] pb-3' : 'bottom-0 pb-[max(1.5rem,env(safe-area-inset-bottom))]'} xl:static xl:bg-transparent xl:border-0 xl:px-0 xl:pt-2 xl:pb-0 xl:backdrop-blur-none`}>
+    <div className={`fixed inset-x-0 z-30 bg-card/95 backdrop-blur border-t border-border px-5 pt-3 ${aboveNav ? 'bottom-[var(--bottom-nav-h)] pb-3' : 'bottom-0 pb-[max(1.5rem,env(safe-area-inset-bottom))]'} xl:static xl:bg-transparent xl:border-0 xl:px-0 xl:pt-2 xl:pb-0 xl:backdrop-blur-none`}>
       <div className="max-w-md mx-auto space-y-2">{children}</div>
     </div>
   )
@@ -140,9 +140,10 @@ function VerifiedIcon({ size = 16 }: { size?: number }) {
 
 export function HomeScreen({
   mode, currentUser, hasLocation, search, setSearch, savedRoutes, onSaveRoute, onDeleteRoute,
-  nextTrip, onPrimary, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, children,
+  nextTrip, onPrimary, onOpenTrip, onOpenProfile, onOpenMap, onOpenNotifications, unreadNotifications = 0, onSwitchMode, children,
 }: {
   onOpenMap?: () => void
+  onSwitchMode?: (m: 'rider' | 'driver') => void
   onOpenNotifications?: () => void
   unreadNotifications?: number
   mode: 'rider' | 'driver'
@@ -196,14 +197,25 @@ export function HomeScreen({
           </button>
         </div>
       </div>
-      <h1 className="font-display text-[30px] leading-tight font-bold tracking-[-0.02em] text-foreground">
+      <h1 className="text-[26px] leading-tight font-extrabold tracking-[-0.015em] text-foreground">
         {isDriver ? 'Where are you driving?' : 'Where are you headed?'}
       </h1>
       </div>
 
+      {onSwitchMode && (
+        <div role="radiogroup" aria-label="Ride or drive" className="grid grid-cols-2 gap-1 p-1 bg-muted rounded-[14px]">
+          {(['rider', 'driver'] as const).map(m => (
+            <button key={m} type="button" role="radio" aria-checked={mode === m} onClick={() => mode !== m && onSwitchMode(m)}
+              className={`h-11 rounded-[11px] text-[15px] transition-colors ${mode === m ? 'bg-card text-primary font-bold shadow-sm' : 'text-muted-foreground font-semibold hover:text-foreground'}`}>
+              {m === 'rider' ? 'Find a ride' : 'Offer a ride'}
+            </button>
+          ))}
+        </div>
+      )}
+
       <section aria-label="Plan a trip" className="bg-card border border-border rounded-[20px] p-1.5 flex flex-col">
         <div className="flex items-center gap-3 px-3 py-3.5">
-          <span aria-hidden className="size-3 rounded-full border-[3px] border-info shrink-0" />
+          <span aria-hidden className="size-3 rounded-full border-[3px] border-primary shrink-0" />
           {search.from ? (
             <LocationInput variant="bare" label="From" value={search.from} placeholder="Starting point"
               onChange={v => setSearch({ ...search, from: v })} />
@@ -220,7 +232,7 @@ export function HomeScreen({
         </div>
         <div aria-hidden className="h-px bg-border ml-9 mr-3" />
         <div className="flex items-center gap-3 px-3 py-3.5">
-          <span aria-hidden className="size-3 rounded-[3px] bg-primary shrink-0" />
+          <MapPin aria-hidden className="size-4 -mx-0.5 fill-destructive text-destructive shrink-0" />
           <LocationInput variant="bare" label="To" value={search.to} placeholder="Search a destination"
             onChange={v => setSearch({ ...search, to: v })} />
         </div>
@@ -374,10 +386,10 @@ function Stepper({ value, min, max, onChange, label, hint }: {
       </div>
       <div className="flex items-center gap-3.5">
         <button type="button" aria-label={`Fewer ${label.toLowerCase()}`} onClick={() => onChange(Math.max(min, value - 1))} disabled={value <= min}
-          className="size-11 rounded-full border border-border bg-muted text-foreground flex items-center justify-center disabled:opacity-40"><Minus className="size-5" /></button>
-        <span className="font-display text-[26px] font-bold w-6 text-center tabular-nums" aria-live="polite">{value}</span>
+          className="size-11 rounded-full border border-border bg-card text-foreground flex items-center justify-center disabled:opacity-40"><Minus className="size-5" /></button>
+        <span className="text-2xl font-extrabold w-6 text-center tabular-nums" aria-live="polite">{value}</span>
         <button type="button" aria-label={`More ${label.toLowerCase()}`} onClick={() => onChange(Math.min(max, value + 1))} disabled={value >= max}
-          className="size-11 rounded-full border border-border bg-muted text-foreground flex items-center justify-center disabled:opacity-40"><Plus className="size-5" /></button>
+          className="size-11 rounded-full bg-primary text-primary-foreground flex items-center justify-center disabled:opacity-40"><Plus className="size-5" /></button>
       </div>
     </div>
   )
@@ -438,8 +450,8 @@ export function ResultsScreen({
   }, [fits, sort, search.time])
 
   const chips: { id: SortKey; label: string }[] = [
-    { id: 'best', label: 'Best match' }, { id: 'soonest', label: 'Leaves soonest' },
-    { id: 'price', label: 'Lowest price' }, { id: 'verified', label: 'Verified' },
+    { id: 'best', label: 'Best match' }, { id: 'soonest', label: 'Soonest' },
+    { id: 'price', label: 'Cheapest' }, { id: 'verified', label: 'Verified only' },
   ]
 
   return (
@@ -480,33 +492,26 @@ export function ResultsScreen({
               return (
                 <li key={t.id}>
                   <button type="button" onClick={() => onOpenTrip(t)}
-                    className={`w-full text-left text-foreground bg-card rounded-[18px] p-4 flex flex-col gap-3.5 border hover:brightness-110 transition ${best ? 'border-primary' : 'border-border'}`}>
-                    <div className="flex justify-between items-start gap-3">
-                      <div className="flex flex-col gap-1 min-w-0">
-                        {best && <span className="self-start text-[11px] font-bold tracking-[0.04em] uppercase text-primary-foreground bg-primary px-2 py-[3px] rounded-md">Best match</span>}
-                        <p className="font-display text-2xl font-bold tracking-[-0.01em]">
-                          {depart}{arrive && <> <span className="text-muted-foreground font-medium">→</span> {arrive}</>}
-                        </p>
-                        <p className="text-[13px] text-secondary-foreground flex items-center gap-1.5 truncate">
-                          <Footprints className="size-3.5 shrink-0" />
-                          {t.detour_minutes != null ? `+${Math.round(t.detour_minutes)} min detour · ` : ''}Pickup near {formatPlace(t.pickup.label)}
-                        </p>
-                        {anyDate && <p className="text-xs text-muted-foreground">{dayLabel(t.target_date)}</p>}
-                      </div>
-                      <div className="text-right flex flex-col gap-0.5 shrink-0">
-                        <span className="font-display text-2xl font-bold">{fmtMoney(t.pricing?.price_per_seat_cents)}</span>
-                        <span className="text-xs text-muted-foreground">per seat</span>
-                      </div>
-                    </div>
-                    <div aria-hidden className="h-px bg-border" />
+                    className={`relative w-full text-left text-foreground rounded-[18px] p-3.5 flex flex-col gap-3 border-2 transition-colors ${best ? 'bg-secondary/40 border-primary' : 'bg-card border-border hover:border-muted-foreground/40'}`}>
+                    {best && <span className="absolute -top-2.5 left-3.5 text-[10px] font-extrabold tracking-[0.06em] uppercase text-primary-foreground bg-primary px-2 py-[3px] rounded-md">Best match</span>}
                     <div className="flex items-center gap-3">
                       <Avatar initials={toInitials(name)} photoUrl={t.driver_photo_url} />
                       <div className="flex-1 min-w-0 flex flex-col gap-0.5">
-                        <span className="text-[15px] font-semibold flex items-center gap-1.5">{name}{t.driver_stats?.id_verified && <VerifiedIcon />}</span>
-                        <span className="text-[13px] text-muted-foreground truncate">{driverLine(t)}</span>
+                        <span className="text-[15px] font-bold flex items-center gap-1.5">{name}{t.driver_stats?.id_verified && <VerifiedIcon size={15} />}</span>
+                        <span className="text-xs text-muted-foreground truncate">{driverLine(t)}</span>
                       </div>
-                      <span className={`text-[13px] font-semibold shrink-0 ${requestedTripIds.has(t.id) ? 'text-info' : free <= 1 ? 'text-[#ffb38a]' : 'text-muted-foreground'}`}>
-                        {requestedTripIds.has(t.id) ? 'Requested' : `${free} left`}
+                      <div className="text-right flex flex-col gap-0.5 shrink-0">
+                        <span className="text-lg font-extrabold">{fmtMoney(t.pricing?.price_per_seat_cents)}</span>
+                        <span className="text-[11px] text-muted-foreground">per seat</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 pt-3 border-t border-dashed border-border">
+                      <span className="text-sm font-bold shrink-0">{depart}{arrive && <> → {arrive}</>}</span>
+                      <span className="text-xs text-muted-foreground flex-1 min-w-0 truncate">
+                        · {t.detour_minutes != null ? `+${Math.round(t.detour_minutes)} min detour` : `Near ${formatPlace(t.pickup.label)}`}{anyDate ? ` · ${dayLabel(t.target_date)}` : ''}
+                      </span>
+                      <span className={`text-xs font-bold px-2 py-1 rounded-lg shrink-0 ${requestedTripIds.has(t.id) ? 'bg-secondary text-secondary-foreground' : free <= 1 ? 'bg-[#fdeee3] text-[#a2440f] dark:bg-[#3a2416] dark:text-[#ff9f5a]' : 'bg-muted text-muted-foreground'}`}>
+                        {requestedTripIds.has(t.id) ? 'Requested' : `${free} seat${free === 1 ? '' : 's'} left`}
                       </span>
                     </div>
                   </button>
@@ -515,14 +520,14 @@ export function ResultsScreen({
             })}
           </ul>
           {!anyDate && (
-            <button type="button" onClick={() => setAnyDate(true)} className="text-sm font-semibold text-info self-center">
+            <button type="button" onClick={() => setAnyDate(true)} className="min-h-11 text-sm font-semibold text-muted-foreground hover:text-foreground self-center">
               Show rides on other dates
             </button>
           )}
           <button type="button" disabled={notified || !search.to}
             onClick={async () => { try { await onNotify(); setNotified(true) } catch (e) { showToast(e instanceof Error ? e.message : 'Could not set alert', 'error') } }}
-            className="mt-2 min-h-[52px] rounded-[14px] border border-dashed border-border bg-transparent text-secondary-foreground text-sm font-semibold flex items-center justify-center gap-2 px-4 disabled:opacity-60">
-            {notified ? <><Check className="size-4" />We'll notify you when a ride is posted</> : <><Bell className="size-4" />Not seeing a fit? Get notified when a ride is posted</>}
+            className="min-h-11 bg-transparent text-primary text-sm font-bold flex items-center justify-center gap-2 px-4 disabled:opacity-60">
+            {notified ? <><Check className="size-4" />We'll notify you when a ride is posted</> : <><Bell className="size-4" />Alert me when a new ride is posted</>}
           </button>
         </>
       )}
@@ -542,28 +547,28 @@ function minutesOf(hhmm: string): number {
 function RouteSketch() {
   return (
     <svg viewBox="0 0 390 300" preserveAspectRatio="xMidYMid slice" className="absolute inset-0 w-full h-full" role="img" aria-label="Route preview">
-      <rect width="390" height="300" fill="#101a2c" />
-      <g stroke="#1b2740" strokeWidth="10" fill="none">
-        <path d="M-10 70 H400" /><path d="M-10 170 H400" /><path d="M-10 250 H400" />
-        <path d="M60 -10 V310" /><path d="M170 -10 V310" /><path d="M290 -10 V310" />
+      <rect width="390" height="300" className="fill-[#eaf0ec] dark:fill-[#0f1c1e]" />
+      <rect x="200" y="200" width="120" height="70" rx="14" className="fill-[#d3e9d8] dark:fill-[#132a22]" />
+      <g strokeWidth="11" fill="none" strokeLinecap="round" className="stroke-white dark:stroke-[#1e2d2c]">
+        <path d="M-10 110 H400" /><path d="M-10 190 H400" /><path d="M70 -10 V310" /><path d="M180 -10 V310" /><path d="M300 -10 V310" />
       </g>
-      <path d="M40 250 L170 250 L170 170 L290 170 L290 90" stroke="#7cc4ff" strokeWidth="5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M110 205 L170 205" stroke="#eef2f8" strokeWidth="3" strokeDasharray="2 7" strokeLinecap="round" />
-      <circle cx="110" cy="205" r="7" fill="#0b1220" stroke="#eef2f8" strokeWidth="3" />
-      <circle cx="170" cy="205" r="9" fill="#7cc4ff" stroke="#0b1220" strokeWidth="3" />
-      <rect x="280" y="80" width="20" height="20" rx="4" fill="#f5b544" stroke="#0b1220" strokeWidth="3" />
+      <path d="M70 250 L70 190 L180 190 L180 110 L300 110 L300 70" strokeWidth="5" fill="none" strokeLinecap="round" strokeLinejoin="round" className="stroke-info" />
+      <path d="M28 222 L70 222" strokeWidth="3" strokeDasharray="2 6" strokeLinecap="round" className="stroke-muted-foreground" />
+      <circle cx="28" cy="222" r="7" strokeWidth="3" className="fill-card stroke-info" />
+      <circle cx="70" cy="222" r="10" strokeWidth="3" className="fill-primary stroke-card" />
+      <path d="M300 44a12 12 0 0 1 12 12c0 8-12 18-12 18s-12-10-12-18a12 12 0 0 1 12-12z" strokeWidth="2" className="fill-destructive stroke-card" />
     </svg>
   )
 }
 
-function TimelineRow({ time, title, sub, tone = 'default' }: { time: string; title: string; sub?: string; tone?: 'default' | 'info' | 'accent' }) {
-  const color = tone === 'info' ? 'text-info' : tone === 'accent' ? 'text-primary' : 'text-foreground'
+function TimelineRow({ time, title, sub, tone = 'default' }: { time: string; title: string; sub?: string; tone?: 'default' | 'accent' | 'end' }) {
+  const color = tone === 'accent' ? 'text-primary' : tone === 'end' ? 'text-destructive' : 'text-foreground'
   return (
     <div className="flex gap-3 items-start">
-      <span className={`w-14 shrink-0 text-[15px] font-bold ${color}`}>{time}</span>
+      <span className={`w-14 shrink-0 text-sm font-extrabold ${color}`}>{time}</span>
       <div className="flex flex-col gap-0.5 min-w-0">
-        <span className="text-[15px] font-semibold">{title}</span>
-        {sub && <span className="text-[13px] text-muted-foreground">{sub}</span>}
+        <span className="text-sm font-semibold">{title}</span>
+        {sub && <span className="text-xs text-muted-foreground">{sub}</span>}
       </div>
     </div>
   )
@@ -595,41 +600,43 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
         <RouteSketch />
         <div className="absolute top-4 left-4"><IconButton label="Back" onClick={onBack} className="rounded-full bg-background"><ChevronLeft className="size-5" /></IconButton></div>
       </div>
-      <div className="relative -mt-7 bg-background rounded-t-3xl border-t border-border px-5 pt-5 flex flex-col gap-[18px]">
-        <div className="flex items-center gap-3">
+      <div className="relative -mt-7 bg-background rounded-t-[26px] px-4 pt-4 flex flex-col gap-3">
+        <div className="bg-card border border-border rounded-[18px] p-3.5 flex items-center gap-3">
           <Avatar initials={toInitials(name)} photoUrl={trip.driver_photo_url} size="lg" />
-          <div className="flex-1 min-w-0">
-            <p className="text-lg font-bold flex items-center gap-1.5">{name}{stats?.id_verified && <VerifiedIcon />}</p>
-            <p className="text-[13px] text-muted-foreground">{statLine}</p>
+          <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+            <p className="text-base font-bold flex items-center gap-1.5">{name}{stats?.id_verified && <VerifiedIcon />}</p>
+            <p className="text-xs text-muted-foreground">{statLine}</p>
+            {car && <p className="text-xs text-muted-foreground truncate">{car}</p>}
           </div>
         </div>
 
-        <div className="bg-card border border-border rounded-2xl px-4 py-3.5 flex flex-col gap-3">
+        <div className="bg-card border border-border rounded-[18px] p-3.5 flex flex-col gap-3">
           <TimelineRow
             time={trip.departure_time ? fmtTimeShort(trip.departure_time) : dayLabel(trip.target_date)}
             title={`Pickup near ${formatPlace(trip.pickup.label)}`}
-            sub={`${trip.departure_time ? dayLabel(trip.target_date) : FLEX_LABEL[trip.flexibility as Flexibility] ?? 'Flexible'}${car ? ` · ${car}` : ''} · exact spot shared once accepted`}
-            tone="info"
+            sub={`${trip.departure_time ? dayLabel(trip.target_date) : FLEX_LABEL[trip.flexibility as Flexibility] ?? 'Flexible'} · exact spot shared once accepted`}
+            tone="accent"
           />
           <TimelineRow
             time={trip.estimated_arrival_time ? fmtTimeShort(trip.estimated_arrival_time) : `~${trip.duration_minutes ?? '—'}m`}
             title={`Drop-off · ${formatPlace(trip.destination.label)}`}
             sub={trip.duration_minutes ? `About ${trip.duration_minutes} min on the road` : undefined}
-            tone="accent"
+            tone="end"
           />
         </div>
 
-        {trip.notes && <p className="text-sm text-secondary-foreground bg-card border border-border rounded-2xl px-4 py-3">“{trip.notes}”</p>}
+        {trip.notes && <p className="text-sm text-muted-foreground bg-card border border-border rounded-[18px] px-3.5 py-3">“{trip.notes}”</p>}
 
         {pricing && (
-          <section className="flex flex-col gap-2">
-            <SectionLabel>How the cost is split</SectionLabel>
-            <div className="flex justify-between text-[15px]"><span className="text-secondary-foreground">Estimated gas, {kmToMi(pricing.distance_km)} mi</span><span>{fmtMoney(pricing.gas_cost_cents)}</span></div>
-            <div className="flex justify-between text-[15px]"><span className="text-secondary-foreground">Shared by {pricing.split_between} people</span><span>÷ {pricing.split_between}</span></div>
+          <section className="bg-card border border-border rounded-[18px] p-3.5 flex flex-col gap-2">
+            <h2 className="text-sm font-extrabold">How the cost is split</h2>
+            <div className="flex justify-between text-[13px] text-muted-foreground"><span>Estimated gas · {kmToMi(pricing.distance_km)} mi</span><span>{fmtMoney(pricing.gas_cost_cents)}</span></div>
+            <div className="flex justify-between text-[13px] text-muted-foreground"><span>Shared by {pricing.split_between} people</span><span>÷ {pricing.split_between}</span></div>
             {pricing.price_per_seat_cents !== pricing.suggested_price_cents && (
-              <div className="flex justify-between text-[15px]"><span className="text-secondary-foreground">{first} set the price per seat</span><span>{fmtMoney(pricing.price_per_seat_cents)}</span></div>
+              <div className="flex justify-between text-[13px] text-muted-foreground"><span>{first} set the price per seat</span><span>{fmtMoney(pricing.price_per_seat_cents)}</span></div>
             )}
-            <div className="flex justify-between text-base font-bold"><span>Your share{seats > 1 ? ` (${seats} seats)` : ''}</span><span>{fmtMoney(share)}</span></div>
+            <div aria-hidden className="h-px bg-border" />
+            <div className="flex justify-between text-base font-extrabold"><span>Your share{seats > 1 ? ` (${seats} seats)` : ''}</span><span>{fmtMoney(share)}</span></div>
           </section>
         )}
       </div>
@@ -647,10 +654,12 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 // ─── 4 · Trip day ─────────────────────────────────────────────────────────────
 
 export function TripDayScreen({
-  connection, currentUserId, onClose, onMessage, onStartDriving, onComplete, showToast,
+  connection, currentUserId, monthSavings, onClose, onMessage, onStartDriving, onComplete, showToast,
 }: {
   connection: Connection
   currentUserId: string
+  // Gas saved on completed rides this month (shown on the arrival screen).
+  monthSavings?: { cents: number; trips: number }
   onClose: () => void
   onMessage: (c: Connection) => void
   onStartDriving: (c: Connection) => void
@@ -667,6 +676,8 @@ export function TripDayScreen({
   const [rating, setRating] = useState<number | null>(raw?.my_rating ?? null)
   const [busy, setBusy] = useState(false)
   const accepted = connection.status === 'accepted'
+  // Furthest the driver has been from the pickup this session: the start of the progress bar.
+  const startDistRef = useRef<number | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
@@ -680,6 +691,10 @@ export function TripDayScreen({
   const pickupLabel = live?.pickup.label ? formatPlace(live.pickup.label) : connection.riderPickupLabel ?? connection.from
   const departure = trip?.departure_time ? fmtTime(trip.departure_time) : null
   const eta = live?.driver?.eta_minutes
+  const distM = live?.driver?.distance_to_pickup_m ?? null
+  if (distM != null && (startDistRef.current == null || distM > startDistRef.current)) startDistRef.current = distM
+  const progress = distM != null && startDistRef.current ? Math.min(1, Math.max(0.04, 1 - distM / startDistRef.current)) : null
+  const partnerRating = partner?.rating_avg
   const car = trip?.vehicle ? [trip.vehicle.color, trip.vehicle.make, trip.vehicle.model].filter(Boolean).join(' ') : ''
   const phone = partner && 'phone' in partner ? partner.phone : null
 
@@ -718,72 +733,83 @@ export function TripDayScreen({
     catch (e) { setRating(raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
   }
 
-  const tile = 'min-h-[72px] rounded-2xl border border-border bg-card text-foreground text-[13px] font-semibold flex flex-col items-center justify-center gap-1.5 disabled:opacity-40'
+  const tile = 'min-h-16 rounded-[14px] bg-muted text-foreground text-xs font-semibold flex flex-col items-center justify-center gap-1.5 hover:brightness-95 dark:hover:brightness-125 disabled:opacity-40'
+
+  if (connection.status === 'completed') {
+    return <TripDoneScreen connection={connection} rating={rating} onRate={rate} monthSavings={monthSavings} onDone={onClose} />
+  }
 
   return (
     <div className="max-w-md mx-auto flex flex-col gap-[18px] pb-40 xl:pb-6">
       <div className="flex items-center justify-between">
         <IconButton label="Close" onClick={onClose}><X className="size-5" /></IconButton>
         <button type="button" onClick={() => setSafetyOpen(true)}
-          className="min-h-11 px-3.5 rounded-xl bg-card border border-border text-foreground text-sm font-semibold flex items-center gap-2">
+          className="min-h-11 px-3.5 rounded-xl bg-card border border-border text-destructive text-sm font-bold flex items-center gap-2">
           <ShieldCheck className="size-4" />Safety
         </button>
       </div>
 
       <div className="flex flex-col gap-1">
         {accepted && connection.myRole === 'rider' && (
-          <span className="text-sm font-semibold text-info flex items-center gap-2">
-            <span aria-hidden className="size-2 rounded-full bg-info" />
+          <span className="text-[13px] font-bold text-primary flex items-center gap-2">
+            <span aria-hidden className="size-2 rounded-full bg-primary" />
             {live?.driver ? 'Live · updated just now' : 'Live location appears when your driver starts sharing'}
           </span>
         )}
-        <h1 className="font-display text-[34px] font-bold tracking-[-0.02em] leading-[1.05]">{headline}</h1>
-        <p className="text-[15px] text-secondary-foreground">{subline}</p>
+        <h1 className="text-[26px] font-extrabold tracking-[-0.015em] leading-tight">{headline}</h1>
+        <p className="text-sm text-muted-foreground">{subline}</p>
       </div>
 
-      {connection.myRole === 'rider' && (car || trip?.vehicle?.plate) && (
-        <div className="bg-card border border-border rounded-[20px] p-4 flex items-center gap-3.5">
-          <div className="flex-1 min-w-0">
-            <p className="text-[13px] text-muted-foreground">Look for</p>
-            <p className="text-[17px] font-semibold truncate">{car || 'Your driver’s car'}</p>
+      {progress != null && connection.myRole === 'rider' && (
+        <div className="flex flex-col gap-1.5">
+          <div className="h-1.5 rounded-full bg-muted overflow-hidden" role="progressbar" aria-label={`${partnerFirst} is on the way`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress * 100)}>
+            <div className="h-full rounded-full bg-primary transition-[width] duration-700" style={{ width: `${progress * 100}%` }} />
           </div>
-          {trip?.vehicle?.plate && (
-            <div className="border-2 border-foreground rounded-lg px-3 py-1.5 font-display text-[22px] font-bold tracking-[0.07em]">{trip.vehicle.plate}</div>
-          )}
+          <div className="flex justify-between text-xs text-muted-foreground">
+            <span>{partnerFirst} is on the way</span>
+            <span>{distM! >= 160 ? `${(distM! / 1609.34).toFixed(1)} mi away` : 'Almost there'}</span>
+          </div>
         </div>
       )}
 
-      <div className="grid grid-cols-3 gap-2.5">
-        <button type="button" className={tile} onClick={() => onMessage(connection)}><MessageCircle className="size-[22px]" />Message</button>
+      <div className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-3">
+        <Avatar initials={toInitials(connection.withUser.name)} photoUrl={connection.withUser.photoUrl} size="card" />
+        <div className="flex-1 min-w-0 flex flex-col gap-0.5">
+          <p className="text-[15px] font-bold truncate">
+            {connection.withUser.name}
+            {partnerRating != null && <span className="text-xs font-semibold text-muted-foreground"> <span className="text-accent">★</span> {partnerRating.toFixed(1)}</span>}
+          </p>
+          <p className="text-xs text-muted-foreground truncate">{connection.myRole === 'rider' ? (car || 'Your driver’s car') : `Pickup at ${pickupLabel}`}</p>
+        </div>
+        {connection.myRole === 'rider' && trip?.vehicle?.plate && (
+          <div className="border-2 border-foreground rounded-lg px-2 py-1 text-[15px] font-extrabold tracking-[0.06em] shrink-0">{trip.vehicle.plate}</div>
+        )}
+      </div>
+
+      <div className="grid grid-cols-4 gap-2">
         {phone
-          ? <a className={tile} href={`tel:${phone.replace(/[^+\d]/g, '')}`}><Phone className="size-[22px]" />Call</a>
-          : <button type="button" className={tile} disabled title={accepted ? `${partnerFirst} hasn't added a phone number` : 'Available once accepted'}><Phone className="size-[22px]" />Call</button>}
-        <button type="button" className={tile} onClick={share}><Share2 className="size-[22px]" />Share trip</button>
+          ? <a className={tile} href={`tel:${phone.replace(/[^+\d]/g, '')}`}><Phone className="size-5" />Call</a>
+          : <button type="button" className={tile} disabled title={accepted ? `${partnerFirst} hasn't added a phone number` : 'Available once accepted'}><Phone className="size-5" />Call</button>}
+        <button type="button" className={tile} onClick={() => onMessage(connection)}><MessageCircle className="size-5" />Message</button>
+        <button type="button" className={tile} onClick={share}><Share2 className="size-5" />Share</button>
+        <button type="button" className={tile} onClick={sendLate} disabled={!accepted} title={accepted ? `Let ${partnerFirst} know you're running late` : 'Available once accepted'}><Timer className="size-5" />I’m late</button>
       </div>
 
       <ol className="bg-card border border-border rounded-[20px] p-4 flex flex-col">
-        <TimelineStep state="done" title={accepted || connection.status === 'completed' ? 'Booked · seat confirmed' : 'Requested · waiting to be accepted'}
+        <TimelineStep state="done" title={accepted ? 'Booked · seat confirmed' : 'Requested · waiting to be accepted'}
           sub={trip?.pricing ? `${fmtMoney(trip.pricing.price_per_seat_cents)} per seat, settled with ${connection.myRole === 'rider' ? partnerFirst : 'your rider'}` : undefined} />
-        <TimelineStep state={connection.status === 'completed' ? 'done' : 'current'}
+        <TimelineStep state="current"
           title={`Pickup ${departure ?? dayLabel(connection.date)} · ${pickupLabel}`}
           sub={checkedIn ? `${connection.myRole === 'rider' ? 'You' : partnerFirst} checked in at the pickup` : undefined} />
-        <TimelineStep state={connection.status === 'completed' ? 'done' : 'next'} last
+        <TimelineStep state="next" last
           title={`Drop-off${trip?.estimated_arrival_time ? ` ${fmtTime(trip.estimated_arrival_time)}` : ''} · ${connection.to}`} />
       </ol>
-
-      {connection.status === 'completed' && (
-        <section className="bg-card border border-border rounded-[20px] p-4 flex flex-col gap-3 items-center">
-          <p className="text-[15px] font-semibold">{rating ? 'Your rating' : `How was the ride with ${partnerFirst}?`}</p>
-          <StarRating value={rating} onChange={rate} />
-        </section>
-      )}
 
       {accepted && (
         <StickyFooter>
           {connection.myRole === 'rider' ? (
             <>
               <PrimaryButton onClick={checkIn} disabled={busy || !!checkedIn}>{checkedIn ? 'You’re checked in' : 'I’m at the pickup spot'}</PrimaryButton>
-              <button type="button" onClick={sendLate} className="w-full h-12 rounded-[14px] text-secondary-foreground text-[15px] font-semibold">Running late? Let {partnerFirst} know</button>
             </>
           ) : (
             <>
@@ -815,11 +841,11 @@ function TimelineStep({ state, title, sub, last = false }: { state: 'done' | 'cu
   return (
     <li className="flex gap-3.5">
       <div aria-hidden className="flex flex-col items-center">
-        <span className={`size-3.5 shrink-0 ${state === 'done' ? 'rounded-full bg-info' : state === 'current' ? 'rounded-full border-[3px] border-primary' : 'rounded-[3px] border-2 border-muted-foreground'}`} />
+        <span className={`size-3.5 shrink-0 ${state === 'done' ? 'rounded-full bg-primary' : state === 'current' ? 'rounded-full border-[3px] border-primary' : 'rounded-[3px] border-2 border-muted-foreground'}`} />
         {!last && <span className="w-0.5 flex-1 min-h-10 bg-border" />}
       </div>
       <div className={`flex flex-col gap-0.5 min-w-0 ${last ? '' : 'pb-3'}`}>
-        <span className={`text-[15px] ${state === 'current' ? 'font-bold' : 'font-semibold'} ${state === 'next' ? 'text-secondary-foreground' : ''}`}>{title}</span>
+        <span className={`text-[15px] ${state === 'current' ? 'font-bold' : 'font-semibold'} ${state === 'next' ? 'text-muted-foreground' : ''}`}>{title}</span>
         {sub && <span className="text-[13px] text-muted-foreground">{sub}</span>}
       </div>
     </li>
@@ -832,14 +858,76 @@ export function StarRating({ value, onChange }: { value: number | null; onChange
       {[1, 2, 3, 4, 5].map(n => (
         <button key={n} type="button" role="radio" aria-checked={value === n} aria-label={`${n} star${n === 1 ? '' : 's'}`} onClick={() => onChange(n)}
           className="size-11 flex items-center justify-center">
-          <Star className={`size-7 ${value != null && n <= value ? 'fill-primary text-primary' : 'text-muted-foreground'}`} />
+          <Star className={`size-8 ${value != null && n <= value ? 'fill-accent text-accent' : 'text-muted-foreground/50'}`} />
         </button>
       ))}
     </div>
   )
 }
 
-// ─── 5 · Driver: offer a ride ─────────────────────────────────────────────────
+// ─── 5 · Arrived & rate ───────────────────────────────────────────────────────
+
+function TripDoneScreen({ connection, rating, onRate, monthSavings, onDone }: {
+  connection: Connection
+  rating: number | null
+  onRate: (stars: number) => void
+  monthSavings?: { cents: number; trips: number }
+  onDone: () => void
+}) {
+  const trip = connection.raw?.driver_trip
+  const pricing = trip?.pricing
+  const partnerFirst = connection.withUser.name.split(' ')[0]
+  const isRider = connection.myRole === 'rider'
+  const arrived = trip?.estimated_arrival_time ? fmtTime(trip.estimated_arrival_time) : null
+  const summary = [connection.to, arrived, pricing ? `${kmToMi(pricing.distance_km)} mi` : null].filter(Boolean).join(' · ')
+
+  return (
+    <div className="max-w-md mx-auto flex flex-col gap-4 pt-4 pb-40 xl:pb-6">
+      <div className="flex flex-col items-center gap-2.5 text-center">
+        <div className="size-[68px] rounded-full bg-primary text-primary-foreground flex items-center justify-center">
+          <Check className="size-9" strokeWidth={3} />
+        </div>
+        <h1 className="text-2xl font-extrabold">{isRider ? 'You’ve arrived' : 'Ride complete'}</h1>
+        <p className="text-sm text-muted-foreground">{summary}</p>
+      </div>
+
+      {pricing && (
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="bg-card border border-border rounded-2xl p-3.5 flex flex-col gap-0.5">
+            <span className="text-xs text-muted-foreground font-semibold">{isRider ? 'Your share' : 'Each rider’s share'}</span>
+            <span className="text-[22px] font-extrabold">{fmtMoney(pricing.price_per_seat_cents)}</span>
+            <span className="text-xs text-muted-foreground">vs ~{fmtMoney(pricing.gas_cost_cents)} driving solo</span>
+          </div>
+          {monthSavings && monthSavings.trips > 0 ? (
+            <div className="bg-secondary text-secondary-foreground rounded-2xl p-3.5 flex flex-col gap-0.5">
+              <span className="text-xs font-semibold">This month</span>
+              <span className="text-[22px] font-extrabold">{fmtMoney(monthSavings.cents).replace(/\.00$/, '')} saved</span>
+              <span className="text-xs">{monthSavings.trips} shared trip{monthSavings.trips === 1 ? '' : 's'}</span>
+            </div>
+          ) : (
+            <div className="bg-secondary text-secondary-foreground rounded-2xl p-3.5 flex flex-col gap-0.5">
+              <span className="text-xs font-semibold">You saved</span>
+              <span className="text-[22px] font-extrabold">{fmtMoney(Math.max(0, pricing.gas_cost_cents - pricing.price_per_seat_cents))}</span>
+              <span className="text-xs">on this trip</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <section className="bg-card border border-border rounded-[20px] px-4 py-[18px] flex flex-col items-center gap-3">
+        <Avatar initials={toInitials(connection.withUser.name)} photoUrl={connection.withUser.photoUrl} size="lg" />
+        <p className="text-[17px] font-extrabold text-center">{rating ? 'Thanks for rating' : `How was riding with ${partnerFirst}?`}</p>
+        <StarRating value={rating} onChange={onRate} />
+      </section>
+
+      <StickyFooter>
+        <PrimaryButton onClick={onDone}>Done</PrimaryButton>
+      </StickyFooter>
+    </div>
+  )
+}
+
+// ─── 6 · Driver: offer a ride ─────────────────────────────────────────────────
 
 export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted, showToast }: {
   initial: RideSearch
@@ -948,7 +1036,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
 
       {step === 1 && (
         <>
-          <h1 className="font-display text-[28px] font-bold tracking-[-0.02em]">Route &amp; time</h1>
+          <h1 className="text-[26px] font-extrabold tracking-[-0.015em]">Route &amp; time</h1>
           <div className="space-y-4">
             <LocationInput label="Leaving from" value={from} onChange={setFrom} placeholder="Your area" />
             <LocationInput label="Going to" value={to} onChange={setTo} placeholder="Destination" />
@@ -982,23 +1070,23 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
       {step === 2 && (
         <>
           <div className="flex flex-col gap-1.5">
-            <h1 className="font-display text-[28px] font-bold tracking-[-0.02em]">Seats &amp; cost</h1>
-            <span className="text-[15px] text-secondary-foreground">{routeLine}</span>
+            <h1 className="text-[26px] font-extrabold tracking-[-0.015em]">Seats &amp; cost</h1>
+            <span className="text-sm text-muted-foreground">{routeLine}</span>
           </div>
           <Stepper value={seats} min={1} max={vehicle?.seats ? Math.max(1, vehicle.seats - 1) : 8} onChange={setSeats} label="Seats to offer" hint="Not counting you" />
-          <div className="bg-card border border-border rounded-[18px] p-4 flex flex-col gap-3">
+          <div className="bg-secondary text-secondary-foreground rounded-[18px] p-4 flex flex-col gap-2.5">
             <div className="flex justify-between items-baseline">
-              <span className="text-base font-semibold">Each rider pays</span>
-              <span className="font-display text-[30px] font-bold">{fmtMoney(priceCents)}</span>
+              <span className="text-[15px] font-bold">Each rider pays</span>
+              <span className="text-[30px] font-extrabold">{fmtMoney(priceCents)}</span>
             </div>
-            <span className="text-[13px] text-secondary-foreground leading-[1.45]">
+            <span className="text-[13px] leading-[1.45]">
               {pricing
                 ? <>Suggested from ~{fmtMoney(pricing.gas_cost_cents)} in gas, split evenly between you and {seats} {seats === 1 ? 'rider' : 'riders'}. You keep the trip cost-neutral — no profit, no loss.</>
                 : 'Working out the gas cost for this route…'}
             </span>
             {customPrice == null ? (
               <button type="button" onClick={() => setCustomPrice(priceCents != null ? (priceCents / 100).toFixed(2) : '')}
-                className="self-start min-h-11 px-3.5 rounded-xl border border-border bg-muted text-foreground text-sm font-semibold">Adjust price</button>
+                className="self-start min-h-11 px-3.5 rounded-xl border border-primary/30 bg-card text-primary text-sm font-bold">Adjust price</button>
             ) : (
               <div className="flex items-center gap-2">
                 <label className="relative flex-1">
@@ -1011,9 +1099,9 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
               </div>
             )}
           </div>
-          <div className="flex flex-col gap-1">
-            <label className="flex items-center justify-between min-h-[52px] gap-3">
-              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Repeat on weekdays</span><span className="text-[13px] text-muted-foreground">Riders can book any day this week</span></span>
+          <div className="bg-card border border-border rounded-[18px] px-4 py-1 flex flex-col">
+            <label className="flex items-center justify-between min-h-[62px] gap-3">
+              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-bold">Repeat on weekdays</span><span className="text-[13px] text-muted-foreground">Riders can book any day this week</span></span>
               <input type="checkbox" checked={repeat} onChange={e => setRepeat(e.target.checked)} className={toggle} />
             </label>
             {repeat && (
@@ -1026,8 +1114,8 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
                 ))}
               </div>
             )}
-            <label className="flex items-center justify-between min-h-[52px] gap-3">
-              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-semibold">Auto-accept verified riders</span><span className="text-[13px] text-muted-foreground">Others still need your OK</span></span>
+            <label className="flex items-center justify-between min-h-[62px] gap-3 border-t border-border">
+              <span className="flex flex-col gap-0.5"><span className="text-[15px] font-bold">Auto-accept verified riders</span><span className="text-[13px] text-muted-foreground">Others still need your OK</span></span>
               <input type="checkbox" checked={autoAccept} onChange={e => setAutoAccept(e.target.checked)} className={toggle} />
             </label>
           </div>
@@ -1036,7 +1124,7 @@ export function OfferRideScreen({ initial, userCoords, vehicle, onBack, onPosted
 
       {step === 3 && (
         <>
-          <h1 className="font-display text-[28px] font-bold tracking-[-0.02em]">Review</h1>
+          <h1 className="text-[26px] font-extrabold tracking-[-0.015em]">Review</h1>
           <div className="bg-card border border-border rounded-[18px] p-4 flex flex-col gap-3 text-[15px]">
             <div className="flex justify-between gap-3"><span className="text-muted-foreground">Route</span><span className="font-semibold text-right">{from?.label} → {to?.label}</span></div>
             <div className="flex justify-between gap-3"><span className="text-muted-foreground">Leaving</span><span className="font-semibold text-right">{dayLabel(date)}, {fmtTime(time)}{repeat && weekdays.length ? ` · ${weekdaysLabel(weekdays)}` : ''}</span></div>

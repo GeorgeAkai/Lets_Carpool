@@ -107,6 +107,7 @@ describe("Rider flow: Home → Results → Ride details", () => {
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
 
     await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.getByRole("radio", { name: /find a ride/i })).toHaveAttribute("aria-checked", "true");
     await pickDestination(user, "Sacramento");
     await user.click(screen.getByRole("button", { name: /1 seat/i }));
     await user.click(screen.getByRole("button", { name: /more seats needed/i }));
@@ -117,12 +118,12 @@ describe("Rider flow: Home → Results → Ride details", () => {
     const search = calls.find(c => c.key === "GET /driver-trips/search" && c.url.includes("destination_latitude"));
     expect(search?.url).toContain(`target_date=${today}`);
 
-    // Best match first (less detour, verified); lowest price flips the order.
+    // Best match first (less detour, verified); cheapest flips the order.
     let cards = screen.getAllByRole("button", { name: /per seat/i });
     expect(cards[0]).toHaveTextContent("Priya");
     expect(cards[0]).toHaveTextContent("8:10 → 8:42");
     expect(within(cards[0]).getByRole("img", { name: /id verified/i })).toBeTruthy();
-    await user.click(screen.getByRole("radio", { name: /lowest price/i }));
+    await user.click(screen.getByRole("radio", { name: /cheapest/i }));
     cards = screen.getAllByRole("button", { name: /per seat/i });
     expect(cards[0]).toHaveTextContent("Marcus");
 
@@ -171,10 +172,50 @@ describe("Trip day", () => {
     expect(screen.getByText("8KXR 214")).toBeTruthy();
     expect(screen.getByText(/grey honda civic/i)).toBeTruthy();
     expect(screen.getByRole("link", { name: /call/i })).toHaveAttribute("href", "tel:+15550100");
+    expect(screen.getByRole("progressbar", { name: /priya is on the way/i })).toBeTruthy();
+    expect(screen.getByText(/1\.1 mi away/i)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /i’m late/i }));
+    await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_1/messages")).toBe(true));
 
     await user.click(screen.getByRole("button", { name: /i’m at the pickup spot/i }));
     await screen.findByRole("button", { name: /you’re checked in/i });
     expect(calls.some(c => c.key === "POST /connections/con_1/at-pickup")).toBe(true);
+  });
+
+  it("shows the arrival screen with the cost split and rating once the driver completes the ride", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const accepted = {
+      id: "con_2", ride_request_id: "rrq_2", driver_trip_id: "trp_mine", initiator_user_id: "usr_sam", status: "accepted",
+      created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null,
+      ride_request: { id: "rrq_2", rider_id: "usr_sam", pickup: { id: "a", label: "Elm St & 3rd, Chico, CA", exact: true }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "morning", passenger_count: 1, tags: [], status: "matched", created_at: "x" },
+      driver_trip: { ...PRIYA, id: "trp_mine", driver_id: "usr_me" },
+      rider_profile: { user_id: "usr_sam", display_name: "Sam Rivera", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+      driver_profile: { user_id: "usr_me", display_name: "Me", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+    };
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/connections": [accepted],
+      "GET /me/driver-trips": [],
+      "GET /me/ride-requests": [],
+      "GET /connections/con_2/messages": [],
+      "GET /connections/con_2/live": { connection_id: "con_2", pickup: { label: "Elm St & 3rd, Chico, CA", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+      "POST /connections/con_2/transition": { ...accepted, status: "completed" },
+      "POST /connections/con_2/rating": {},
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await user.click(await screen.findByRole("button", { name: /picking up sam/i }));
+    await user.click(await screen.findByRole("button", { name: /mark ride complete/i }));
+
+    await screen.findByRole("heading", { name: /ride complete/i });
+    expect(screen.getByText("$4.50")).toBeTruthy();
+    expect(screen.getByText(/vs ~\$13\.50 driving solo/i)).toBeTruthy();
+    await user.click(screen.getByRole("radio", { name: /^5 stars$/i }));
+    await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_2/rating")).toBe(true));
+    expect((calls.find(c => c.key === "POST /connections/con_2/rating")!.body as { stars: number }).stars).toBe(5);
   });
 });
 
@@ -223,5 +264,27 @@ describe("Driver flow: Home → Offer a ride", () => {
     expect(body.price_per_seat_cents).toBeNull();
     expect(body.seats_available).toBe(1);
     await screen.findByRole("heading", { name: /^my rides$/i });
+  });
+});
+
+describe("Home: ride or drive toggle", () => {
+  useMobileViewport();
+  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
+
+  it("switches between finding and offering a ride without leaving Home", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    stubApi({ ...BASE_ROUTES, "GET /me/driver-trips": [], "GET /me/ride-requests": [] });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await user.click(screen.getByRole("radio", { name: /offer a ride/i }));
+    await screen.findByRole("heading", { name: /where are you driving\?/i });
+    expect(screen.getByRole("button", { name: /post this ride/i })).toBeTruthy();
+    expect(sessionStorage.getItem("carpool_mode")).toBe("driver");
+
+    await user.click(screen.getByRole("radio", { name: /find a ride/i }));
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
   });
 });
