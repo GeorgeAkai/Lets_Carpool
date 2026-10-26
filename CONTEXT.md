@@ -245,6 +245,17 @@ Record who confirmed completion. Do not implement disputes, refunds, or payment 
 
 Keep completion data so ratings and reviews can be added later without remodelling rides.
 
+## Preferences, Receipts and Safety
+
+- **Ride preferences** (per user): max walk to pickup (narrows the pickup radius and route corridor at 80 m/min), ride vibes (`quiet`, `music_ok`, `chatty`, `pets_ok`, `room_for_bags`, `no_smoking`), verified drivers only, women-only rides, coworkers first, and route check-ins. Preferences apply to driver-trip search by default; `apply_preferences=false` turns them off for one search. Vibes only rank results, never filter them out.
+- A driver's vibes are copied onto each trip they post. **Coworkers** share a non-public email domain (two Gmail users are not coworkers). **Ride buddies** are people a user chose to "ride with again"; they can only be added after a completed ride together.
+- **Women-only rides** rely on an optional, self-declared `gender` on the profile. It is never shown to other users, and only a user who declared `woman` can turn the preference on. The filter keeps trips whose driver, and every rider already accepted, declared `woman`.
+- **Saved places**: one Home, one Work, and a few named extras.
+- **Settling up** stays outside the app. A user records how they like to be paid back (`cash`, `venmo`, `zelle`, `paypal`, `cash_app`, `other` plus an optional handle). Partners see it once a ride is accepted. No card or bank data is stored.
+- **Ride PIN**: accepting a connection generates a 4-digit PIN that only the rider sees. The driver confirms it before pickup.
+- **Trip receipt**: an immutable snapshot of the cost split, written when a connection completes and numbered `CP-00001`. Both participants can read it. **Impact** (shared trips, gas saved, regular buddies) is derived from receipts.
+- **Emergency contacts** (up to 5) have a share mode of `every_trip`, `night_only` or `off`. Trip reports carry the connection and a category (`safety`, `driving`, `no_show`, `payment`, `conduct`, `other`).
+
 ## Tags and Verticals
 
 Support lightweight listing tags within the same core flow:

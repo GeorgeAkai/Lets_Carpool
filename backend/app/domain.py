@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -24,6 +25,19 @@ PoolStatus = Literal["open", "full", "cancelled", "completed"]
 ALLOWED_TAGS = {"airport", "student", "church", "college", "work", "event"}
 ALLOWED_LUGGAGE: set[str] = {"none", "small", "medium", "large", "oversized"}
 ALLOWED_CAR_TYPES: set[str] = {"sedan", "suv", "van", "minivan", "truck", "other"}
+# "Ride vibe" chips: riders rank by them, drivers advertise them on their trips.
+ALLOWED_VIBES: set[str] = {"quiet", "music_ok", "chatty", "pets_ok", "room_for_bags", "no_smoking"}
+# Quick feedback chips on the rating screen.
+ALLOWED_RATING_TAGS: set[str] = {"on_time", "safe_driving", "clean_car", "great_chat", "friendly", "easy_pickup"}
+# How people settle the gas split outside the app.
+ALLOWED_SETTLEMENT_METHODS: set[str] = {"cash", "venmo", "zelle", "paypal", "cash_app", "other"}
+ALLOWED_GENDERS: set[str] = {"woman", "man", "nonbinary"}
+ALLOWED_REPORT_CATEGORIES: set[str] = {"safety", "driving", "no_show", "payment", "conduct", "other"}
+ALLOWED_SHARE_MODES: set[str] = {"every_trip", "night_only", "off"}
+# "Max walk to pickup" → search radius, at an unhurried walking pace.
+WALK_METERS_PER_MINUTE = 80
+MAX_EMERGENCY_CONTACTS = 5
+MAX_SAVED_PLACES = 10
 
 _GAS_PRICE_PER_GALLON_USD = 3.50
 _MPG_DEFAULT = 28.0
@@ -66,6 +80,17 @@ def email_domain(email: str) -> str:
     return email.split("@", 1)[1].lower()
 
 
+_PUBLIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com",
+    "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com", "gmx.com",
+}
+
+
+def _is_public_email_domain(domain: str) -> bool:
+    """Two Gmail users aren't coworkers: only a shared work/school domain counts."""
+    return domain.lower() in _PUBLIC_EMAIL_DOMAINS
+
+
 def haversine_meters(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
     radius = 6_371_000
     d_lat = radians(b_lat - a_lat)
@@ -99,6 +124,7 @@ class User:
     suspended_at: datetime | None = None
     suspended_reason: str | None = None
     id_verified: bool = False
+    onboarded_at: datetime | None = None
 
 
 @dataclass
@@ -111,6 +137,7 @@ class Profile:
     interests: list[str] = field(default_factory=list)
     nationality: str | None = None
     phone: str | None = None
+    gender: str | None = None
 
 
 @dataclass
@@ -186,9 +213,14 @@ class DriverTrip:
     series_id: str | None = None
     route_distance_m: float | None = None
     route_duration_s: float | None = None
+    vibes: list[str] = field(default_factory=list)
     # Minutes added to this trip if the searching rider is picked up. Only set
     # on corridor-search results (needs the rider's pickup + destination).
     detour_minutes: float | None = None
+    # Search-only, relative to the searching rider's preferences.
+    is_coworker: bool | None = None
+    is_buddy: bool | None = None
+    shared_vibes: list[str] | None = None
 
 
 @dataclass
@@ -202,6 +234,11 @@ class Connection:
     updated_at: datetime
     completed_confirmed_by: list[str] = field(default_factory=list)
     rider_at_pickup_at: datetime | None = None
+    responded_at: datetime | None = None
+    completed_at: datetime | None = None
+    # Read out by the rider, entered by the driver; never shown to the driver.
+    ride_pin: str | None = None
+    pin_verified_at: datetime | None = None
 
 
 @dataclass
@@ -245,6 +282,8 @@ class Report:
     reason: str
     created_at: datetime
     status: str = "open"
+    connection_id: str | None = None
+    category: str = "other"
 
 
 @dataclass
@@ -311,12 +350,14 @@ def _row_to_user(r: dict) -> User:
         created_at=r["created_at"], status=r.get("status", "active"),
         suspended_at=r.get("suspended_at"), suspended_reason=r.get("suspended_reason"),
         id_verified=bool(r.get("id_verified") or False),
+        onboarded_at=r.get("onboarded_at"),
     )
 
 def _row_to_report(r: dict) -> Report:
     return Report(
         id=r["id"], reporter_id=r["reporter_id"], reported_user_id=r["reported_user_id"],
         reason=r["reason"], created_at=r["created_at"], status=r.get("status", "open"),
+        connection_id=r.get("connection_id"), category=r.get("category") or "other",
     )
 
 def _row_to_audit_log(r: dict) -> AuditLogEntry:
@@ -335,7 +376,7 @@ def _row_to_profile(r: dict) -> Profile:
         photo_url=r["photo_url"], bio=r["bio"],
         photo_verified=r["photo_verified"],
         interests=list(r["interests"] or []), nationality=r["nationality"],
-        phone=r.get("phone"),
+        phone=r.get("phone"), gender=r.get("gender"),
     )
 
 def _row_to_vehicle(r: dict) -> Vehicle:
@@ -405,6 +446,7 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         auto_accept_verified=bool(r.get("auto_accept_verified") or False),
         series_id=r.get("series_id"),
         route_distance_m=r.get("route_distance_m"), route_duration_s=r.get("route_duration_s"),
+        vibes=list(r.get("vibes") or []),
     )
 
 def _row_to_connection(r: dict) -> Connection:
@@ -416,6 +458,8 @@ def _row_to_connection(r: dict) -> Connection:
         updated_at=r["updated_at"],
         completed_confirmed_by=list(r["completed_confirmed_by"] or []),
         rider_at_pickup_at=r.get("rider_at_pickup_at"),
+        responded_at=r.get("responded_at"), completed_at=r.get("completed_at"),
+        ride_pin=r.get("ride_pin"), pin_verified_at=r.get("pin_verified_at"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -469,6 +513,12 @@ def _row_to_pool_message(r: dict) -> PoolMessage:
 
 
 # ─── Store ────────────────────────────────────────────────────────────────────
+
+def _receipt_view(r: dict) -> dict[str, Any]:
+    data = dict(r)
+    data["receipt_number"] = f"CP-{int(r['receipt_number']):05d}"
+    return data
+
 
 class Store:
     def __init__(self, database_url: str, router: OSRMClient | None = None) -> None:
@@ -532,8 +582,10 @@ class Store:
     def update_profile(
         self, user_id: str, display_name: str, photo_url: str | None, bio: str | None,
         interests: list[str] | None = None, nationality: str | None = None,
-        phone: Any = _KEEP,
+        phone: Any = _KEEP, gender: Any = _KEEP,
     ) -> Profile:
+        if gender is not _KEEP and gender is not None and gender not in ALLOWED_GENDERS:
+            raise DomainError(f"Invalid gender: {gender}")
         if phone is not _KEEP:
             phone = (phone or "").strip() or None
             if phone and not _PHONE_RE.match(phone):
@@ -553,6 +605,12 @@ class Store:
             )
             if phone is not _KEEP:
                 cur.execute("UPDATE profiles SET phone = %s WHERE user_id = %s", (phone, user_id))
+            if gender is not _KEEP:
+                cur.execute("UPDATE profiles SET gender = %s WHERE user_id = %s", (gender, user_id))
+                if gender != "woman":
+                    # The preference only makes sense for women; drop it rather
+                    # than silently filtering on a stale answer.
+                    cur.execute("UPDATE ride_preferences SET women_only = FALSE WHERE user_id = %s", (user_id,))
             cur.execute("SELECT * FROM profiles WHERE user_id = %s", (user_id,))
             return _row_to_profile(cur.fetchone())
 
@@ -776,6 +834,7 @@ class Store:
             price_per_seat_cents=None if price is None else int(price),
             auto_accept_verified=bool(data.get("auto_accept_verified")),
             series_id=data.get("series_id"),
+            vibes=self.get_ride_preferences(driver_id)["vibes"],
         )
         # One routing call per trip creation (not per search). Done before
         # opening the DB connection so a slow OSRM doesn't hold a pooled one.
@@ -789,16 +848,16 @@ class Store:
                        seats_available, seats_reserved, tags, status, created_at,
                        luggage_capacity, car_type, notes,
                        route_geog, route_distance_m, route_duration_s,
-                       departure_time, price_per_seat_cents, auto_accept_verified, series_id)
+                       departure_time, price_per_seat_cents, auto_accept_verified, series_id, vibes)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           ST_GeogFromText(%s), %s, %s, %s, %s, %s, %s)""",
+                           ST_GeogFromText(%s), %s, %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
                  trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
                  trip.notes, route_wkt, route_distance_m, route_duration_s,
                  trip.departure_time, trip.price_per_seat_cents, trip.auto_accept_verified,
-                 trip.series_id),
+                 trip.series_id, trip.vibes),
             )
         self._fulfil_ride_alerts(trip)
         return trip
@@ -940,6 +999,10 @@ class Store:
         # actually being scheduled yet. Idempotent and cheap: matches ~0 rows
         # once a listing has already been archived once.
         self.expire_listings(now_utc().date())
+        prefs = self.get_ride_preferences(user_id) if query.get("apply_preferences", True) else None
+        if prefs and prefs["max_walk_minutes"]:
+            walk_m = prefs["max_walk_minutes"] * WALK_METERS_PER_MINUTE
+            query = {**query, "pickup_radius_meters": walk_m, "route_buffer_meters": walk_m}
         corridor = self._corridor_search(query)
         if corridor:
             joins, geo_conditions, geo_params = corridor
@@ -947,6 +1010,17 @@ class Store:
             joins, geo_conditions, geo_params = self._geo_search_clauses(
                 query, "dt.destination_location_id", "dt.pickup_location_id",
             )
+        pref_conditions = ""
+        if prefs and prefs["verified_only"]:
+            pref_conditions += " AND EXISTS (SELECT 1 FROM users vu WHERE vu.id = dt.driver_id AND vu.id_verified)"
+        if prefs and prefs["women_only"]:
+            # The driver and every rider already booked on the trip are women.
+            pref_conditions += """ AND EXISTS (SELECT 1 FROM profiles gp WHERE gp.user_id = dt.driver_id AND gp.gender = 'woman')
+                AND NOT EXISTS (SELECT 1 FROM connections wc
+                                JOIN ride_requests wr ON wr.id = wc.ride_request_id
+                                LEFT JOIN profiles wp ON wp.user_id = wr.rider_id
+                                WHERE wc.driver_trip_id = dt.id AND wc.status = 'accepted'
+                                AND wp.gender IS DISTINCT FROM 'woman')"""
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
@@ -962,6 +1036,7 @@ class Store:
                    AND dt.driver_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
                    {geo_conditions}
+                   {pref_conditions}
                    AND NOT EXISTS (
                        SELECT 1 FROM blocks
                        WHERE (blocker_id = %s AND blocked_id = dt.driver_id)
@@ -975,7 +1050,38 @@ class Store:
         trips = [_row_to_driver_trip(r) for r in rows]
         if corridor:
             self._attach_detours(trips, rows, query)
-        return [t for t in trips if self._listing_matches_query(t, query)]
+        trips = [t for t in trips if self._listing_matches_query(t, query)]
+        if prefs is not None:
+            self._rank_by_preferences(user_id, trips, prefs)
+        return trips
+
+    def _rank_by_preferences(self, user_id: str, trips: list[DriverTrip], prefs: dict[str, Any]) -> None:
+        """Marks each trip with what it has in common with the rider (coworker,
+        ride buddy, shared vibes) and, with "Coworkers first", moves coworkers
+        and buddies to the top. A stable sort, so the SQL order holds within
+        each group. Vibes only rank, never filter: an empty result for "Quiet
+        ride" helps no one."""
+        if not trips:
+            return
+        driver_ids = list({t.driver_id for t in trips})
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT u.id, u.email_domain = me.email_domain AS coworker,
+                          EXISTS (SELECT 1 FROM ride_buddies b WHERE b.user_id = me.id AND b.buddy_id = u.id) AS buddy
+                   FROM users u, users me WHERE me.id = %s AND u.id = ANY(%s)""",
+                (user_id, driver_ids),
+            )
+            flags = {r["id"]: r for r in cur.fetchall()}
+        wanted = set(prefs["vibes"])
+        work_domain = not _is_public_email_domain(self.user_for_id(user_id).email_domain)
+        for t in trips:
+            f = flags.get(t.driver_id)
+            t.is_coworker = bool(work_domain and f and f["coworker"])
+            t.is_buddy = bool(f and f["buddy"])
+            t.shared_vibes = sorted(wanted & set(t.vibes))
+        if prefs["coworkers_first"]:
+            trips.sort(key=lambda t: (not t.is_buddy, not t.is_coworker, -len(t.shared_vibes or [])))
 
     # ─── Proposed matches (Empower-style) ─────────────────────────────────────
 
@@ -1319,16 +1425,21 @@ class Store:
             if new_reserved > trip.seats_available:
                 raise DomainError("Driver trip does not have enough available seats", 409)
             new_trip_status = "matched" if new_reserved >= trip.seats_available else "open"
+            pin = f"{secrets.randbelow(10_000):04d}"
+            responded = now_utc()
             with get_conn() as conn:
                 cur = self._cur(conn)
-                cur.execute("UPDATE connections SET status = 'accepted', updated_at = %s WHERE id = %s",
-                            (now_utc(), connection_id))
+                cur.execute(
+                    """UPDATE connections SET status = 'accepted', updated_at = %s,
+                           responded_at = %s, ride_pin = %s WHERE id = %s""",
+                    (responded, responded, pin, connection_id))
                 cur.execute("UPDATE ride_requests SET status = 'matched' WHERE id = %s", (rr.id,))
                 cur.execute(
                     "UPDATE driver_trips SET seats_reserved = %s, status = %s WHERE id = %s",
                     (new_reserved, new_trip_status, trip.id),
                 )
             connection.status = "accepted"
+            connection.responded_at, connection.ride_pin = responded, pin
             self.notify(connection.initiator_user_id, "connection_accepted",
                         "Connection accepted", "Your carpool connection was accepted.", related_id=connection.id)
             self.notify(rr.rider_id, "chat_unlocked", "Chat unlocked",
@@ -1341,8 +1452,8 @@ class Store:
                 raise DomainError("Only pending connections can be declined")
             with get_conn() as conn:
                 cur = self._cur(conn)
-                cur.execute("UPDATE connections SET status = 'declined', updated_at = %s WHERE id = %s",
-                            (now_utc(), connection_id))
+                cur.execute("UPDATE connections SET status = 'declined', updated_at = %s, responded_at = %s WHERE id = %s",
+                            (now_utc(), now_utc(), connection_id))
             connection.status = "declined"
 
         elif action == "cancel":
@@ -1369,16 +1480,20 @@ class Store:
             confirmed = list(connection.completed_confirmed_by)
             if user_id not in confirmed:
                 confirmed.append(user_id)
+            completed = now_utc()
             with get_conn() as conn:
                 cur = self._cur(conn)
                 cur.execute(
-                    "UPDATE connections SET status = 'completed', completed_confirmed_by = %s, updated_at = %s WHERE id = %s",
-                    (confirmed, now_utc(), connection_id),
+                    """UPDATE connections SET status = 'completed', completed_confirmed_by = %s,
+                           updated_at = %s, completed_at = %s WHERE id = %s""",
+                    (confirmed, completed, completed, connection_id),
                 )
                 cur.execute("UPDATE ride_requests SET status = 'completed' WHERE id = %s", (rr.id,))
                 cur.execute("UPDATE driver_trips SET status = 'completed' WHERE id = %s", (trip.id,))
             connection.status = "completed"
             connection.completed_confirmed_by = confirmed
+            connection.completed_at = completed
+            self._write_receipt(connection, rr, trip)
         else:
             raise DomainError(f"Unsupported connection action: {action}")
 
@@ -1802,7 +1917,8 @@ class Store:
 
     # ─── Ratings & trust ──────────────────────────────────────────────────────
 
-    def rate_connection(self, user_id: str, connection_id: str, stars: int, comment: str | None) -> dict[str, Any]:
+    def rate_connection(self, user_id: str, connection_id: str, stars: int, comment: str | None,
+                        tags: list[str] | None = None) -> dict[str, Any]:
         connection = self.get_connection(connection_id)
         rr = self.get_ride_request(connection.ride_request_id)
         trip = self.get_driver_trip(connection.driver_trip_id)
@@ -1812,19 +1928,24 @@ class Store:
             raise DomainError("You can rate a ride once it's completed")
         if not 1 <= stars <= 5:
             raise DomainError("Rating must be 1 to 5 stars")
+        tags = sorted(set(tags or []))
+        if any(t not in ALLOWED_RATING_TAGS for t in tags):
+            raise DomainError(f"Rating tags must be among: {', '.join(sorted(ALLOWED_RATING_TAGS))}")
         ratee = trip.driver_id if user_id == rr.rider_id else rr.rider_id
         rating = {
             "id": new_id("rtg"), "connection_id": connection_id, "rater_id": user_id,
             "ratee_id": ratee, "stars": stars, "comment": (comment or "").strip() or None,
-            "created_at": now_utc(),
+            "tags": tags, "created_at": now_utc(),
         }
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                """INSERT INTO ratings (id, connection_id, rater_id, ratee_id, stars, comment, created_at)
-                   VALUES (%(id)s, %(connection_id)s, %(rater_id)s, %(ratee_id)s, %(stars)s, %(comment)s, %(created_at)s)
+                """INSERT INTO ratings (id, connection_id, rater_id, ratee_id, stars, comment, tags, created_at)
+                   VALUES (%(id)s, %(connection_id)s, %(rater_id)s, %(ratee_id)s, %(stars)s, %(comment)s,
+                           %(tags)s, %(created_at)s)
                    ON CONFLICT (connection_id, rater_id) DO UPDATE
-                   SET stars = EXCLUDED.stars, comment = EXCLUDED.comment, created_at = EXCLUDED.created_at""",
+                   SET stars = EXCLUDED.stars, comment = EXCLUDED.comment, tags = EXCLUDED.tags,
+                       created_at = EXCLUDED.created_at""",
                 rating,
             )
         return rating
@@ -1850,16 +1971,32 @@ class Store:
                         JOIN ride_requests rr ON rr.id = c.ride_request_id
                         JOIN driver_trips dt ON dt.id = c.driver_trip_id
                        WHERE c.status = 'completed' AND (rr.rider_id = %(u)s OR dt.driver_id = %(u)s)) AS completed_trips,
-                     (SELECT id_verified FROM users WHERE id = %(u)s) AS id_verified""",
+                     (SELECT id_verified FROM users WHERE id = %(u)s) AS id_verified,
+                     -- Typical time to answer a request on one of their trips
+                     -- ("Drivers usually reply within 10 minutes").
+                     (SELECT percentile_cont(0.5) WITHIN GROUP (
+                                ORDER BY EXTRACT(EPOCH FROM c.responded_at - c.created_at) / 60)
+                        FROM connections c JOIN driver_trips dt ON dt.id = c.driver_trip_id
+                       WHERE dt.driver_id = %(u)s AND c.responded_at IS NOT NULL
+                         AND c.initiator_user_id != %(u)s) AS median_response_minutes""",
                 {"u": user_id},
             )
             r = cur.fetchone()
+            cur.execute(
+                """SELECT tag, COUNT(*) AS n FROM ratings, unnest(tags) AS tag
+                   WHERE ratee_id = %s GROUP BY tag ORDER BY n DESC, tag LIMIT 3""",
+                (user_id,),
+            )
+            top_tags = [{"tag": t["tag"], "count": int(t["n"])} for t in cur.fetchall()]
         avg = r["rating_avg"]
+        response = r["median_response_minutes"]
         return {
             "rating_avg": round(float(avg), 1) if avg is not None else None,
             "rating_count": int(r["rating_count"]),
             "completed_trips": int(r["completed_trips"]),
             "id_verified": bool(r["id_verified"]),
+            "median_response_minutes": max(1, round(float(response))) if response is not None else None,
+            "top_rating_tags": top_tags,
         }
 
     def set_id_verified(self, target_user_id: str, verified: bool) -> User:
@@ -2012,6 +2149,328 @@ class Store:
                     related_id=connection_id)
         return connection
 
+    def verify_ride_pin(self, user_id: str, connection_id: str, pin: str) -> Connection:
+        """The driver enters the PIN the rider reads out, so both know they've
+        got the right car / the right person before the ride starts."""
+        connection = self.get_connection(connection_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id != trip.driver_id:
+            raise DomainError("Only the driver can confirm the ride PIN", 403)
+        if connection.status != "accepted" or not connection.ride_pin:
+            raise DomainError("Only accepted rides have a PIN")
+        if not secrets.compare_digest(pin.strip(), connection.ride_pin):
+            raise DomainError("That PIN doesn't match — ask your rider to check it", 409)
+        at = now_utc()
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("UPDATE connections SET pin_verified_at = %s WHERE id = %s", (at, connection_id))
+        connection.pin_verified_at = at
+        return connection
+
+    # ─── Onboarding ───────────────────────────────────────────────────────────
+
+    def complete_onboarding(self, user_id: str) -> User:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE users SET onboarded_at = COALESCE(onboarded_at, %s) WHERE id = %s RETURNING *",
+                (now_utc(), user_id),
+            )
+            return _row_to_user(cur.fetchone())
+
+    # ─── Ride preferences ─────────────────────────────────────────────────────
+
+    _DEFAULT_PREFERENCES: dict[str, Any] = {
+        "max_walk_minutes": None, "vibes": [], "verified_only": False,
+        "women_only": False, "coworkers_first": False, "route_checkins": True,
+    }
+
+    def get_ride_preferences(self, user_id: str) -> dict[str, Any]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT * FROM ride_preferences WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        if not row:
+            return {**self._DEFAULT_PREFERENCES, "vibes": []}
+        return {k: (list(row[k] or []) if k == "vibes" else row[k]) for k in self._DEFAULT_PREFERENCES}
+
+    def update_ride_preferences(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Partial update: keys not sent keep their stored (or default) value."""
+        prefs = {**self.get_ride_preferences(user_id),
+                 **{k: v for k, v in data.items() if k in self._DEFAULT_PREFERENCES}}
+        prefs["vibes"] = sorted(set(prefs["vibes"] or []))
+        if any(v not in ALLOWED_VIBES for v in prefs["vibes"]):
+            raise DomainError(f"Ride vibes must be among: {', '.join(sorted(ALLOWED_VIBES))}")
+        walk = prefs["max_walk_minutes"]
+        if walk is not None and not 1 <= int(walk) <= 60:
+            raise DomainError("Max walk must be between 1 and 60 minutes")
+        if prefs["women_only"]:
+            profile = self.get_profile(user_id)
+            if not profile or profile.gender != "woman":
+                raise DomainError("Women-only rides are available to women. Add your gender in your profile to turn this on.", 403)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO ride_preferences (user_id, max_walk_minutes, vibes, verified_only,
+                       women_only, coworkers_first, route_checkins, updated_at)
+                   VALUES (%(user_id)s, %(max_walk_minutes)s, %(vibes)s, %(verified_only)s,
+                           %(women_only)s, %(coworkers_first)s, %(route_checkins)s, %(updated_at)s)
+                   ON CONFLICT (user_id) DO UPDATE SET
+                       max_walk_minutes = EXCLUDED.max_walk_minutes, vibes = EXCLUDED.vibes,
+                       verified_only = EXCLUDED.verified_only, women_only = EXCLUDED.women_only,
+                       coworkers_first = EXCLUDED.coworkers_first, route_checkins = EXCLUDED.route_checkins,
+                       updated_at = EXCLUDED.updated_at""",
+                {**prefs, "user_id": user_id, "updated_at": now_utc()},
+            )
+        return prefs
+
+    # ─── Saved places (Home, Work, …) ─────────────────────────────────────────
+
+    def list_saved_places(self, user_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT * FROM saved_places WHERE user_id = %s
+                   ORDER BY CASE kind WHEN 'home' THEN 0 WHEN 'work' THEN 1 ELSE 2 END, created_at""",
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def save_place(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Home and Work are one each: saving again moves them."""
+        kind = data.get("kind") or "other"
+        if kind not in {"home", "work", "other"}:
+            raise DomainError("Place kind must be home, work or other")
+        self.get_location(data["location_id"])
+        label = (data.get("label") or "").strip() or kind.capitalize()
+        place = {"id": new_id("plc"), "user_id": user_id, "kind": kind, "label": label[:40],
+                 "location_id": data["location_id"], "created_at": now_utc()}
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            if kind in {"home", "work"}:
+                cur.execute("DELETE FROM saved_places WHERE user_id = %s AND kind = %s", (user_id, kind))
+            else:
+                cur.execute("SELECT COUNT(*) AS n FROM saved_places WHERE user_id = %s", (user_id,))
+                if cur.fetchone()["n"] >= MAX_SAVED_PLACES:
+                    raise DomainError(f"You can save up to {MAX_SAVED_PLACES} places")
+            cur.execute(
+                """INSERT INTO saved_places (id, user_id, kind, label, location_id, created_at)
+                   VALUES (%(id)s, %(user_id)s, %(kind)s, %(label)s, %(location_id)s, %(created_at)s)""",
+                place,
+            )
+        return place
+
+    def delete_saved_place(self, user_id: str, place_id: str) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("DELETE FROM saved_places WHERE id = %s AND user_id = %s", (place_id, user_id))
+            if cur.rowcount == 0:
+                raise DomainError("Place not found", 404)
+
+    # ─── Settling up (outside the app) ────────────────────────────────────────
+
+    def get_settlement_preference(self, user_id: str) -> dict[str, Any] | None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT method, handle, updated_at FROM settlement_preferences WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def set_settlement_preference(self, user_id: str, method: str, handle: str | None) -> dict[str, Any]:
+        if method not in ALLOWED_SETTLEMENT_METHODS:
+            raise DomainError(f"Settle-up method must be one of: {', '.join(sorted(ALLOWED_SETTLEMENT_METHODS))}")
+        handle = (handle or "").strip() or None
+        if handle and len(handle) > 60:
+            raise DomainError("Keep the handle under 60 characters")
+        if method == "cash":
+            handle = None
+        pref = {"method": method, "handle": handle, "updated_at": now_utc()}
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO settlement_preferences (user_id, method, handle, updated_at)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET method = EXCLUDED.method,
+                       handle = EXCLUDED.handle, updated_at = EXCLUDED.updated_at""",
+                (user_id, method, handle, pref["updated_at"]),
+            )
+        return pref
+
+    # ─── Receipts ─────────────────────────────────────────────────────────────
+
+    def _write_receipt(self, connection: Connection, rr: RideRequest, trip: DriverTrip) -> None:
+        pricing = self.trip_pricing(trip)
+        driver = self.get_profile(trip.driver_id)
+        vehicle = self.get_vehicle(trip.driver_id)
+        settle = self.get_settlement_preference(trip.driver_id)
+        seats = rr.passenger_count
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """INSERT INTO trip_receipts (id, connection_id, rider_id, driver_id, driver_name, vehicle_label,
+                       pickup_label, dropoff_label, trip_date, departure_time, completed_at, distance_km,
+                       gas_cost_cents, split_between, seats, price_per_seat_cents, amount_cents,
+                       settlement_method, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (connection_id) DO NOTHING""",
+                (new_id("rcp"), connection.id, rr.rider_id, trip.driver_id,
+                 driver.display_name if driver else None,
+                 " ".join(filter(None, [vehicle.color, vehicle.make, vehicle.model])) or None if vehicle else None,
+                 self.get_location(rr.pickup_location_id).label,
+                 self.get_location(rr.destination_location_id).label,
+                 trip.target_date, trip.departure_time, connection.completed_at,
+                 pricing["distance_km"], pricing["gas_cost_cents"], pricing["split_between"], seats,
+                 pricing["price_per_seat_cents"], pricing["price_per_seat_cents"] * seats,
+                 settle["method"] if settle else None, now_utc()),
+            )
+
+    def get_receipt(self, user_id: str, connection_id: str) -> dict[str, Any]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT * FROM trip_receipts WHERE connection_id = %s", (connection_id,))
+            row = cur.fetchone()
+        if not row or user_id not in {row["rider_id"], row["driver_id"]}:
+            raise DomainError("Receipt not found", 404)
+        return _receipt_view(row)
+
+    def list_receipts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT * FROM trip_receipts WHERE rider_id = %s OR driver_id = %s
+                   ORDER BY completed_at DESC LIMIT %s""",
+                (user_id, user_id, limit),
+            )
+            return [_receipt_view(r) for r in cur.fetchall()]
+
+    # ─── Impact (Profile header, "This month" on arrival) ─────────────────────
+
+    def user_impact(self, user_id: str, since: date | None = None) -> dict[str, Any]:
+        """What sharing rides has done for this user, from their receipts:
+        riders save the solo gas cost minus their share; drivers recoup the
+        shares they collected. Regular buddies: people shared 3+ rides with."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT COUNT(*) AS trips,
+                          COALESCE(SUM(CASE WHEN rider_id = %(u)s
+                                            THEN GREATEST(0, gas_cost_cents - amount_cents)
+                                            ELSE amount_cents END), 0) AS saved_cents,
+                          COALESCE(SUM(distance_km), 0) AS shared_km
+                   FROM trip_receipts
+                   WHERE (rider_id = %(u)s OR driver_id = %(u)s)
+                     AND (%(since)s::date IS NULL OR completed_at >= %(since)s::date)""",
+                {"u": user_id, "since": since},
+            )
+            r = cur.fetchone()
+            cur.execute(
+                """SELECT COUNT(*) AS n FROM (
+                       SELECT CASE WHEN rider_id = %(u)s THEN driver_id ELSE rider_id END AS partner
+                       FROM trip_receipts WHERE rider_id = %(u)s OR driver_id = %(u)s
+                       GROUP BY 1 HAVING COUNT(*) >= 3) p""",
+                {"u": user_id},
+            )
+            regulars = cur.fetchone()["n"]
+        return {
+            "shared_trips": int(r["trips"]),
+            "saved_cents": int(r["saved_cents"]),
+            "shared_km": round(float(r["shared_km"]), 1),
+            "regular_buddies": int(regulars),
+            "since": since,
+        }
+
+    # ─── Ride buddies ("Ride with them again") ────────────────────────────────
+
+    def add_buddy(self, user_id: str, buddy_id: str) -> None:
+        if user_id == buddy_id:
+            raise DomainError("You can't add yourself")
+        self.user_for_id(buddy_id)
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            # Only people you've actually shared a completed ride with.
+            cur.execute(
+                """SELECT 1 FROM trip_receipts
+                   WHERE (rider_id = %(a)s AND driver_id = %(b)s) OR (rider_id = %(b)s AND driver_id = %(a)s)
+                   LIMIT 1""",
+                {"a": user_id, "b": buddy_id},
+            )
+            if not cur.fetchone():
+                raise DomainError("You can add someone after sharing a ride with them", 403)
+            cur.execute(
+                "INSERT INTO ride_buddies (user_id, buddy_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (user_id, buddy_id, now_utc()),
+            )
+
+    def remove_buddy(self, user_id: str, buddy_id: str) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("DELETE FROM ride_buddies WHERE user_id = %s AND buddy_id = %s", (user_id, buddy_id))
+
+    def list_buddies(self, user_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT b.buddy_id AS user_id, p.display_name, p.photo_url, b.created_at
+                   FROM ride_buddies b LEFT JOIN profiles p ON p.user_id = b.buddy_id
+                   WHERE b.user_id = %s ORDER BY b.created_at DESC""",
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    # ─── Emergency contacts ───────────────────────────────────────────────────
+
+    def list_emergency_contacts(self, user_id: str) -> list[dict[str, Any]]:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT * FROM emergency_contacts WHERE user_id = %s ORDER BY created_at", (user_id,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def add_emergency_contact(self, user_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        name = (data.get("name") or "").strip()
+        phone = (data.get("phone") or "").strip()
+        share_mode = data.get("share_mode") or "every_trip"
+        if not name:
+            raise DomainError("Add the contact's name")
+        if not _PHONE_RE.match(phone):
+            raise DomainError("Enter a valid phone number")
+        if share_mode not in ALLOWED_SHARE_MODES:
+            raise DomainError("Share mode must be every_trip, night_only or off")
+        contact = {"id": new_id("emc"), "user_id": user_id, "name": name[:60],
+                   "relationship": ((data.get("relationship") or "").strip() or None),
+                   "phone": phone, "share_mode": share_mode, "created_at": now_utc()}
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("SELECT COUNT(*) AS n FROM emergency_contacts WHERE user_id = %s", (user_id,))
+            if cur.fetchone()["n"] >= MAX_EMERGENCY_CONTACTS:
+                raise DomainError(f"You can add up to {MAX_EMERGENCY_CONTACTS} contacts")
+            cur.execute(
+                """INSERT INTO emergency_contacts (id, user_id, name, relationship, phone, share_mode, created_at)
+                   VALUES (%(id)s, %(user_id)s, %(name)s, %(relationship)s, %(phone)s, %(share_mode)s, %(created_at)s)""",
+                contact,
+            )
+        return contact
+
+    def update_emergency_contact_share_mode(self, user_id: str, contact_id: str, share_mode: str) -> dict[str, Any]:
+        if share_mode not in ALLOWED_SHARE_MODES:
+            raise DomainError("Share mode must be every_trip, night_only or off")
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                "UPDATE emergency_contacts SET share_mode = %s WHERE id = %s AND user_id = %s RETURNING *",
+                (share_mode, contact_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise DomainError("Contact not found", 404)
+            return dict(row)
+
+    def delete_emergency_contact(self, user_id: str, contact_id: str) -> None:
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute("DELETE FROM emergency_contacts WHERE id = %s AND user_id = %s", (contact_id, user_id))
+            if cur.rowcount == 0:
+                raise DomainError("Contact not found", 404)
+
     # ─── Blocks / Reports ─────────────────────────────────────────────────────
 
     def block_user(self, blocker_id: str, blocked_id: str) -> None:
@@ -2024,21 +2483,36 @@ class Store:
                 (blocker_id, blocked_id),
             )
 
-    def report_user(self, reporter_id: str, reported_user_id: str, reason: str) -> Report:
+    def report_user(self, reporter_id: str, reported_user_id: str, reason: str,
+                    category: str = "other", connection_id: str | None = None) -> Report:
         if reporter_id == reported_user_id:
             raise DomainError("Users cannot report themselves")
+        if category not in ALLOWED_REPORT_CATEGORIES:
+            raise DomainError(f"Report category must be one of: {', '.join(sorted(ALLOWED_REPORT_CATEGORIES))}")
         report = Report(
             id=new_id("rpt"), reporter_id=reporter_id,
             reported_user_id=reported_user_id, reason=reason, created_at=now_utc(),
+            connection_id=connection_id, category=category,
         )
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                "INSERT INTO reports (id, reporter_id, reported_user_id, reason, created_at) VALUES (%s, %s, %s, %s, %s)",
+                """INSERT INTO reports (id, reporter_id, reported_user_id, reason, created_at, connection_id, category)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (report.id, report.reporter_id, report.reported_user_id,
-                 report.reason, report.created_at),
+                 report.reason, report.created_at, report.connection_id, report.category),
             )
         return report
+
+    def report_trip(self, user_id: str, connection_id: str, reason: str, category: str) -> Report:
+        """"Report an issue with this trip": files against the other participant."""
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id not in {rr.rider_id, trip.driver_id}:
+            raise DomainError("Only participants can report this trip", 403)
+        other = trip.driver_id if user_id == rr.rider_id else rr.rider_id
+        return self.report_user(user_id, other, reason, category=category, connection_id=connection_id)
 
     def is_blocked(self, user_a: str, user_b: str) -> bool:
         with get_conn() as conn:

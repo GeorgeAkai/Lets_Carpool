@@ -381,5 +381,124 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
+    # ── Preferences, trust, receipts and safety (redesign, part 2) ─────────
+    # First-run welcome screen: shown until the user finishes it once.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ")
+    # Optional, self-declared, never shown to other users. Only used to honour
+    # the "Women-only rides" preference (see ride_preferences.women_only).
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gender TEXT")
+
+    # "Ride preferences": how the rider wants search narrowed and ranked, plus
+    # the driver's own ride vibe (copied onto each trip they post).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ride_preferences (
+            user_id           TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            max_walk_minutes  INTEGER CHECK (max_walk_minutes IS NULL OR max_walk_minutes BETWEEN 1 AND 60),
+            vibes             TEXT[] NOT NULL DEFAULT '{}',
+            verified_only     BOOLEAN NOT NULL DEFAULT FALSE,
+            women_only        BOOLEAN NOT NULL DEFAULT FALSE,
+            coworkers_first   BOOLEAN NOT NULL DEFAULT FALSE,
+            route_checkins    BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at        TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS vibes TEXT[] NOT NULL DEFAULT '{}'")
+
+    # "Saved places": one-tap Home / Work (and a few named extras) on Home.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS saved_places (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL CHECK (kind IN ('home', 'work', 'other')),
+            label       TEXT NOT NULL,
+            location_id TEXT NOT NULL REFERENCES locations(id),
+            created_at  TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_places_home_work
+        ON saved_places (user_id, kind) WHERE kind IN ('home', 'work')
+    """)
+
+    # How a user settles the gas split outside the app (no card data is ever
+    # stored: in-app payments are out of MVP scope). Shown to accepted partners
+    # and printed on receipts.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settlement_preferences (
+            user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            method     TEXT NOT NULL,
+            handle     TEXT,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+    # Request-status and receipt timeline, and the safety PIN the rider reads
+    # out to the driver before getting in.
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS ride_pin TEXT")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS pin_verified_at TIMESTAMPTZ")
+
+    # Immutable snapshot of a completed ride's cost split, so a receipt never
+    # changes if the trip, prices or profiles are edited later.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trip_receipts (
+            id                TEXT PRIMARY KEY,
+            receipt_number    BIGSERIAL UNIQUE,
+            connection_id     TEXT NOT NULL UNIQUE REFERENCES connections(id) ON DELETE CASCADE,
+            rider_id          TEXT NOT NULL REFERENCES users(id),
+            driver_id         TEXT NOT NULL REFERENCES users(id),
+            driver_name       TEXT,
+            vehicle_label     TEXT,
+            pickup_label      TEXT NOT NULL,
+            dropoff_label     TEXT NOT NULL,
+            trip_date         DATE NOT NULL,
+            departure_time    TIME,
+            completed_at      TIMESTAMPTZ NOT NULL,
+            distance_km       DOUBLE PRECISION NOT NULL,
+            gas_cost_cents    INTEGER NOT NULL,
+            split_between     INTEGER NOT NULL,
+            seats             INTEGER NOT NULL,
+            price_per_seat_cents INTEGER NOT NULL,
+            amount_cents      INTEGER NOT NULL,
+            settlement_method TEXT,
+            created_at        TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_receipts_rider ON trip_receipts (rider_id, completed_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_receipts_driver ON trip_receipts (driver_id, completed_at DESC)")
+
+    # Quick feedback chips on the rating screen ("On time", "Clean car", ...).
+    cur.execute("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'")
+
+    # "Ride with them again": people a user wants to see first in results.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ride_buddies (
+            user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            buddy_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (user_id, buddy_id)
+        )
+    """)
+
+    # Trusted contacts the user shares live trips with.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emergency_contacts (
+            id           TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name         TEXT NOT NULL,
+            relationship TEXT,
+            phone        TEXT NOT NULL,
+            share_mode   TEXT NOT NULL DEFAULT 'every_trip'
+                         CHECK (share_mode IN ('every_trip', 'night_only', 'off')),
+            created_at   TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+    # "Report an issue with this trip": a report can point at a ride and carry
+    # a category so the admin queue can triage safety issues first.
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS connection_id TEXT REFERENCES connections(id) ON DELETE SET NULL")
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'other'")
+
     cur.close()
     conn.close()
