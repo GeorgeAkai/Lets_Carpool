@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   ArrowUpDown, Check, ChevronLeft, ChevronRight, Clock, Footprints, MessageCircle, Minus,
   Phone, Plus, Share2, ShieldCheck, Star, Users, X, Bell, Navigation, Map as MapIcon, MapPin, Timer,
+  SlidersHorizontal, Receipt, Heart, Briefcase,
 } from 'lucide-react'
 import * as api from '../api'
 import type { ApiDriverTrip, ApiUser, SavedRoute, TripDayStatus } from '../api'
@@ -11,6 +12,8 @@ import {
   type Connection, type Flexibility, type LocationValue, type MyListing,
 } from './home'
 import { BottomSheet } from './discover-mobile'
+import { RATING_TAG_LABELS, VIBE_LABELS, settlementLine } from './account-screens'
+import type { RatingTag } from '../api'
 
 // ─── Shared search state (Home → Results → Ride details) ──────────────────────
 
@@ -100,11 +103,11 @@ function driverLine(trip: ApiDriverTrip): string {
 
 // ─── Small primitives ─────────────────────────────────────────────────────────
 
-function SectionLabel({ children }: { children: ReactNode }) {
+export function SectionLabel({ children }: { children: ReactNode }) {
   return <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">{children}</h2>
 }
 
-function IconButton({ label, onClick, children, className = '' }: { label: string; onClick?: () => void; children: ReactNode; className?: string }) {
+export function IconButton({ label, onClick, children, className = '' }: { label: string; onClick?: () => void; children: ReactNode; className?: string }) {
   return (
     <button type="button" onClick={onClick} aria-label={label}
       className={`size-11 shrink-0 rounded-xl bg-card border border-border text-foreground flex items-center justify-center hover:bg-muted transition-colors ${className}`}>
@@ -113,7 +116,7 @@ function IconButton({ label, onClick, children, className = '' }: { label: strin
   )
 }
 
-function PrimaryButton({ children, onClick, disabled, type = 'button' }: { children: ReactNode; onClick?: () => void; disabled?: boolean; type?: 'button' | 'submit' }) {
+export function PrimaryButton({ children, onClick, disabled, type = 'button' }: { children: ReactNode; onClick?: () => void; disabled?: boolean; type?: 'button' | 'submit' }) {
   return (
     <button type={type} onClick={onClick} disabled={disabled}
       className="w-full h-14 rounded-2xl bg-primary text-primary-foreground text-base font-bold hover:brightness-105 active:scale-[0.99] disabled:opacity-50 transition-all">
@@ -124,7 +127,7 @@ function PrimaryButton({ children, onClick, disabled, type = 'button' }: { child
 
 // A full-width action bar pinned to the bottom of the screen on phones (above
 // the bottom nav when it's showing), and inline at the end of the column on desktop.
-function StickyFooter({ children, aboveNav = false }: { children: ReactNode; aboveNav?: boolean }) {
+export function StickyFooter({ children, aboveNav = false }: { children: ReactNode; aboveNav?: boolean }) {
   return (
     <div className={`fixed inset-x-0 z-30 bg-card/95 backdrop-blur border-t border-border px-5 pt-3 ${aboveNav ? 'bottom-[var(--bottom-nav-h)] pb-3' : 'bottom-0 pb-[max(1.5rem,env(safe-area-inset-bottom))]'} xl:static xl:bg-transparent xl:border-0 xl:px-0 xl:pt-2 xl:pb-0 xl:backdrop-blur-none`}>
       <div className="max-w-md mx-auto space-y-2">{children}</div>
@@ -400,8 +403,9 @@ function Stepper({ value, min, max, onChange, label, hint }: {
 type SortKey = 'best' | 'soonest' | 'price' | 'verified'
 
 export function ResultsScreen({
-  search, userCoords, currentUserId, requestedTripIds, onBack, onOpenTrip, onNotify, showToast,
+  search, userCoords, currentUserId, requestedTripIds, onBack, onOpenTrip, onNotify, showToast, onOpenPreferences,
 }: {
+  onOpenPreferences?: () => void
   search: RideSearch
   userCoords: { lat: number; lng: number } | null
   currentUserId: string
@@ -465,6 +469,7 @@ export function ResultsScreen({
             {anyDate ? 'Any date' : dayLabel(search.date)}{search.time ? `, around ${fmtTime(search.time)}` : ''} · {search.seats} seat{search.seats === 1 ? '' : 's'}
           </span>
         </button>
+        {onOpenPreferences && <IconButton label="Ride preferences" onClick={onOpenPreferences}><SlidersHorizontal className="size-[18px]" /></IconButton>}
       </div>
 
       <div className="flex gap-2 overflow-x-auto -mx-4 px-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="radiogroup" aria-label="Sort rides">
@@ -514,6 +519,13 @@ export function ResultsScreen({
                         {requestedTripIds.has(t.id) ? 'Requested' : `${free} seat${free === 1 ? '' : 's'} left`}
                       </span>
                     </div>
+                    {(t.is_buddy || t.is_coworker || (t.shared_vibes?.length ?? 0) > 0) && (
+                      <div className="flex flex-wrap gap-1.5 -mt-1">
+                        {t.is_buddy && <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground inline-flex items-center gap-1"><Heart className="size-3" aria-hidden />Ridden together</span>}
+                        {t.is_coworker && <span className="text-[11px] font-bold px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground inline-flex items-center gap-1"><Briefcase className="size-3" aria-hidden />Coworker</span>}
+                        {t.shared_vibes?.map(v => <span key={v} className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-muted text-muted-foreground">{VIBE_LABELS[v]}</span>)}
+                      </div>
+                    )}
                   </button>
                 </li>
               )
@@ -654,8 +666,10 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 // ─── 4 · Trip day ─────────────────────────────────────────────────────────────
 
 export function TripDayScreen({
-  connection, currentUserId, monthSavings, onClose, onMessage, onStartDriving, onComplete, showToast,
+  connection, currentUserId, monthSavings, onClose, onMessage, onStartDriving, onComplete, showToast, onOpenSafety, onOpenReceipt,
 }: {
+  onOpenSafety?: (c: Connection) => void
+  onOpenReceipt?: (c: Connection) => void
   connection: Connection
   currentUserId: string
   // Gas saved on completed rides this month (shown on the arrival screen).
@@ -673,6 +687,8 @@ export function TripDayScreen({
   const [live, setLive] = useState<TripDayStatus | null>(null)
   const [checkedIn, setCheckedIn] = useState<string | null>(raw?.rider_at_pickup_at ?? null)
   const [safetyOpen, setSafetyOpen] = useState(false)
+  const [pinVerified, setPinVerified] = useState<string | null>(raw?.pin_verified_at ?? null)
+  const [pinDraft, setPinDraft] = useState('')
   const [rating, setRating] = useState<number | null>(raw?.my_rating ?? null)
   const [busy, setBusy] = useState(false)
   const accepted = connection.status === 'accepted'
@@ -727,23 +743,24 @@ export function TripDayScreen({
     finally { setBusy(false) }
   }
 
-  const rate = async (stars: number) => {
+  const rate = async (stars: number, tags: RatingTag[] = []) => {
     setRating(stars)
-    try { await api.rateConnection(connection.id, stars); showToast('Thanks for rating', 'success') }
+    try { await api.rateConnection(connection.id, stars, undefined, tags) }
     catch (e) { setRating(raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
   }
 
   const tile = 'min-h-16 rounded-[14px] bg-muted text-foreground text-xs font-semibold flex flex-col items-center justify-center gap-1.5 hover:brightness-95 dark:hover:brightness-125 disabled:opacity-40'
 
   if (connection.status === 'completed') {
-    return <TripDoneScreen connection={connection} rating={rating} onRate={rate} monthSavings={monthSavings} onDone={onClose} />
+    return <TripDoneScreen connection={connection} rating={rating} onRate={rate} monthSavings={monthSavings} onDone={onClose}
+      onOpenReceipt={onOpenReceipt ? () => onOpenReceipt(connection) : undefined} showToast={showToast} />
   }
 
   return (
     <div className="max-w-md mx-auto flex flex-col gap-[18px] pb-40 xl:pb-6">
       <div className="flex items-center justify-between">
         <IconButton label="Close" onClick={onClose}><X className="size-5" /></IconButton>
-        <button type="button" onClick={() => setSafetyOpen(true)}
+        <button type="button" onClick={() => (onOpenSafety ? onOpenSafety(connection) : setSafetyOpen(true))}
           className="min-h-11 px-3.5 rounded-xl bg-card border border-border text-destructive text-sm font-bold flex items-center gap-2">
           <ShieldCheck className="size-4" />Safety
         </button>
@@ -785,6 +802,35 @@ export function TripDayScreen({
           <div className="border-2 border-foreground rounded-lg px-2 py-1 text-[15px] font-extrabold tracking-[0.06em] shrink-0">{trip.vehicle.plate}</div>
         )}
       </div>
+
+      {accepted && connection.myRole === 'rider' && raw?.ride_pin && (
+        <div className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-3">
+          <span className="flex-1 text-[13px] text-muted-foreground">{pinVerified ? `${partnerFirst} confirmed your ride PIN` : `Tell ${partnerFirst} your ride PIN before you get in`}</span>
+          <span className="text-[22px] font-extrabold tracking-[0.2em] tabular-nums">{raw.ride_pin}</span>
+          {pinVerified && <Check aria-hidden className="size-5 text-primary" />}
+        </div>
+      )}
+      {accepted && connection.myRole === 'driver' && (
+        pinVerified ? (
+          <p className="text-[13px] font-semibold text-primary flex items-center gap-1.5"><Check className="size-4" aria-hidden />Ride PIN confirmed — it's {partnerFirst}</p>
+        ) : (
+          <form className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-2.5"
+            onSubmit={async e => {
+              e.preventDefault()
+              try { const c = await api.verifyRidePin(connection.id, pinDraft); setPinVerified(c.pin_verified_at ?? new Date().toISOString()); showToast('PIN confirmed', 'success') }
+              catch (err) { showToast(err instanceof Error ? err.message : 'Could not check PIN', 'error') }
+            }}>
+            <label htmlFor="ride-pin" className="flex-1 text-[13px] text-muted-foreground">Ask {partnerFirst} for their 4-digit ride PIN</label>
+            <input id="ride-pin" inputMode="numeric" autoComplete="one-time-code" maxLength={4} value={pinDraft}
+              onChange={e => setPinDraft(e.target.value.replace(/\D/g, ''))}
+              className="w-[72px] h-11 rounded-xl bg-input-background border border-border text-center text-lg font-extrabold tracking-[0.15em]" />
+            <button type="submit" disabled={pinDraft.length !== 4} className="h-11 px-3.5 rounded-xl bg-primary text-primary-foreground text-sm font-bold disabled:opacity-50">Check</button>
+          </form>
+        )
+      )}
+      {accepted && connection.myRole === 'rider' && raw?.settlement && (
+        <p className="text-[13px] text-muted-foreground">{partnerFirst} settles up via <span className="font-semibold text-foreground">{settlementLine(raw.settlement)}</span></p>
+      )}
 
       <div className="grid grid-cols-4 gap-2">
         {phone
@@ -867,13 +913,27 @@ export function StarRating({ value, onChange }: { value: number | null; onChange
 
 // ─── 5 · Arrived & rate ───────────────────────────────────────────────────────
 
-function TripDoneScreen({ connection, rating, onRate, monthSavings, onDone }: {
+function TripDoneScreen({ connection, rating, onRate, monthSavings, onDone, onOpenReceipt, showToast }: {
   connection: Connection
   rating: number | null
-  onRate: (stars: number) => void
+  onRate: (stars: number, tags: RatingTag[]) => void
   monthSavings?: { cents: number; trips: number }
   onDone: () => void
+  onOpenReceipt?: () => void
+  showToast: (msg: string, type: 'success' | 'error') => void
 }) {
+  const [tags, setTags] = useState<RatingTag[]>([])
+  const [again, setAgain] = useState(false)
+  const toggleTag = (t: RatingTag) => {
+    const next = tags.includes(t) ? tags.filter(x => x !== t) : [...tags, t]
+    setTags(next)
+    if (rating) onRate(rating, next)
+  }
+  const toggleAgain = async (on: boolean) => {
+    setAgain(on)
+    try { await (on ? api.addBuddy(connection.withUserId) : api.removeBuddy(connection.withUserId)) }
+    catch (e) { setAgain(!on); showToast(e instanceof Error ? e.message : 'Could not update', 'error') }
+  }
   const trip = connection.raw?.driver_trip
   const pricing = trip?.pricing
   const partnerFirst = connection.withUser.name.split(' ')[0]
@@ -917,11 +977,30 @@ function TripDoneScreen({ connection, rating, onRate, monthSavings, onDone }: {
       <section className="bg-card border border-border rounded-[20px] px-4 py-[18px] flex flex-col items-center gap-3">
         <Avatar initials={toInitials(connection.withUser.name)} photoUrl={connection.withUser.photoUrl} size="lg" />
         <p className="text-[17px] font-extrabold text-center">{rating ? 'Thanks for rating' : `How was riding with ${partnerFirst}?`}</p>
-        <StarRating value={rating} onChange={onRate} />
+        <StarRating value={rating} onChange={n => onRate(n, tags)} />
+        {rating != null && (
+          <div className="flex flex-wrap justify-center gap-2" role="group" aria-label="What went well?">
+            {(Object.keys(RATING_TAG_LABELS) as RatingTag[]).filter(t => isRider || t !== 'safe_driving').map(t => (
+              <button key={t} type="button" aria-pressed={tags.includes(t)} onClick={() => toggleTag(t)}
+                className={`min-h-9 px-3 rounded-full border text-[13px] font-semibold transition-colors ${tags.includes(t) ? 'border-primary bg-secondary text-secondary-foreground' : 'border-border bg-card text-foreground'}`}>
+                {RATING_TAG_LABELS[t]}
+              </button>
+            ))}
+          </div>
+        )}
       </section>
 
+      <label className="bg-card border border-border rounded-2xl px-3.5 py-3 flex items-center justify-between gap-3">
+        <span className="flex flex-col gap-0.5">
+          <span className="text-[15px] font-bold">Ride with {partnerFirst} again</span>
+          <span className="text-xs text-muted-foreground">Show {partnerFirst}{isRider ? '’s rides' : ''} first next time</span>
+        </span>
+        <input type="checkbox" checked={again} onChange={e => toggleAgain(e.target.checked)} className="size-6 accent-[var(--primary)]" />
+      </label>
+
       <StickyFooter>
-        <PrimaryButton onClick={onDone}>Done</PrimaryButton>
+        <PrimaryButton onClick={onDone}>{rating ? 'Done' : 'Skip for now'}</PrimaryButton>
+        {onOpenReceipt && <button type="button" onClick={onOpenReceipt} className="w-full min-h-11 text-sm font-bold flex items-center justify-center gap-2"><Receipt className="size-4" aria-hidden />View receipt</button>}
       </StickyFooter>
     </div>
   )

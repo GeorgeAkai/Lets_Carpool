@@ -45,6 +45,7 @@ const ME_RESPONSE = {
   id: "usr_abc",
   email: "ada@example.com",
   email_domain: "example.com",
+  onboarded_at: "2026-01-01T00:00:00Z",
   profile: { user_id: "usr_abc", display_name: "Ada Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
   vehicle: null,
 };
@@ -366,11 +367,9 @@ describe("Post listing view", () => {
     expect(screen.getByText(/requesting a ride/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /i need a ride/i })).toBeNull();
 
-    // Switch to Driver mode via the deliberate Profile confirm flow — no
-    // toggle exists anymore, so this is the only way to switch.
+    // Switch to Driver mode from the Driver mode switch on Profile.
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
-    await user.click(screen.getByRole("button", { name: /switch to driver mode/i }));
-    await user.click(screen.getByRole("button", { name: /confirm switch/i }));
+    await user.click(screen.getByRole("checkbox", { name: /driver mode/i }));
 
     await user.click(screen.getAllByRole("button", { name: /^discover$/i })[0]);
     await user.click(screen.getByRole("button", { name: /^post$/i }));
@@ -693,29 +692,29 @@ describe("Profile view", () => {
     // `hidden`/`xl:` classes aren't computed without real CSS) — either one
     // navigates the same place, so just take the first match.
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
-    await waitFor(() => screen.getByText("Ada Rider"));
+    await waitFor(() => expect(screen.getAllByText("Ada Rider").length).toBeGreaterThan(0));
   });
 
-  it("cancelling a mode switch leaves the mode unchanged", async () => {
+  it("shows ride stats and account settings above the profile form", async () => {
     const user = userEvent.setup();
     mockFetch({
       "GET /me": ME_RESPONSE,
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
+      "GET /me/impact": { shared_trips: 42, saved_cents: 31800, shared_km: 900, regular_buddies: 6, since: null },
+      "GET /me/settlement": { method: "venmo", handle: "@ada", updated_at: "x" },
+      "GET /me/emergency-contacts": [{ id: "emc_1", name: "Alex", relationship: null, phone: "+1 555 0100", share_mode: "every_trip", created_at: "x" }],
     });
 
     render(<MemoryRouter><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/find your ride/i));
-
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
-    await waitFor(() => screen.getByText(/browsing as a passenger/i));
 
-    await user.click(screen.getByRole("button", { name: /switch to driver mode/i }));
-    await user.click(screen.getByRole("button", { name: /^cancel$/i }));
-
-    // Still Passenger — cancelling never called onSetMode.
-    expect(screen.getByText(/browsing as a passenger/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /switch to driver mode/i })).toBeTruthy();
+    await waitFor(() => expect(screen.getAllByText("42").length).toBe(2));
+    expect(screen.getByText("$318")).toBeTruthy();
+    expect(screen.getByRole("checkbox", { name: /driver mode/i })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: /settle up.*venmo/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /safety & emergency.*1 contact/i })).toBeTruthy();
   });
 
   it("saves profile + vehicle with one Save Changes button", async () => {

@@ -390,12 +390,14 @@ export function updateProfile(
   interests?: string[],
   nationality?: string | null,
   phone?: string | null,
+  gender?: Gender | null,
 ): Promise<ApiProfile> {
   return request<ApiProfile>("PATCH", "/me/profile", {
     display_name: displayName, photo_url: photoUrl, bio,
     interests: interests ?? [], nationality: nationality ?? null,
-    // Left out entirely when not editing it, so the server keeps the stored number.
+    // Left out entirely when not editing them, so the server keeps the stored values.
     ...(phone !== undefined ? { phone } : {}),
+    ...(gender !== undefined ? { gender } : {}),
   });
 }
 
