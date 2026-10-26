@@ -3060,6 +3060,18 @@ const PATH_VIEWS: Record<string, View> = {
   '/preferences': 'preferences', '/safety': 'safety', '/receipt': 'receipt',
 }
 
+// "Get started" is also remembered per user on this device, so a failed or
+// missing /me/onboarding/complete can't bring the Welcome screen back.
+const ONBOARDED_KEY = 'carpool_onboarded:'
+
+function onboardedOnDevice(userId: string): boolean {
+  try { return localStorage.getItem(ONBOARDED_KEY + userId) === '1' } catch { return false }
+}
+
+function rememberOnboarded(userId: string): void {
+  try { localStorage.setItem(ONBOARDED_KEY + userId, '1') } catch { /* private mode: server flag still applies */ }
+}
+
 export function Home() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -3633,38 +3645,60 @@ export function Home() {
     )
   }
 
+  // One AuthSync, always first child of a fragment, so it stays mounted while
+  // the screen moves from Loading → Welcome → ride/drive choice → the app.
+  // A remount would re-run the session sync and reload the user from /me
+  // mid-flow (which sent people back to the Welcome screen).
+  const authSync = <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+
   // Show loading while session is resolving
   if (authLoading) {
     return (
-      <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
-        <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
-      </div>
+      <>
+        {authSync}
+        <div className="min-h-screen bg-background text-foreground flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
+      </>
     )
   }
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <>{authSync}</>
+  }
+
+  // First run only: the server reports onboarded_at = null. An older API that
+  // doesn't send the field (undefined) never shows it, and finishing it is
+  // also remembered on this device in case the server call fails.
+  if (currentUser.onboarded_at === null && !onboardedOnDevice(currentUser.id)) {
+    return (
+      <>
+        {authSync}
+        <WelcomeScreen onStart={async () => {
+          rememberOnboarded(currentUser.id)
+          let at = new Date().toISOString()
+          try { at = (await api.completeOnboarding()).onboarded_at ?? at } catch { /* remembered on this device */ }
+          setCurrentUser(prev => prev ? { ...prev, onboarded_at: at } : prev)
+        }} />
+      </>
+    )
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
   // Goes through handleSetMode so the existing "Driver with no vehicle on
   // file routes to Profile" behavior applies to this first choice too.
-  if (!currentUser.onboarded_at) {
-    return <WelcomeScreen onStart={async () => {
-      try { const u = await api.completeOnboarding(); setCurrentUser(prev => prev ? { ...prev, onboarded_at: u.onboarded_at } : prev) }
-      catch { setCurrentUser(prev => prev ? { ...prev, onboarded_at: new Date().toISOString() } : prev) }
-    }} />
-  }
-
   if (modeGateOpen) {
-    return <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+    return (
+      <>
+        {authSync}
+        <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+      </>
+    )
   }
 
   return (
+    <>
+    {authSync}
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
-      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
       {pendingReview && (
@@ -3910,5 +3944,6 @@ export function Home() {
 
       {!immersive || guardedView === 'map' ? <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} /> : null}
     </div>
+    </>
   )
 }

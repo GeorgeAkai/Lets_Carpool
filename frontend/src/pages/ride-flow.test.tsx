@@ -373,6 +373,35 @@ describe("Account screens", () => {
     expect(calls.some(c => c.key === "POST /me/onboarding/complete")).toBe(true);
   });
 
+  it("doesn't loop back to the welcome screen when the server can't record onboarding", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const calls = stubApi({ ...BASE_ROUTES, "GET /me": { ...ME, onboarded_at: null } }); // no /me/onboarding/complete → 404
+
+    const { unmount } = render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /get started/i }));
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    // The session sync stayed mounted: /me was not re-fetched mid-flow.
+    expect(calls.filter(c => c.key === "GET /me").length).toBe(1);
+    await new Promise(r => setTimeout(r, 50));
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+
+    // A reload on this device doesn't bring it back either.
+    unmount();
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+  });
+
+  it("skips the welcome screen for an API that doesn't report onboarding", async () => {
+    signIn("rider");
+    const { onboarded_at: _omit, ...legacyMe } = ME;
+    stubApi({ ...BASE_ROUTES, "GET /me": legacyMe });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+  });
+
   it("saves ride preferences from Results and searches again", async () => {
     const user = userEvent.setup();
     signIn("rider");
