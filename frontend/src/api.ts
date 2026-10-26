@@ -317,13 +317,13 @@ function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): W
 // equivalent. A hosted realtime service (Ably/Pusher) can replace this later
 // behind the same `createRealtime` interface.
 
-// Each poll re-reads every connection, so keep it modest: chat and status
-// changes arrive within ~20s, which is fine outside localhost (where the
-// WebSocket gives instant updates).
-export const POLL_INTERVAL_MS = 20000;
+// Polls read the one-query status feed (GET /me/connections/status), not the
+// full connection list, so they're cheap; the full list is refetched by the
+// app only when a status actually changes.
+export const POLL_INTERVAL_MS = 10000;
 // While a request is waiting on an answer, poll faster so accept/decline
-// shows up within seconds instead of up to POLL_INTERVAL_MS.
-export const PENDING_POLL_INTERVAL_MS = 5000;
+// shows up within a few seconds.
+export const PENDING_POLL_INTERVAL_MS = 3000;
 
 export type RealtimeStrategy = "websocket" | "polling";
 
@@ -348,7 +348,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
     if (stopped || running || document.hidden) return;
     running = true;
     try {
-      const [connections, notifications] = await Promise.all([getMyConnections(), getNotifications()]);
+      const [connections, notifications] = await Promise.all([getConnectionStatuses(), getNotifications()]);
       if (stopped) return;
 
       const events: WsMessage[] = [];
@@ -384,6 +384,13 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
   return {
     close: () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); },
   };
+}
+
+export type ConnectionStatusRow = { id: string; status: string; updated_at: string };
+
+// One cheap query: what changed, not the full ride details.
+export function getConnectionStatuses(): Promise<ConnectionStatusRow[]> {
+  return request("GET", "/me/connections/status");
 }
 
 export function createRealtime(userId: string, onMessage: (msg: WsMessage) => void): { close: () => void } {

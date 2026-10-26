@@ -244,3 +244,15 @@ def test_pickup_then_completion_settles_the_automatic_fare() -> None:
     # Both sides can rate each other.
     assert api.post(f"/connections/{conn['id']}/rating", headers=rider_headers, json={"stars": 5}).status_code == 200
     assert api.post(f"/connections/{conn['id']}/rating", headers=driver_headers, json={"stars": 4}).status_code == 200
+
+
+def test_connection_statuses_is_a_light_change_feed() -> None:
+    api = client()
+    rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+    _, outsider_headers = auth(api, "outsider@example.com", "Out Sider")
+
+    for headers in (rider_headers, driver_headers):
+        rows = api.get("/me/connections/status", headers=headers).json()
+        assert [(r["id"], r["status"]) for r in rows] == [(conn["id"], "accepted")]
+        assert set(rows[0]) == {"id", "status", "updated_at"}
+    assert api.get("/me/connections/status", headers=outsider_headers).json() == []

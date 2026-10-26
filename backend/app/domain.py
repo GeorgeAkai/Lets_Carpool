@@ -1532,6 +1532,22 @@ class Store:
             )
             return [_row_to_connection(r) for r in cur.fetchall()]
 
+    def connection_statuses(self, user_id: str) -> list[dict[str, Any]]:
+        """Just id / status / updated_at for every ride the user is part of: one
+        query, for clients polling for changes. They fetch the full (expensive)
+        connection list only when something here changes."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT c.id, c.status, c.updated_at FROM connections c
+                   JOIN ride_requests rr ON rr.id = c.ride_request_id
+                   JOIN driver_trips dt ON dt.id = c.driver_trip_id
+                   WHERE rr.rider_id = %s OR dt.driver_id = %s
+                   ORDER BY c.updated_at DESC""",
+                (user_id, user_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def transition_connection(self, user_id: str, connection_id: str, action: str) -> Connection:
         connection = self.get_connection(connection_id)
         rr = self.get_ride_request(connection.ride_request_id)

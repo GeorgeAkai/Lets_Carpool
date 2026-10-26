@@ -636,6 +636,10 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         app.state.store.expire_connections(today)
         return {"status": "ok", "expired_as_of": today.isoformat()}
 
+    @app.get("/me/connections/status")
+    def my_connection_statuses(user: CurrentUser) -> list[dict[str, Any]]:
+        return serialize(app.state.store.connection_statuses(user.id))
+
     @app.get("/me/connections")
     def my_connections(user: CurrentUser) -> list[dict[str, Any]]:
         connections = app.state.store.get_user_connections(user.id)
