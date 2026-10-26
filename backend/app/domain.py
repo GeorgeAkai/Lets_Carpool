@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from time import monotonic
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -430,6 +431,23 @@ def _proposal_score(detour_minutes: float | None, trip: DriverTrip, rr: RideRequ
     return 0.7 * detour + 0.3 * (0.6 * date_score + 0.4 * flex_score)
 
 
+# Every driver_trips column except route_geog. The stored route is only used
+# inside SQL (corridor search); selecting it would ship the whole OSRM line
+# (tens of KB per trip) to the app on every read, which is most of our
+# database egress.
+_TRIP_COLUMNS = (
+    "id", "driver_id", "pickup_location_id", "destination_location_id", "target_date",
+    "flexibility", "seats_available", "seats_reserved", "tags", "status", "created_at",
+    "luggage_capacity", "car_type", "notes", "route_distance_m", "route_duration_s",
+    "departure_time", "price_per_seat_cents", "auto_accept_verified", "series_id", "vibes",
+)
+
+
+def _trip_columns(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return ", ".join(prefix + c for c in _TRIP_COLUMNS)
+
+
 def _row_to_driver_trip(r: dict) -> DriverTrip:
     return DriverTrip(
         id=r["id"], driver_id=r["driver_id"],
@@ -531,6 +549,11 @@ class Store:
         # leaks the old pool's connections instead of releasing them.
         close_pool()
         init_pool(database_url)
+        # user_id -> (expires_at, stats). Stats ride along on every listing and
+        # profile in every response, so recomputing them per row per poll was
+        # a large share of database round trips. Per process and short-lived,
+        # so other instances catch up within the TTL.
+        self._stats_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def _cur(self, conn):
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -940,7 +963,7 @@ class Store:
     def cancel_driver_trip(self, user_id: str, trip_id: str) -> DriverTrip:
         with get_conn() as conn:
             cur = self._cur(conn)
-            cur.execute("SELECT * FROM driver_trips WHERE id = %s", (trip_id,))
+            cur.execute(f"SELECT {_trip_columns()} FROM driver_trips WHERE id = %s", (trip_id,))
             row = cur.fetchone()
             if not row:
                 raise DomainError("Driver trip not found", 404)
@@ -954,7 +977,7 @@ class Store:
     def get_driver_trip(self, trip_id: str) -> DriverTrip:
         with get_conn() as conn:
             cur = self._cur(conn)
-            cur.execute("SELECT * FROM driver_trips WHERE id = %s", (trip_id,))
+            cur.execute(f"SELECT {_trip_columns()} FROM driver_trips WHERE id = %s", (trip_id,))
             row = cur.fetchone()
             if not row:
                 raise DomainError("Driver trip not found", 404)
@@ -964,7 +987,7 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                "SELECT * FROM driver_trips WHERE driver_id = %s ORDER BY created_at DESC",
+                f"SELECT {_trip_columns()} FROM driver_trips WHERE driver_id = %s ORDER BY created_at DESC",
                 (user_id,),
             )
             return [_row_to_driver_trip(r) for r in cur.fetchall()]
@@ -1024,7 +1047,7 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                f"""SELECT DISTINCT dt.*,
+                f"""SELECT DISTINCT {_trip_columns('dt')},
                           tp.latitude AS trip_pickup_lat, tp.longitude AS trip_pickup_lng,
                           td.latitude AS trip_dest_lat, td.longitude AS trip_dest_lng
                    FROM driver_trips dt
@@ -1498,6 +1521,7 @@ class Store:
             raise DomainError(f"Unsupported connection action: {action}")
 
         connection.updated_at = now_utc()
+        self._invalidate_stats(rr.rider_id, trip.driver_id)
         return connection
 
     def expire_connections(self, today: date) -> None:
@@ -1948,6 +1972,7 @@ class Store:
                        created_at = EXCLUDED.created_at""",
                 rating,
             )
+        self._invalidate_stats(ratee)
         return rating
 
     def my_rating_for(self, user_id: str, connection_id: str) -> int | None:
@@ -1958,9 +1983,23 @@ class Store:
             row = cur.fetchone()
             return row["stars"] if row else None
 
+    STATS_TTL_SECONDS = 60
+
     def user_stats(self, user_id: str) -> dict[str, Any]:
         """Public trust signals: average stars, number of ratings, completed rides
         (as driver or rider) and the admin-set ID check."""
+        cached = self._stats_cache.get(user_id)
+        if cached and cached[0] > monotonic():
+            return dict(cached[1])
+        stats = self._compute_user_stats(user_id)
+        self._stats_cache[user_id] = (monotonic() + self.STATS_TTL_SECONDS, stats)
+        return dict(stats)
+
+    def _invalidate_stats(self, *user_ids: str) -> None:
+        for u in user_ids:
+            self._stats_cache.pop(u, None)
+
+    def _compute_user_stats(self, user_id: str) -> dict[str, Any]:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
@@ -2006,7 +2045,8 @@ class Store:
             row = cur.fetchone()
             if not row:
                 raise DomainError("User not found", 404)
-            return _row_to_user(row)
+        self._invalidate_stats(target_user_id)
+        return _row_to_user(row)
 
     # ─── Saved routes ("Your routes") ─────────────────────────────────────────
 
@@ -2688,7 +2728,7 @@ class Store:
             cur.execute("UPDATE driver_trips SET status = 'cancelled' WHERE id = %s", (trip_id,))
             if cur.rowcount == 0:
                 raise DomainError("Driver trip not found", 404)
-            cur.execute("SELECT * FROM driver_trips WHERE id = %s", (trip_id,))
+            cur.execute(f"SELECT {_trip_columns()} FROM driver_trips WHERE id = %s", (trip_id,))
             return _row_to_driver_trip(cur.fetchone())
 
     def popular_destinations(self, limit: int = 10) -> list[dict[str, Any]]:

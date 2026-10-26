@@ -300,7 +300,10 @@ function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): W
 // equivalent. A hosted realtime service (Ably/Pusher) can replace this later
 // behind the same `createRealtime` interface.
 
-export const POLL_INTERVAL_MS = 8000;
+// Each poll re-reads every connection, so keep it modest: chat and status
+// changes arrive within ~20s, which is fine outside localhost (where the
+// WebSocket gives instant updates).
+export const POLL_INTERVAL_MS = 20000;
 
 export type RealtimeStrategy = "websocket" | "polling";
 

@@ -2934,6 +2934,8 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 
 // Each app view has its own URL so tabs are linkable, survive a refresh and
 // work with the browser's back button.
+const FEED_REFRESH_MS = 120_000
+
 const VIEW_PATHS: Record<View, string> = {
   home: '/discover', feed: '/discover', admin: '/admin',
   results: '/rides', ride: '/rides/detail', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
@@ -3217,14 +3219,17 @@ export function Home() {
   }, [corridorQuery])
 
   // Another user's new post has no way to push into an already-open Discover
-  // tab — refetch whenever Discover becomes the active view (not just once on
-  // mount), and keep polling while it stays active so a listing posted while
-  // you're already browsing shows up without a manual reload.
+  // tab — refetch whenever Discover becomes the active view or the tab comes
+  // back to the foreground, plus a slow refresh while it's on screen. Never
+  // while hidden: a backgrounded tab polling every few seconds was most of
+  // our database egress.
   useEffect(() => {
     if (!currentUser || view !== 'feed') return
     loadListings()
-    const id = setInterval(loadListings, 20000)
-    return () => clearInterval(id)
+    const id = setInterval(() => { if (!document.hidden) loadListings() }, FEED_REFRESH_MS)
+    const onVisible = () => { if (!document.hidden) loadListings() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']

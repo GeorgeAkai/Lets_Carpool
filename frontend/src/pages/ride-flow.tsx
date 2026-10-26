@@ -700,7 +700,9 @@ export function TripDayScreen({
     if (!accepted) return
     const load = () => api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at) }).catch(() => {})
     load()
-    pollRef.current = setInterval(load, 15000)
+    // Live position only matters on the day of the ride, and only on screen.
+    if (connection.date !== todayLocalISO()) return
+    pollRef.current = setInterval(() => { if (!document.hidden) load() }, 15000)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [connection.id, accepted])
 

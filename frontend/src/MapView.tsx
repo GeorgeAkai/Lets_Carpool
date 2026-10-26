@@ -447,7 +447,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   useEffect(() => {
     fetchDrivers()
-    const id = setInterval(fetchDrivers, 10000)
+    const id = setInterval(() => { if (!document.hidden) fetchDrivers() }, 10000)
     return () => clearInterval(id)
   }, [fetchDrivers])
 
