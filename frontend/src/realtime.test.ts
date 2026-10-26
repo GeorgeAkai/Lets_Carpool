@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BASE, POLL_INTERVAL_MS, createRealtime, type WsMessage } from "./api";
+import { BASE, PENDING_POLL_INTERVAL_MS, POLL_INTERVAL_MS, createRealtime, type WsMessage } from "./api";
 
 // Under jsdom BASE is not localhost in these tests only if VITE_API_BASE_URL says
 // so; force the polling strategy explicitly so the test is environment-independent.
@@ -15,7 +15,7 @@ beforeEach(() => {
   state = { connections: [conn("c1", "pending")], notifications: [], messages: [] };
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     const path = String(url).replace(BASE, "");
-    const body = path === "/me/connections" ? state.connections : path === "/notifications" ? state.notifications : state.messages;
+    const body = path === "/me/connections/status" ? state.connections : path === "/notifications" ? state.notifications : state.messages;
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   }));
 });
@@ -38,6 +38,10 @@ describe("polling real-time fallback", () => {
     state.connections = [conn("c1", "accepted")];
     await tick();
     expect(events).toEqual([{ type: "connection_update", connection_id: "c1", status: "accepted" }]);
+    // Polls only read the light status feed, never the full connection list.
+    const urls = (fetch as ReturnType<typeof vi.fn>).mock.calls.map(([u]) => String(u).replace(BASE, ""));
+    expect(urls).toContain("/me/connections/status");
+    expect(urls).not.toContain("/me/connections");
     rt.close();
   });
 
@@ -64,5 +68,22 @@ describe("polling real-time fallback", () => {
     state.connections = [conn("c1", "accepted")];
     await tick();
     expect(events).toEqual([]);
+  });
+});
+
+describe("adaptive polling", () => {
+  it("polls faster while a connection is pending, slower once settled", async () => {
+    const calls = () => (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([u]) => String(u).endsWith("/me/connections/status")).length;
+    const stop = createRealtime("u", () => {}).close;
+    await vi.advanceTimersByTimeAsync(0);
+    const start = calls();
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS * 2 + 10);
+    expect(calls() - start).toBeGreaterThanOrEqual(2);
+    state.connections = [conn("c1", "accepted")];
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS + 10);
+    const settled = calls();
+    await vi.advanceTimersByTimeAsync(PENDING_POLL_INTERVAL_MS * 2);
+    expect(calls()).toBe(settled);
+    stop();
   });
 });

@@ -21,7 +21,7 @@ export function HomePage() {
   return (
     <PageLayout
       title="Carpool MVP"
-      description="A small two-sided marketplace for riders and drivers with the MVP flows described in the implementation guide."
+      description="A small two-sided marketplace for passengers and drivers with the MVP flows described in the implementation guide."
     >
       <Text style={{ marginBottom: 10 }}>
         This app contains pages for the MVP issues: sign in, profile, locations, ride requests, driver trips, search, connections,
@@ -76,7 +76,7 @@ export function ProfilePage() {
       <Text>- Display name, profile photo, and short bio can be edited.</Text>
       <Text>- Vehicle details can be added or updated.</Text>
       <Text>- Self-declared license, insurance, and driving record fields are stored.</Text>
-      <Text style={{ marginTop: 16, fontWeight: "700" }}>Driver readiness helps riders know which drivers are eligible to offer rides.</Text>
+      <Text style={{ marginTop: 16, fontWeight: "700" }}>Driver readiness helps passengers know which drivers are eligible to offer rides.</Text>
     </PageLayout>
   );
 }
@@ -99,10 +99,10 @@ export function LocationPage() {
 export function RideRequestPage() {
   return (
     <PageLayout
-      title="Publish Rider Request"
+      title="Publish Passenger Request"
       description="Create and manage one-off ride requests with pickup/destination, timing, passenger count, and tags."
     >
-      <Text>- Riders can create a ride request with pickup and destination locations.</Text>
+      <Text>- Passengers can create a ride request with pickup and destination locations.</Text>
       <Text>- Target date, flexibility, passenger count, and tags are captured.</Text>
       <Text>- Supported tags include airport and student.</Text>
       <Text>- Requests are created with open status and can be cancelled or expired.
@@ -131,7 +131,7 @@ export function SearchPage() {
       title="Search Opposite Listings"
       description="Search opposite-side listings with destination radius, pickup proximity, date flexibility, and tags."
     >
-      <Text>- Riders discover open driver trips.</Text>
+      <Text>- Passengers discover open driver trips.</Text>
       <Text>- Drivers discover open ride requests.</Text>
       <Text>- Search supports destination radius, pickup proximity, date/flexibility, and airport/student tags.</Text>
       <Text>- Expired, cancelled, completed, or inactive listings are excluded.</Text>
@@ -145,7 +145,7 @@ export function ConnectionsPage() {
       title="Connections"
       description="Create and manage manual connections between ride requests and driver trips."
     >
-      <Text>- Riders can request a seat on a driver trip.</Text>
+      <Text>- Passengers can request a seat on a driver trip.</Text>
       <Text>- Drivers can offer a ride on a ride request.</Text>
       <Text>- Connection states include pending, expired, accepted, declined, cancelled, and completed.</Text>
       <Text>- Recipients can accept or decline pending connections.</Text>

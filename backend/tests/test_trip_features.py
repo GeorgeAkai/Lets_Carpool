@@ -21,12 +21,12 @@ def _post_trip(api, headers, **extra):
 
 
 def _connect_and_accept(api):
-    rider, rider_headers, driver, driver_headers, rr, trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, rr, trip = make_request_and_trip(api)
     conn = api.post("/connections", headers=rider_headers,
                     json={"ride_request_id": rr["id"], "driver_trip_id": trip["id"]}).json()
     accepted = api.post(f"/connections/{conn['id']}/transition", headers=driver_headers, json={"action": "accept"})
     assert accepted.status_code == 200
-    return rider, rider_headers, driver, driver_headers, conn
+    return passenger, rider_headers, driver, driver_headers, conn
 
 
 def test_trip_carries_departure_time_arrival_and_price() -> None:
@@ -75,7 +75,7 @@ def test_repeat_on_weekdays_posts_one_trip_per_day() -> None:
 
 def test_plate_and_phone_unlock_only_after_acceptance() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, rr, trip = make_request_and_trip(api)
+    passenger, rider_headers, driver, driver_headers, rr, trip = make_request_and_trip(api)
     api.put("/me/driver-readiness", headers=driver_headers, json={"make": "Honda", "model": "Civic", "plate": "8kxr 214"})
     api.patch("/me/profile", headers=driver_headers, json={"display_name": "Dee Driver", "phone": "+1 555 123 4567"})
 
@@ -100,7 +100,7 @@ def test_plate_and_phone_unlock_only_after_acceptance() -> None:
 
 def test_ratings_feed_public_trust_stats() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+    passenger, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
 
     early = api.post(f"/connections/{conn['id']}/rating", headers=rider_headers, json={"stars": 5})
     assert early.status_code == 400  # not completed yet
@@ -120,7 +120,7 @@ def test_ratings_feed_public_trust_stats() -> None:
 def test_admin_id_verification_enables_auto_accept() -> None:
     api = client()
     _, admin_headers = auth(api, ADMIN_EMAIL, "Admin")
-    rider, rider_headers = auth(api, "rider@example.edu", "Riley Rider")
+    passenger, rider_headers = auth(api, "passenger@example.edu", "Riley Passenger")
     _, driver_headers = auth(api, "driver@example.com", "Dee Driver")
     trip = _post_trip(api, driver_headers, auto_accept_verified=True)
     pickup = location(api, rider_headers, "Pickup", 37.87, -122.27)
@@ -135,17 +135,17 @@ def test_admin_id_verification_enables_auto_accept() -> None:
                           json={"ride_request_id": request()["id"], "driver_trip_id": trip["id"]}).json()
     assert unverified["status"] == "pending"
 
-    assert api.post(f"/admin/users/{rider['id']}/verify-id", headers=admin_headers).json()["id_verified"] is True
+    assert api.post(f"/admin/users/{passenger['id']}/verify-id", headers=admin_headers).json()["id_verified"] is True
     verified = api.post("/connections", headers=rider_headers,
                         json={"ride_request_id": request()["id"], "driver_trip_id": trip["id"]}).json()
     assert verified["status"] == "accepted"
 
-    assert api.post(f"/admin/users/{rider['id']}/verify-id", headers=rider_headers).status_code == 403
+    assert api.post(f"/admin/users/{passenger['id']}/verify-id", headers=rider_headers).status_code == 403
 
 
 def test_saved_routes_crud() -> None:
     api = client()
-    _, headers = auth(api, "rider@example.edu", "Riley Rider")
+    _, headers = auth(api, "passenger@example.edu", "Riley Passenger")
     home = location(api, headers, "Home", 37.87, -122.27)
     work = location(api, headers, "Work", 37.79, -122.40)
 
@@ -162,7 +162,7 @@ def test_saved_routes_crud() -> None:
 
 def test_ride_alert_notifies_once_when_a_matching_trip_is_posted() -> None:
     api = client()
-    _, rider_headers = auth(api, "rider@example.edu", "Riley Rider")
+    _, rider_headers = auth(api, "passenger@example.edu", "Riley Passenger")
     _, driver_headers = auth(api, "driver@example.com", "Dee Driver")
     near_sfo = location(api, rider_headers, "Near SFO", 37.6250, -122.3800)
     api.post("/ride-alerts", headers=rider_headers,
@@ -177,7 +177,7 @@ def test_ride_alert_notifies_once_when_a_matching_trip_is_posted() -> None:
 
 def test_trip_day_live_status_and_pickup_check_in() -> None:
     api = client()
-    rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+    passenger, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
 
     before = api.get(f"/connections/{conn['id']}/live", headers=rider_headers).json()
     assert before["driver"] is None
@@ -194,3 +194,65 @@ def test_trip_day_live_status_and_pickup_check_in() -> None:
 
     _, stranger_headers = auth(api, "stranger@example.com", "Stranger")
     assert api.get(f"/connections/{conn['id']}/live", headers=stranger_headers).status_code == 403
+
+
+def test_driver_can_pause_resume_and_edit_a_trip() -> None:
+    api = client()
+    _, headers = auth(api, "driver@example.com", "Dee Driver")
+    _, rider_headers = auth(api, "passenger@example.com", "Rae Passenger")
+    trip = _post_trip(api, headers)
+
+    paused = api.post(f"/driver-trips/{trip['id']}/pause", headers=headers)
+    assert paused.json()["status"] == "paused"
+    assert api.post(f"/driver-trips/{trip['id']}/pause", headers=headers).status_code == 400
+    assert api.post(f"/driver-trips/{trip['id']}/pause", headers=rider_headers).status_code == 403
+    found = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert trip["id"] not in {t["id"] for t in found}
+
+    resumed = api.post(f"/driver-trips/{trip['id']}/resume", headers=headers).json()
+    assert resumed["status"] == "open"
+    found = api.get("/driver-trips/search", headers=rider_headers).json()
+    assert trip["id"] in {t["id"] for t in found}
+
+    edited = api.patch(f"/driver-trips/{trip['id']}", headers=headers,
+                       json={"seats_available": 2, "notes": "Leaving a bit early", "departure_time": "07:30"})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["seats_available"] == 2
+    assert edited.json()["notes"] == "Leaving a bit early"
+    assert api.patch(f"/driver-trips/{trip['id']}", headers=rider_headers, json={"seats_available": 1}).status_code == 403
+
+
+def test_pickup_then_completion_settles_the_automatic_fare() -> None:
+    api = client()
+    passenger, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+
+    assert api.post(f"/connections/{conn['id']}/picked-up", headers=rider_headers).status_code == 403
+    live = api.get(f"/connections/{conn['id']}/live", headers=rider_headers).json()
+    assert live["picked_up_at"] is None and live["destination"]["label"]
+
+    picked = api.post(f"/connections/{conn['id']}/picked-up", headers=driver_headers).json()
+    assert picked["picked_up_at"] is not None
+    assert picked["fare"]["status"] == "estimated" and picked["fare"]["amount_cents"] >= 100
+
+    done = api.post(f"/connections/{conn['id']}/transition", headers=driver_headers, json={"action": "complete"}).json()
+    assert done["fare"]["status"] == "paid"
+    assert done["fare"]["amount_cents"] == picked["fare"]["amount_cents"]
+    rider_types = {n["type"] for n in api.get("/notifications", headers=rider_headers).json()}
+    driver_types = {n["type"] for n in api.get("/notifications", headers=driver_headers).json()}
+    assert "payment_processed" in rider_types and "payment_processed" in driver_types
+
+    # Both sides can rate each other.
+    assert api.post(f"/connections/{conn['id']}/rating", headers=rider_headers, json={"stars": 5}).status_code == 200
+    assert api.post(f"/connections/{conn['id']}/rating", headers=driver_headers, json={"stars": 4}).status_code == 200
+
+
+def test_connection_statuses_is_a_light_change_feed() -> None:
+    api = client()
+    rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+    _, outsider_headers = auth(api, "outsider@example.com", "Out Sider")
+
+    for headers in (rider_headers, driver_headers):
+        rows = api.get("/me/connections/status", headers=headers).json()
+        assert [(r["id"], r["status"]) for r in rows] == [(conn["id"], "accepted")]
+        assert set(rows[0]) == {"id", "status", "updated_at"}
+    assert api.get("/me/connections/status", headers=outsider_headers).json() == []

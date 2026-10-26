@@ -14,9 +14,9 @@ Living document from product/design grill sessions. Use this in team meetings to
 
 | # | Topic | Decision | Notes |
 |---|--------|----------|--------|
-| 1 | Primary listing model | **Two-sided** | Riders publish **ride requests**; drivers publish **trips**. Both are first-class in MVP. |
+| 1 | Primary listing model | **Two-sided** | Passengers publish **ride requests**; drivers publish **trips**. Both are first-class in MVP. |
 | 2 | Departure time | **Date + flexibility** | e.g. “Friday, flexible”, “ASAP today”. Finer scheduling via **in-app chat**, not rigid datetime in the listing. |
-| 3 | How connections are created | **A — Symmetric, manual** | Rider can request to join a driver trip *or* driver can offer on a rider request; other party accepts/declines. **May revisit** after team discussion (suggestions-only, one-way browse, etc.). |
+| 3 | How connections are created | **A — Symmetric, manual** | Passenger can request to join a driver trip *or* driver can offer on a passenger request; other party accepts/declines. **May revisit** after team discussion (suggestions-only, one-way browse, etc.). |
 | 4 | When is chat available? | **C — Hybrid** | Canned/quick messages while connection is **pending**; full chat after **accept**. |
 | 5 | One account, two roles? | **A — Single account** | Same user can post ride requests or trips (e.g. driver may prefer to ride instead of driving their own car). |
 | 6 | “Same destination” matching | **A — Tight endpoint match** | Destinations must be within a small radius (e.g. 500 m–1 km); pickup proximity is evaluated separately. Corridor matching can follow later. |
@@ -70,7 +70,7 @@ Living document from product/design grill sessions. Use this in team meetings to
 |------|--------|
 | 2026-05-24 | Initial agenda from grill session (Q1–Q3 resolved; Q4–Q13 open). |
 | 2026-05-24 | Q4 resolved: hybrid chat (pending templates + full chat after accept). |
-| 2026-05-24 | Q5 resolved: single account for rider + driver roles. |
+| 2026-05-24 | Q5 resolved: single account for passenger + driver roles. |
 | 2026-05-24 | Q6 resolved: tight endpoint destination matching for MVP. |
 | 2026-05-24 | Q7 resolved: geocoded exact addresses or places for pickup/dropoff. |
 | 2026-05-24 | Q8 resolved: in-app gas split agreement with offline payment. |

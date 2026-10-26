@@ -21,8 +21,9 @@ function useMobileViewport() {
 const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; })();
 
 const ME = {
+  onboarded_at: "2026-01-01T00:00:00Z",
   id: "usr_me", email: "sam@example.com", email_domain: "example.com", status: "active",
-  profile: { user_id: "usr_me", display_name: "Sam Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+  profile: { user_id: "usr_me", display_name: "Sam Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
   vehicle: { user_id: "usr_me", make: "Honda", model: "Fit", color: "Red", seats: 5, car_type: "sedan", has_license: true, has_insurance: true, has_good_driving_record: true },
 };
 
@@ -52,7 +53,9 @@ function stubApi(routes: Record<string, unknown | Handler>) {
     if (raw.startsWith("https://nominatim.openstreetmap.org")) {
       if (raw.includes("/reverse")) return { ok: true, json: async () => ({ display_name: "Elm St, Chico, California", address: { road: "Elm St", city: "Chico", state: "California" } }) };
       const q = new URL(raw).searchParams.get("q") ?? "";
-      return { ok: true, json: async () => [{ place_id: 9, name: q, display_name: `${q}, California, United States`, lat: "38.58", lon: "-121.49", address: { city: q, state: "California" } }] };
+      return { ok: true, json: async () => [{ place_id: 9, name: q, display_name: `${q}, California, United States`, lat: "38.58", lon: "-121.49",
+        // "Area …" queries geocode to a whole city (no house number); anything else to a street address.
+        address: q.startsWith("Area") ? { city: q, state: "California" } : { house_number: "100", road: q, city: q, state: "California" } }] };
     }
     const method = (init?.method ?? "GET").toUpperCase();
     const path = raw.replace(BASE, "").split("?")[0];
@@ -88,9 +91,29 @@ async function pickDestination(user: ReturnType<typeof userEvent.setup>, text: s
   fireEvent.mouseDown(within(option).getByRole("button"));
 }
 
-describe("Rider flow: Home → Results → Ride details", () => {
+describe("Passenger flow: Home → Results → Ride details", () => {
   useMobileViewport();
-  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
+  beforeEach(() => {
+    // A real pickup point is required to open a ride request.
+    Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+      getCurrentPosition: (ok: (p: unknown) => void) => ok({ coords: { latitude: 39.7, longitude: -121.8 } }),
+    } });
+  });
+  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); Reflect.deleteProperty(navigator, "geolocation"); });
+
+  it("asks passengers for a street address instead of accepting a whole city", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    stubApi({ ...BASE_ROUTES });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await user.type(await screen.findByPlaceholderText(/search a destination/i), "Area Sacramento");
+    const option = await screen.findByRole("option", { name: /area sacramento/i });
+    fireEvent.mouseDown(within(option).getByRole("button"));
+
+    expect((await screen.findByRole("alert")).textContent).toMatch(/full street address/i);
+    expect(screen.getByRole("button", { name: /find me a ride/i })).toBeDisabled();
+  });
 
   it("finds rides, sorts them, and requests a seat with the real destination", async () => {
     const user = userEvent.setup();
@@ -107,22 +130,23 @@ describe("Rider flow: Home → Results → Ride details", () => {
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
 
     await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.getByRole("radio", { name: /find a ride/i })).toHaveAttribute("aria-checked", "true");
     await pickDestination(user, "Sacramento");
     await user.click(screen.getByRole("button", { name: /1 seat/i }));
     await user.click(screen.getByRole("button", { name: /more seats needed/i }));
     await user.click(screen.getByRole("button", { name: /^done$/i }));
-    await user.click(screen.getByRole("button", { name: /find rides/i }));
+    await user.click(screen.getByRole("button", { name: /browse all rides/i }));
 
     await screen.findByText(/2 drivers going your way/i);
     const search = calls.find(c => c.key === "GET /driver-trips/search" && c.url.includes("destination_latitude"));
     expect(search?.url).toContain(`target_date=${today}`);
 
-    // Best match first (less detour, verified); lowest price flips the order.
+    // Best match first (less detour, verified); cheapest flips the order.
     let cards = screen.getAllByRole("button", { name: /per seat/i });
     expect(cards[0]).toHaveTextContent("Priya");
     expect(cards[0]).toHaveTextContent("8:10 → 8:42");
     expect(within(cards[0]).getByRole("img", { name: /id verified/i })).toBeTruthy();
-    await user.click(screen.getByRole("radio", { name: /lowest price/i }));
+    await user.click(screen.getByRole("radio", { name: /cheapest/i }));
     cards = screen.getAllByRole("button", { name: /per seat/i });
     expect(cards[0]).toHaveTextContent("Marcus");
 
@@ -137,15 +161,76 @@ describe("Rider flow: Home → Results → Ride details", () => {
     expect(rr.passenger_count).toBe(2);
     const dest = calls.filter(c => c.key === "POST /locations").map(c => c.body as { label: string; latitude: number });
     expect(dest.some(d => d.label.startsWith("Sacramento") && d.latitude === 38.58)).toBe(true);
-    await screen.findByRole("heading", { name: /^inbox$/i });
+    // Requesting now lands on the waiting screen, not the inbox.
+    await screen.findByText(/waiting for priya/i);
   });
+
+  it("'Find me a ride' requests the top match and opens the trip once accepted", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const pending = { id: "con_new", ride_request_id: "rrq_new", driver_trip_id: PRIYA.id, initiator_user_id: "usr_me", status: "pending", created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null,
+      ride_request: { id: "rrq_new", rider_id: "usr_me", pickup: { id: "a", label: "Elm St, Chico, CA", exact: true, latitude: 39.7, longitude: -121.8 }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "flexible", passenger_count: 1, tags: [], status: "open", created_at: "x" },
+      driver_trip: PRIYA,
+      driver_profile: { user_id: PRIYA.driver_id, display_name: "Priya", photo_url: null, bio: null, photo_verified: true, interests: [], nationality: null, phone: "+1 555 0100" },
+      rider_profile: null };
+    let polls = 0;
+    let requested = false;
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "POST /locations": (body: unknown) => ({ id: `loc_${(body as { label: string }).label.length}`, label: (body as { label: string }).label, exact: true }),
+      "POST /ride-requests": { id: "rrq_new", rider_id: "usr_me", status: "open" },
+      "POST /connections": () => { requested = true; return pending; },
+      "GET /me/connections": () => (!requested ? [] : ++polls < 3 ? [pending] : [{ ...pending, status: "accepted" }]),
+      "GET /connections/con_new/messages": [],
+      "GET /connections/con_new/live": { connection_id: "con_new", pickup: { label: "Elm St, Chico, CA", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await pickDestination(user, "Sacramento");
+    await user.click(screen.getByRole("button", { name: /find me a ride/i }));
+
+    // Best match (Priya) is asked automatically, with no list or detail screen in between.
+    await screen.findByText(/waiting for priya/i);
+    const conn = calls.find(c => c.key === "POST /connections")!.body as Record<string, unknown>;
+    expect(conn.driver_trip_id).toBe(PRIYA.id);
+
+    // Once Priya accepts, the passenger lands on the trip-day screen.
+    await screen.findByText(/ride confirmed/i, undefined, { timeout: 8000 });
+    await screen.findByRole("button", { name: /i’m at the pickup spot/i });
+    expect(screen.queryByText(/waiting for priya/i)).toBeNull();
+  }, 15000);
+
+  it("moves on to the next best driver when the first one declines", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const conn = (t: typeof PRIYA, status: string) => ({ id: `con_${t.id}`, ride_request_id: "rrq_new", driver_trip_id: t.id, initiator_user_id: "usr_me", status, created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null,
+      ride_request: { id: "rrq_new", rider_id: "usr_me", pickup: { id: "a", label: "Elm St, Chico, CA", exact: true }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "flexible", passenger_count: 1, tags: [], status: "open", created_at: "x" },
+      driver_trip: t, driver_profile: null, rider_profile: null });
+    const asked: string[] = [];
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "POST /locations": (body: unknown) => ({ id: `loc_${(body as { label: string }).label.length}`, label: (body as { label: string }).label, exact: true }),
+      "POST /ride-requests": { id: "rrq_new", rider_id: "usr_me", status: "open" },
+      "POST /connections": (body: unknown) => { const t = (body as { driver_trip_id: string }).driver_trip_id === PRIYA.id ? PRIYA : MARCUS; asked.push(t.id); return conn(t, "pending"); },
+      "GET /me/connections": () => asked.map(id => conn(id === PRIYA.id ? PRIYA : MARCUS, id === PRIYA.id ? "declined" : "pending")),
+    });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await pickDestination(user, "Sacramento");
+    await user.click(screen.getByRole("button", { name: /find me a ride/i }));
+    await screen.findByText(/waiting for priya/i);
+    await screen.findByText(/waiting for marcus/i, undefined, { timeout: 8000 });
+    expect(asked).toEqual([PRIYA.id, MARCUS.id]);
+    expect(calls.filter(c => c.key === "POST /ride-requests")).toHaveLength(1); // one request reused
+  }, 15000);
 });
 
 describe("Trip day", () => {
   useMobileViewport();
   afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
 
-  it("shows the live ETA, plate and call link, and checks the rider in at pickup", async () => {
+  it("shows the live ETA, plate and call link, and checks the passenger in at pickup", async () => {
     const user = userEvent.setup();
     signIn("rider");
     const accepted = {
@@ -154,7 +239,7 @@ describe("Trip day", () => {
       ride_request: { id: "rrq_1", rider_id: "usr_me", pickup: { id: "a", label: "Elm St & 3rd, Chico, CA", exact: true, latitude: 39.7, longitude: -121.8 }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "morning", passenger_count: 1, tags: [], status: "matched", created_at: "x" },
       driver_trip: { ...PRIYA, vehicle: { ...PRIYA.vehicle, plate: "8KXR 214" } },
       driver_profile: { user_id: PRIYA.driver_id, display_name: "Priya", photo_url: null, bio: null, photo_verified: true, interests: [], nationality: null, phone: "+1 555 0100" },
-      rider_profile: { user_id: "usr_me", display_name: "Sam Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+      rider_profile: { user_id: "usr_me", display_name: "Sam Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
     };
     const calls = stubApi({
       ...BASE_ROUTES,
@@ -171,6 +256,9 @@ describe("Trip day", () => {
     expect(screen.getByText("8KXR 214")).toBeTruthy();
     expect(screen.getByText(/grey honda civic/i)).toBeTruthy();
     expect(screen.getByRole("link", { name: /call/i })).toHaveAttribute("href", "tel:+15550100");
+
+    await user.click(screen.getByRole("button", { name: /i’m late/i }));
+    await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_1/messages")).toBe(true));
 
     await user.click(screen.getByRole("button", { name: /i’m at the pickup spot/i }));
     await screen.findByRole("button", { name: /you’re checked in/i });
@@ -223,5 +311,233 @@ describe("Driver flow: Home → Offer a ride", () => {
     expect(body.price_per_seat_cents).toBeNull();
     expect(body.seats_available).toBe(1);
     await screen.findByRole("heading", { name: /^my rides$/i });
+  });
+});
+
+describe("Home: ride or drive toggle", () => {
+  useMobileViewport();
+  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
+
+  it("switches between finding and offering a ride without leaving Home", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    stubApi({ ...BASE_ROUTES, "GET /me/driver-trips": [], "GET /me/ride-requests": [] });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await user.click(screen.getByRole("radio", { name: /offer a ride/i }));
+    await screen.findByRole("heading", { name: /where are you driving\?/i });
+    expect(screen.getByRole("button", { name: /post this ride/i })).toBeTruthy();
+    expect(sessionStorage.getItem("carpool_mode")).toBe("driver");
+
+    await user.click(screen.getByRole("radio", { name: /find a ride/i }));
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+  });
+});
+
+// ─── Account screens: welcome, preferences, safety, receipt, PIN, rating ──────
+
+function acceptedConnection(over: Record<string, unknown> = {}) {
+  return {
+    id: "con_9", ride_request_id: "rrq_9", driver_trip_id: PRIYA.id, initiator_user_id: "usr_me", status: "accepted",
+    created_at: "x", updated_at: "x", my_rating: null, rider_at_pickup_at: null, ride_pin: "4821", pin_verified_at: null,
+    ride_request: { id: "rrq_9", rider_id: "usr_me", rider_name: "Sam Rider", pickup: { id: "a", label: "Elm St & 3rd, Chico, CA", exact: true, latitude: 39.7, longitude: -121.8 }, destination: { id: "b", label: "Sacramento, CA", exact: true }, target_date: today, flexibility: "morning", passenger_count: 1, tags: [], status: "matched", created_at: "x" },
+    driver_trip: { ...PRIYA, vehicle: { ...PRIYA.vehicle, plate: "8KXR 214" } },
+    driver_profile: { user_id: PRIYA.driver_id, display_name: "Priya", photo_url: null, bio: null, photo_verified: true, interests: [], nationality: null },
+    rider_profile: { user_id: "usr_me", display_name: "Sam Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+    settlement: { method: "venmo", handle: "@priya", updated_at: "x" },
+    ...over,
+  };
+}
+
+describe("Account screens", () => {
+  useMobileViewport();
+  afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); });
+
+  it("shows the welcome screen once, before choosing how to ride", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    sessionStorage.removeItem("carpool_mode");
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me": { ...ME, onboarded_at: null },
+      "POST /me/onboarding/complete": { ...ME, onboarded_at: "2026-10-26T00:00:00Z" },
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+
+    await screen.findByRole("heading", { name: /share the ride/i });
+    await user.click(screen.getByRole("button", { name: /get started/i }));
+    await screen.findByText(/how are you riding today/i);
+    expect(calls.some(c => c.key === "POST /me/onboarding/complete")).toBe(true);
+  });
+
+  it("doesn't loop back to the welcome screen when the server can't record onboarding", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const calls = stubApi({ ...BASE_ROUTES, "GET /me": { ...ME, onboarded_at: null } }); // no /me/onboarding/complete → 404
+
+    const { unmount } = render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /get started/i }));
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    // The session sync stayed mounted: /me was not re-fetched mid-flow.
+    expect(calls.filter(c => c.key === "GET /me").length).toBe(1);
+    await new Promise(r => setTimeout(r, 50));
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+
+    // A reload on this device doesn't bring it back either.
+    unmount();
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+  });
+
+  it("skips the welcome screen for an API that doesn't report onboarding", async () => {
+    signIn("rider");
+    const { onboarded_at: _omit, ...legacyMe } = ME;
+    stubApi({ ...BASE_ROUTES, "GET /me": legacyMe });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    expect(screen.queryByRole("button", { name: /get started/i })).toBeNull();
+  });
+
+  it("saves ride preferences from Results and searches again", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/preferences": { max_walk_minutes: null, vibes: [], verified_only: false, women_only: false, coworkers_first: false, route_checkins: true },
+      "PATCH /me/preferences": (body: unknown) => body,
+      "GET /driver-trips/search": [{ ...PRIYA, is_coworker: true, shared_vibes: ["quiet"] }, MARCUS],
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await screen.findByRole("heading", { name: /where are you headed\?/i });
+    await pickDestination(user, "Sacramento");
+    await user.click(screen.getByRole("button", { name: /or browse all rides/i }));
+    await screen.findByText(/2 drivers going your way/i);
+    expect(screen.getByText("Coworker")).toBeTruthy();
+    expect(screen.getByText("Quiet ride")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /ride preferences/i }));
+    await screen.findByRole("heading", { name: /ride preferences/i });
+    await user.click(await screen.findByRole("radio", { name: /10 min/i }));
+    await user.click(screen.getByRole("button", { name: /quiet ride/i }));
+    await user.click(screen.getByRole("checkbox", { name: /verified drivers only/i }));
+    // Women-only needs a self-declared gender first.
+    expect(screen.getByRole("checkbox", { name: /women-only rides/i })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: /show matching rides/i }));
+
+    await screen.findByText(/2 drivers going your way/i);
+    const body = calls.find(c => c.key === "PATCH /me/preferences")!.body as Record<string, unknown>;
+    expect(body).toMatchObject({ max_walk_minutes: 10, vibes: ["quiet"], verified_only: true, women_only: false });
+    expect(calls.filter(c => c.key === "GET /driver-trips/search" && c.url.includes("destination_latitude")).length).toBe(2);
+  });
+
+  it("opens Safety from trip day with the ride PIN and texts the trip to trusted contacts", async () => {
+    const user = userEvent.setup();
+    signIn("rider");
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/connections": [acceptedConnection()],
+      "GET /connections/con_9/messages": [],
+      "GET /connections/con_9/live": { connection_id: "con_9", pickup: { label: "Elm St & 3rd, Chico, CA", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+      "GET /me/emergency-contacts": [],
+      "POST /me/emergency-contacts": (body: unknown) => ({ id: "emc_1", relationship: null, created_at: "x", ...(body as object) }),
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /8:10 am with priya/i }));
+    await screen.findByText(/tell priya your ride pin/i);
+    expect(screen.getByText(/settles up via/i)).toHaveTextContent("Venmo · @priya");
+
+    await user.click(screen.getByRole("button", { name: /safety/i }));
+    await screen.findByRole("heading", { name: /^safety$/i });
+    expect(screen.getByRole("link", { name: /call emergency services/i })).toHaveAttribute("href", "tel:911");
+    expect(screen.getByText("4821")).toBeTruthy();
+
+    await user.click(await screen.findByRole("button", { name: /\+ add/i }));
+    await user.type(screen.getByLabelText(/^name$/i), "Alex");
+    await user.type(screen.getByLabelText(/^phone$/i), "+1 555 0100");
+    await user.click(screen.getByRole("button", { name: /add contact/i }));
+
+    const text = await screen.findByRole("link", { name: /text this trip to alex/i });
+    expect(text.getAttribute("href")).toMatch(/^sms:\+15550100\?&body=.*Priya/);
+    expect((calls.find(c => c.key === "POST /me/emergency-contacts")!.body as { name: string }).name).toBe("Alex");
+  });
+
+  it("lets the driver confirm the rider's PIN", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const asDriver = acceptedConnection({
+      driver_trip: { ...PRIYA, driver_id: "usr_me" }, ride_pin: null,
+      ride_request: { ...acceptedConnection().ride_request, rider_id: "usr_sam" },
+      rider_profile: { user_id: "usr_sam", display_name: "Sam Rivera", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+    });
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/driver-trips": [], "GET /me/ride-requests": [],
+      "GET /me/connections": [asDriver],
+      "GET /connections/con_9/messages": [],
+      "GET /connections/con_9/live": { connection_id: "con_9", pickup: { label: "Elm St", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+      "POST /connections/con_9/verify-pin": { ...asDriver, pin_verified_at: "2026-10-26T08:09:00Z" },
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /picking up sam/i }));
+    await user.type(await screen.findByLabelText(/ask sam for their 4-digit ride pin/i), "4821");
+    await user.click(screen.getByRole("button", { name: /^check$/i }));
+
+    await screen.findByText(/ride pin confirmed/i);
+    expect((calls.find(c => c.key === "POST /connections/con_9/verify-pin")!.body as { pin: string }).pin).toBe("4821");
+  });
+
+  it("rates with tags, rides again and opens the receipt after a completed ride", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const asDriver = acceptedConnection({
+      driver_trip: { ...PRIYA, driver_id: "usr_me" },
+      ride_request: { ...acceptedConnection().ride_request, rider_id: "usr_sam" },
+      rider_profile: { user_id: "usr_sam", display_name: "Sam Rivera", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+    });
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/driver-trips": [], "GET /me/ride-requests": [],
+      "GET /me/connections": [asDriver],
+      "GET /connections/con_9/messages": [],
+      "GET /connections/con_9/live": { connection_id: "con_9", pickup: { label: "Elm St", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
+      "POST /connections/con_9/transition": { ...asDriver, status: "completed" },
+      "POST /connections/con_9/rating": {},
+      "PUT /me/buddies/usr_sam": { status: "added" },
+      "GET /connections/con_9/receipt": {
+        id: "rcp_1", receipt_number: "CP-00042", connection_id: "con_9", rider_id: "usr_sam", driver_id: "usr_me",
+        driver_name: "Me", vehicle_label: "Grey Honda Civic", pickup_label: "Elm St & 3rd, Chico, CA", dropoff_label: "Sacramento, CA",
+        trip_date: today, departure_time: "08:10:00", completed_at: `${today}T08:41:00`, distance_km: 23, gas_cost_cents: 1350,
+        split_between: 3, seats: 1, price_per_seat_cents: 450, amount_cents: 450, settlement_method: "venmo",
+      },
+    });
+
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /picking up sam/i }));
+    await user.click(await screen.findByRole("button", { name: /mark ride complete/i }));
+    await screen.findByRole("heading", { name: /ride with sam complete/i });
+
+    await user.click(screen.getByRole("radio", { name: /^5 stars$/i }));
+    await user.click(screen.getByRole("button", { name: /on time/i }));
+    await waitFor(() => {
+      const last = calls.filter(c => c.key === "POST /connections/con_9/rating").at(-1)!.body as { stars: number; tags: string[] };
+      expect(last).toMatchObject({ stars: 5, tags: ["on_time"] });
+    });
+    await user.click(screen.getByRole("checkbox", { name: /ride with sam again/i }));
+    await waitFor(() => expect(calls.some(c => c.key === "PUT /me/buddies/usr_sam")).toBe(true));
+
+    await user.click(screen.getByRole("button", { name: /view receipt/i }));
+    await screen.findByRole("heading", { name: /trip receipt/i });
+    const receipt = screen.getByRole("article", { name: /receipt cp-00042/i });
+    expect(receipt).toHaveTextContent("$4.50");
+    expect(receipt).toHaveTextContent("Gas for 14 mi");
+    expect(receipt).toHaveTextContent("Venmo");
+    expect(screen.getByRole("link", { name: /email for expenses/i }).getAttribute("href")).toMatch(/^mailto:\?subject=Carpool%20receipt%20CP-00042/);
   });
 });

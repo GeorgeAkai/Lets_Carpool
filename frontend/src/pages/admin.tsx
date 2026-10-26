@@ -31,7 +31,7 @@ function StatusBadge({ status }: { status: 'active' | 'suspended' }) {
 }
 
 function RoleBadge({ isDriver, isRider }: { isDriver: boolean; isRider: boolean }) {
-  const label = isDriver && isRider ? 'Driver + Rider' : isDriver ? 'Driver' : isRider ? 'Rider' : 'New'
+  const label = isDriver && isRider ? 'Driver + Passenger' : isDriver ? 'Driver' : isRider ? 'Rider' : 'New'
   return <span className="inline-flex px-2.5 py-1 rounded-full text-xs font-medium bg-muted text-muted-foreground">{label}</span>
 }
 
@@ -93,9 +93,9 @@ function OverviewTab({ showToast }: { showToast: Toast }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatTile label="Total Users" value={stats.total_users} sub={`${stats.total_drivers} drivers · ${stats.total_riders} riders`} />
+        <StatTile label="Total Users" value={stats.total_users} sub={`${stats.total_drivers} drivers · ${stats.total_riders} passengers`} />
         <StatTile label="Active Drivers" value={stats.active_drivers} sub="Published, open routes" />
-        <StatTile label="Active Riders" value={stats.active_riders} sub="Open ride requests" />
+        <StatTile label="Active Passengers" value={stats.active_riders} sub="Open ride requests" />
         <StatTile label="Completed Rides" value={stats.completed_rides} sub="All-time" />
         <StatTile label="New Signups" value={stats.new_users_7d} sub="Last 7 days" />
         <StatTile label="Suspended Users" value={stats.suspended_users} sub="Locked out of the platform" />

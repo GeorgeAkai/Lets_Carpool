@@ -4,7 +4,7 @@
 
 People who need rides and people who are already driving to similar destinations lack a simple, trusted way to find each other, coordinate details, and agree on a fair gas split without turning the product into a full rideshare, payment, or safety platform too early.
 
-Riders need to publish where they want to go, find drivers going to similar destinations, and coordinate a practical pickup. Drivers need to publish planned trips, discover relevant rider requests, manage available seats, and decide who to connect with. Both sides need enough structure to feel organized, but enough flexibility to coordinate real-world timing through chat.
+Passengers need to publish where they want to go, find drivers going to similar destinations, and coordinate a practical pickup. Drivers need to publish planned trips, discover relevant passenger requests, manage available seats, and decide who to connect with. Both sides need enough structure to feel organized, but enough flexibility to coordinate real-world timing through chat.
 
 ## Current State (as of 2026-09-26)
 
@@ -32,7 +32,7 @@ Both the original two-sided listing model and a newer community-pool model exist
 
 - `users`, `profiles` (display name, photo, bio, `photo_verified`), `vehicles` (make/model/color/seats, `car_type`, self-declared license/insurance/driving record)
 - `locations` (lat/lng, label, provider metadata)
-- `ride_requests` / `driver_trips` — the PRD's original rider/driver listing split, including `luggage_size`/`luggage_capacity` and `car_type`/`preferred_car_type`, tags (`airport`, `student`, plus `church`/`college`/`work`/`event` added since), and the full `open/expired/matched/cancelled/completed` status enum
+- `ride_requests` / `driver_trips` — the PRD's original passenger/driver listing split, including `luggage_size`/`luggage_capacity` and `car_type`/`preferred_car_type`, tags (`airport`, `student`, plus `church`/`college`/`work`/`event` added since), and the full `open/expired/matched/cancelled/completed` status enum
 - `connections` — links one ride request to one driver trip, full `pending/expired/accepted/declined/cancelled/completed` state machine, seat reservation
 - `messages` — canned vs. free-text, gated by connection state
 - `gas_split_confirmations` — suggested-fare + manual confirmation per side (haversine distance, $3.50/gal, 28mpg assumption)
@@ -53,7 +53,7 @@ Both the original two-sided listing model and a newer community-pool model exist
 | Chat (canned while pending, full after accepted) | Fully built, including inbox UI, unread badges, and a full-screen chat view |
 | Gas split (suggested fare + manual confirmation) | Built as a suggestion + independent confirmation; still **no reconciliation** if the two sides confirm different amounts |
 | Block / report | Backend complete (enforced in search/connect/message); **UI entry point now exists** — an overflow menu on listing cards and connection cards |
-| Driver "Start Driving" pickup navigation | Fully built: live GPS watch, routed map to the rider's pickup, auto-refreshing ETA/distance, ends on arrival |
+| Driver "Start Driving" pickup navigation | Fully built: live GPS watch, routed map to the passenger's pickup, auto-refreshing ETA/distance, ends on arrival |
 | Admin panel / moderation | Fully built (`frontend/src/pages/admin.tsx`, linked from account settings): overview stats, user directory + suspend/unsuspend/warn, report review (dismiss/action), active-route removal, and an audit log viewer |
 | Listing/connection expiry | Automated: Vercel Cron calls `GET /cron/expire`, gated by a shared cron secret; the ownership/authorization gap is closed |
 | Notifications | In-app/polled only. No email, no push. |
@@ -75,7 +75,7 @@ Both the original two-sided listing model and a newer community-pool model exist
 
 - Full ID verification; document upload/review for license, insurance, driving record
 - In-app payments, credit card storage, refunds/disputes
-- Real-time driver/rider tracking beyond the existing nearby-driver map, journey sharing, SOS
+- Real-time driver/passenger tracking beyond the existing nearby-driver map, journey sharing, SOS
 - Ratings and reviews
 - AI matching, dynamic pricing beyond the simple editable gas-split estimate
 - Flight data integration, luggage/vehicle-size ML
@@ -91,7 +91,7 @@ Unsolicited product/UI feedback came in covering six themes. Each is evaluated a
 1. **Progressive sign-up animation** (an SUV drives down a route, picking up passengers as onboarding steps complete: details+email → ID → selfie/liveness → payment → done). Cosmetic, and the steps it animates mostly don't exist yet — sign-in today is Neon Auth email/OAuth only, with no ID/liveness/payment steps. Revisit once (if) item 5 below gives it real steps to represent; building the animation first would be decorating an onboarding flow that isn't there.
 2. **Auto-match instead of manual browse-and-connect** ("system pairs you, accept/cancel," Uber-style). This isn't a UI tweak — it replaces the deliberate manual/symmetric request-offer model (`connections` state machine) and runs directly against the existing "AI matching... out of scope" decision below. Needs its own architecture decision if pursued, not a roadmap line item. Not adopted.
 3. **Richer match profile as a trust/icebreaker layer** (rating, shared interests, nationality, alongside name). Rating is explicitly out of scope today (no ratings system exists). Shared interests / nationality are cheap additions to `profiles` if we want them, independent of the rating piece.
-4. **Explicit Passenger/Driver mode toggle.** The backend already supports one account acting as both rider and driver — there's just no dedicated UI toggle for it, and no prompt into driver verification when a passenger first switches to Driver mode. Concrete, buildable UI work; added to the roadmap below.
+4. **Explicit Passenger/Driver mode toggle.** The backend already supports one account acting as both passenger and driver — there's just no dedicated UI toggle for it, and no prompt into driver verification when a passenger first switches to Driver mode. Concrete, buildable UI work; added to the roadmap below.
 5. **Materially stronger driver verification**: live (not uploaded) vehicle photos, AI-based damage/feature checks (headlights, brake lights, indicators, plate), insurance verification, background checks. This directly reopens "Full ID verification; document upload/review for license, insurance, driving record," which is currently out of scope — vehicle/license/insurance are self-declared only. It's also a large, separate initiative (vision model, background-check vendor, insurance verification integration), not incremental hardening. Track as its own future phase rather than a roadmap line.
 6. **Group Carpool UI details.** This already exists as the `pools`/`pool_memberships` feature. The concrete ask — driver sets pickup location, departure time, and manages the group chat; passengers immediately see pickup, ETA, destination, seats available, current passengers (optional), and get the group chat after joining — is actionable now as a UI audit against the existing Pools screens, not new scope.
 7. **Branding: keep navy blue as primary, paired with white and a lighter accent.** Already the direction in place (green→blue switch, then deepened to royal blue `#2848c8`/`#5b7beb` per recent commits). No action needed — treat as confirmation of the current direction, not a change.
@@ -135,7 +135,7 @@ Roughly ordered by what would most reduce risk or unblock real usage:
 A follow-up spec came in covering the remaining production gaps above plus new UX scope. Items already covered by the roadmap above are cross-referenced rather than restated; genuinely new scope is listed here.
 
 23. Algorithmic "Best Matches" card deck — replace the flat marketplace feed with a ranked top-2–3 card deck (departure window, pickup proximity, shared-interest overlap) showing driver identity, verified badge (`profiles.photo_verified`, not a star rating — ratings stay out of scope per item 18), trip specs, and an "Instant Request Match" CTA that creates a `pending` connection through the existing state machine. See roadmap item 9's decision note above. → Issue 30.
-24. Simplify listing creation: auto-fill driver vehicle specs from profile settings when creating a trip; hide driver-only fields when posting a ride request and rider-only fields when posting a trip. (The gas-split estimator itself — $3.50/gal at 28 MPG — already exists per issue 11; no new work there.) → Issue 31.
+24. Simplify listing creation: auto-fill driver vehicle specs from profile settings when creating a trip; hide driver-only fields when posting a ride request and passenger-only fields when posting a trip. (The gas-split estimator itself — $3.50/gal at 28 MPG — already exists per issue 11; no new work there.) → Issue 31.
 25. Notification UX overhaul: deep-link each notification type to its record (connection → Inbox, chat message → the specific thread, gas split confirmed → the split detail view), add unread visual state (accent pill + card background per the design tokens below) vs. read (white), add "Mark all as read" and a per-item dismiss, and add category pill filters (All / Connections / Chat / Payments). This is UX on top of the existing in-app/polled notifications (item 17) — it does not add email/push. → Issue 33.
 26. **Design system token conflict — needs confirmation, not yet applied.** External feedback item 7 (recorded above) concluded the current royal-blue direction (`#2848c8` / `#5b7beb`) needed no change. The 2026-08-28 spec specifies *different* hex values: primary navy `#0F172A`/`#1E3A8A`, accent sky blue/cyan `#0284C7`, backgrounds white/`#F8FAFC`. These are a real rebrand, not a restatement of the existing direction. Treated here as the newer, more specific instruction and scoped as issue 34, but flagging the conflict explicitly since it reverses a previously "no action needed" conclusion — confirm before merging.
 

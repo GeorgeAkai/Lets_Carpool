@@ -34,6 +34,9 @@ export type UserStats = {
   rating_count: number;
   completed_trips: number;
   id_verified: boolean;
+  // Typical minutes to answer a ride request ("usually replies within …").
+  median_response_minutes?: number | null;
+  top_rating_tags?: { tag: RatingTag; count: number }[];
 };
 
 export type TripPricing = {
@@ -61,9 +64,14 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the trip; only set on corridor searches
+  // Minutes this passenger would add to the trip; only set on corridor searches
   // (search with both pickup and destination coordinates).
   detour_minutes?: number | null;
+  vibes?: RideVibe[];
+  // Search results only, relative to the searching rider's preferences.
+  is_coworker?: boolean | null;
+  is_buddy?: boolean | null;
+  shared_vibes?: RideVibe[] | null;
   departure_time?: string | null;        // "HH:MM:SS"
   estimated_arrival_time?: string | null; // "HH:MM:SS", from the route duration
   duration_minutes?: number;
@@ -93,8 +101,12 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  // Minutes this passenger would add to the driver's trip; only set on driver-side proposals.
   detour_minutes?: number | null;
+  // Driver-side matches: metres from the passenger's pickup to the trip's route,
+  // and a 0-100 match score.
+  off_route_m?: number | null;
+  match_score?: number | null;
   departure_time?: string | null;
   rider_stats?: UserStats;
 };
@@ -114,6 +126,25 @@ export type ApiConnection = {
   driver_profile?: (ApiProfile & Partial<UserStats>) | null;
   my_rating?: number | null;
   rider_at_pickup_at?: string | null;
+  responded_at?: string | null;
+  completed_at?: string | null;
+  // Rider only, once accepted: read it out to the driver before getting in.
+  ride_pin?: string | null;
+  pin_verified_at?: string | null;
+  // How the driver would like the gas split settled (accepted/completed rides).
+  settlement?: SettlementPreference | null;
+  // Driver confirmed the passenger is in the car — the ride is en route.
+  picked_up_at?: string | null;
+  // Automatic fare: an estimate until the ride completes, then "paid".
+  fare?: ApiFare;
+};
+
+export type ApiFare = {
+  amount_cents: number;
+  currency: string;
+  distance_km: number;
+  passengers: number;
+  status: "estimated" | "paid";
 };
 
 export type ApiProfile = {
@@ -126,6 +157,8 @@ export type ApiProfile = {
   nationality: string | null;
   // Own profile only, or the other party's once a ride is accepted.
   phone?: string | null;
+  // Own profile only; enables "Women-only rides".
+  gender?: Gender | null;
 };
 
 export type ApiVehicle = {
@@ -146,6 +179,7 @@ export type ApiUser = {
   email: string;
   email_domain: string;
   status: "active" | "suspended";
+  onboarded_at?: string | null;
   profile: ApiProfile;
   vehicle: ApiVehicle;
 };
@@ -176,6 +210,8 @@ export type SearchQuery = {
   tag?: string;
   car_type?: string;
   luggage_size?: string;
+  // Defaults to true server-side: narrow and rank by the saved ride preferences.
+  apply_preferences?: boolean;
 };
 
 export type ApiPool = {
@@ -244,6 +280,7 @@ export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
   | { type: "pickup_updated"; connection_id: string }
+  | { type: "notification"; notification: ApiNotification }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
@@ -280,7 +317,13 @@ function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): W
 // equivalent. A hosted realtime service (Ably/Pusher) can replace this later
 // behind the same `createRealtime` interface.
 
-export const POLL_INTERVAL_MS = 8000;
+// Polls read the one-query status feed (GET /me/connections/status), not the
+// full connection list, so they're cheap; the full list is refetched by the
+// app only when a status actually changes.
+export const POLL_INTERVAL_MS = 10000;
+// While a request is waiting on an answer, poll faster so accept/decline
+// shows up within a few seconds.
+export const PENDING_POLL_INTERVAL_MS = 3000;
 
 export type RealtimeStrategy = "websocket" | "polling";
 
@@ -296,12 +339,16 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
   let primed = false;
   let stopped = false;
   let running = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const nextDelay = () =>
+    [...statuses.values()].includes("pending") ? PENDING_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+  const schedule = () => { if (!stopped) timer = setTimeout(() => void poll().finally(schedule), nextDelay()); };
 
   const poll = async () => {
     if (stopped || running || document.hidden) return;
     running = true;
     try {
-      const [connections, notifications] = await Promise.all([getMyConnections(), getNotifications()]);
+      const [connections, notifications] = await Promise.all([getConnectionStatuses(), getNotifications()]);
       if (stopped) return;
 
       const events: WsMessage[] = [];
@@ -317,6 +364,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
         if (seenNotifications.has(n.id)) continue;
         seenNotifications.add(n.id);
         if (primed && n.type === "chat_message" && n.related_id) chatConnectionIds.add(n.related_id);
+        else if (primed) events.push({ type: "notification", notification: n });
       }
       for (const connectionId of chatConnectionIds) {
         const messages = await getMessages(connectionId);
@@ -330,13 +378,19 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
     finally { running = false; }
   };
 
-  void poll();
-  const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+  void poll().finally(schedule);
   const onVisible = () => { if (!document.hidden) void poll(); };
   document.addEventListener("visibilitychange", onVisible);
   return {
-    close: () => { stopped = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); },
+    close: () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); },
   };
+}
+
+export type ConnectionStatusRow = { id: string; status: string; updated_at: string };
+
+// One cheap query: what changed, not the full ride details.
+export function getConnectionStatuses(): Promise<ConnectionStatusRow[]> {
+  return request("GET", "/me/connections/status");
 }
 
 export function createRealtime(userId: string, onMessage: (msg: WsMessage) => void): { close: () => void } {
@@ -370,12 +424,14 @@ export function updateProfile(
   interests?: string[],
   nationality?: string | null,
   phone?: string | null,
+  gender?: Gender | null,
 ): Promise<ApiProfile> {
   return request<ApiProfile>("PATCH", "/me/profile", {
     display_name: displayName, photo_url: photoUrl, bio,
     interests: interests ?? [], nationality: nationality ?? null,
-    // Left out entirely when not editing it, so the server keeps the stored number.
+    // Left out entirely when not editing them, so the server keeps the stored values.
     ...(phone !== undefined ? { phone } : {}),
+    ...(gender !== undefined ? { gender } : {}),
   });
 }
 
@@ -422,8 +478,10 @@ export function suggestRoute(
 
 // ─── Locations ────────────────────────────────────────────────────────────────
 
-export function createLocation(label: string, latitude: number, longitude: number): Promise<LocationView> {
-  return request<LocationView>("POST", "/locations", { label, latitude, longitude });
+// `isGeneral`: the point stands for a whole area (a city), not an address, so
+// searches treat it as the surrounding area rather than a pin.
+export function createLocation(label: string, latitude: number, longitude: number, isGeneral = false): Promise<LocationView> {
+  return request<LocationView>("POST", "/locations", { label, latitude, longitude, ...(isGeneral ? { is_general: true } : {}) });
 }
 
 // ─── Driver trips ─────────────────────────────────────────────────────────────
@@ -455,7 +513,7 @@ export function createDriverTrip(data: {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
 
-// "Each rider pays" while the driver is still filling in the form.
+// "Each passenger pays" while the driver is still filling in the form.
 export function previewTripPrice(pickupLocationId: string, destinationLocationId: string, seatsAvailable: number): Promise<TripPricing & { duration_minutes: number }> {
   return request("POST", "/driver-trips/price-preview", {
     pickup_location_id: pickupLocationId, destination_location_id: destinationLocationId, seats_available: seatsAvailable,
@@ -464,6 +522,26 @@ export function previewTripPrice(pickupLocationId: string, destinationLocationId
 
 export function cancelDriverTrip(tripId: string): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/cancel`);
+}
+
+export function pauseDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/pause`);
+}
+
+export function resumeDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/resume`);
+}
+
+export type DriverTripEdit = {
+  target_date?: string;
+  flexibility?: string;
+  seats_available?: number;
+  departure_time?: string | null;
+  notes?: string | null;
+};
+
+export function updateDriverTrip(tripId: string, edit: DriverTripEdit): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("PATCH", `/driver-trips/${tripId}`, edit);
 }
 
 export function getMyDriverTrips(): Promise<ApiDriverTrip[]> {
@@ -533,6 +611,10 @@ export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: num
 
 export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
   return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function getDriverTripMatches(driverTripId: string): Promise<ApiRideRequest[]> {
+  return request<ApiRideRequest[]>("GET", `/driver-trips/${driverTripId}/matches`);
 }
 
 export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
@@ -652,13 +734,15 @@ export type ApiPublicProfile = {
 
 // ─── Ratings, trip day, saved routes, ride alerts ────────────────────────────
 
-export function rateConnection(connectionId: string, stars: number, comment?: string): Promise<unknown> {
-  return request("POST", `/connections/${connectionId}/rating`, { stars, comment });
+export function rateConnection(connectionId: string, stars: number, comment?: string, tags: RatingTag[] = []): Promise<unknown> {
+  return request("POST", `/connections/${connectionId}/rating`, { stars, comment, tags });
 }
 
 export type TripDayStatus = {
   connection_id: string;
   pickup: { label: string; latitude: number; longitude: number };
+  destination: { label: string; latitude: number; longitude: number };
+  picked_up_at: string | null;
   departure_time: string | null;
   driver: { latitude: number; longitude: number; updated_at: string; distance_to_pickup_m: number; eta_minutes: number } | null;
   rider_at_pickup_at: string | null;
@@ -666,6 +750,10 @@ export type TripDayStatus = {
 
 export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {
   return request("GET", `/connections/${connectionId}/live`);
+}
+
+export function markPickedUp(connectionId: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/picked-up`);
 }
 
 export function markAtPickup(connectionId: string): Promise<ApiConnection> {
@@ -708,8 +796,158 @@ export function blockUser(targetUserId: string): Promise<{ status: string }> {
   return request<{ status: string }>("POST", `/users/${targetUserId}/block`);
 }
 
-export function reportUser(targetUserId: string, reason: string): Promise<unknown> {
-  return request<unknown>("POST", `/users/${targetUserId}/report`, { reason });
+export function reportUser(targetUserId: string, reason: string, category: ReportCategory = "other"): Promise<unknown> {
+  return request<unknown>("POST", `/users/${targetUserId}/report`, { reason, category });
+}
+
+export function reportTrip(connectionId: string, reason: string, category: ReportCategory = "other"): Promise<unknown> {
+  return request<unknown>("POST", `/connections/${connectionId}/report`, { reason, category });
+}
+
+// ─── Onboarding, preferences, places, settling up, receipts, safety ──────────
+
+export type Gender = "woman" | "man" | "nonbinary";
+export type RideVibe = "quiet" | "music_ok" | "chatty" | "pets_ok" | "room_for_bags" | "no_smoking";
+export type RatingTag = "on_time" | "safe_driving" | "clean_car" | "great_chat" | "friendly" | "easy_pickup";
+export type ReportCategory = "safety" | "driving" | "no_show" | "payment" | "conduct" | "other";
+export type SettlementMethod = "cash" | "venmo" | "zelle" | "paypal" | "cash_app" | "other";
+export type ShareMode = "every_trip" | "night_only" | "off";
+
+export type RidePreferences = {
+  max_walk_minutes: number | null; // null = any distance
+  vibes: RideVibe[];
+  verified_only: boolean;
+  women_only: boolean;
+  coworkers_first: boolean;
+  route_checkins: boolean;
+};
+
+export type SavedPlace = {
+  id: string;
+  kind: "home" | "work" | "other";
+  label: string;
+  location_id: string;
+  location: LocationView;
+  created_at: string;
+};
+
+export type SettlementPreference = { method: SettlementMethod; handle: string | null; updated_at: string };
+
+export type TripReceipt = {
+  id: string;
+  receipt_number: string; // "CP-00042"
+  connection_id: string;
+  rider_id: string;
+  driver_id: string;
+  driver_name: string | null;
+  vehicle_label: string | null;
+  pickup_label: string;
+  dropoff_label: string;
+  trip_date: string;
+  departure_time: string | null;
+  completed_at: string;
+  distance_km: number;
+  gas_cost_cents: number;
+  split_between: number;
+  seats: number;
+  price_per_seat_cents: number;
+  amount_cents: number;
+  settlement_method: SettlementMethod | null;
+};
+
+export type UserImpact = {
+  shared_trips: number;
+  saved_cents: number;
+  shared_km: number;
+  regular_buddies: number;
+  since: string | null;
+};
+
+export type RideBuddy = { user_id: string; display_name: string | null; photo_url: string | null; created_at: string };
+
+export type EmergencyContact = {
+  id: string;
+  name: string;
+  relationship: string | null;
+  phone: string;
+  share_mode: ShareMode;
+  created_at: string;
+};
+
+export function completeOnboarding(): Promise<ApiUser> {
+  return request("POST", "/me/onboarding/complete");
+}
+
+export function getPreferences(): Promise<RidePreferences> {
+  return request("GET", "/me/preferences");
+}
+
+export function updatePreferences(changes: Partial<RidePreferences>): Promise<RidePreferences> {
+  return request("PATCH", "/me/preferences", changes);
+}
+
+export function getSavedPlaces(): Promise<SavedPlace[]> {
+  return request("GET", "/me/places");
+}
+
+export function savePlace(kind: SavedPlace["kind"], locationId: string, label?: string): Promise<SavedPlace> {
+  return request("POST", "/me/places", { kind, location_id: locationId, label });
+}
+
+export function deleteSavedPlace(placeId: string): Promise<unknown> {
+  return request("DELETE", `/me/places/${placeId}`);
+}
+
+export function getSettlement(): Promise<SettlementPreference | null> {
+  return request("GET", "/me/settlement");
+}
+
+export function setSettlement(method: SettlementMethod, handle?: string | null): Promise<SettlementPreference> {
+  return request("PUT", "/me/settlement", { method, handle });
+}
+
+export function getReceipt(connectionId: string): Promise<TripReceipt> {
+  return request("GET", `/connections/${connectionId}/receipt`);
+}
+
+export function getReceipts(): Promise<TripReceipt[]> {
+  return request("GET", "/me/receipts");
+}
+
+export function getImpact(since?: string): Promise<UserImpact> {
+  return request("GET", `/me/impact${since ? `?since=${since}` : ""}`);
+}
+
+export function getBuddies(): Promise<RideBuddy[]> {
+  return request("GET", "/me/buddies");
+}
+
+export function addBuddy(userId: string): Promise<unknown> {
+  return request("PUT", `/me/buddies/${userId}`);
+}
+
+export function removeBuddy(userId: string): Promise<unknown> {
+  return request("DELETE", `/me/buddies/${userId}`);
+}
+
+export function verifyRidePin(connectionId: string, pin: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/verify-pin`, { pin });
+}
+
+export function getEmergencyContacts(): Promise<EmergencyContact[]> {
+  return request("GET", "/me/emergency-contacts");
+}
+
+export function addEmergencyContact(contact: { name: string; phone: string; relationship?: string; share_mode?: ShareMode }): Promise<EmergencyContact> {
+  return request("POST", "/me/emergency-contacts", contact);
+}
+
+export function updateEmergencyContact(contactId: string, shareMode: ShareMode): Promise<EmergencyContact> {
+  return request("PATCH", `/me/emergency-contacts/${contactId}`, { share_mode: shareMode });
+}
+
+export function deleteEmergencyContact(contactId: string): Promise<unknown> {
+  return request("DELETE", `/me/emergency-contacts/${contactId}`);
 }
 
 // ─── Notifications ────────────────────────────────────────────────────────────

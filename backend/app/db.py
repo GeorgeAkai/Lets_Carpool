@@ -1,32 +1,66 @@
 """PostgreSQL connection pool and schema bootstrap."""
 from __future__ import annotations
 
+import os
+import threading
 from contextlib import contextmanager
 from typing import Generator
 
 import psycopg2
 import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.pool import PoolError, ThreadedConnectionPool
 
 _pool: ThreadedConnectionPool | None = None
 
 
+# How long a request waits for a free connection before giving up (seconds).
+POOL_WAIT_SECONDS = float(os.environ.get("DB_POOL_WAIT_SECONDS", "20"))
+
+_slots: threading.BoundedSemaphore | None = None
+_local = threading.local()
+
+
 def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10) -> None:
-    global _pool
+    global _pool, _slots
+    # Each Cloud Run instance holds its own pool, so total connections =
+    # instances x DB_POOL_MAX — keep that under the database's limit.
+    maxconn = int(os.environ.get("DB_POOL_MAX", maxconn))
     _pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
+    # psycopg2's pool raises the instant it is empty. A page load fires many
+    # requests at once, so callers queue on this semaphore for a free connection instead.
+    _slots = threading.BoundedSemaphore(maxconn)
 
 
 def close_pool() -> None:
-    global _pool
+    global _pool, _slots
     if _pool:
         _pool.closeall()
         _pool = None
+    _slots = None
 
 
 @contextmanager
 def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
-    assert _pool is not None, "DB pool not initialised — call init_pool() first"
-    conn = _pool.getconn()
+    assert _pool is not None and _slots is not None, "DB pool not initialised — call init_pool() first"
+    # Re-entrant per thread: code that opens a connection while already holding
+    # one (e.g. a helper called inside a transaction) shares it instead of
+    # needing a second slot, which could deadlock a small pool. Only the
+    # outermost block commits / rolls back / returns the connection.
+    held = getattr(_local, "conn", None)
+    if held is not None:
+        yield held
+        return
+    if not _slots.acquire(timeout=POOL_WAIT_SECONDS):
+        raise PoolError("timed out waiting for a database connection")
+    try:
+        conn = _pool.getconn()
+        if conn.closed:  # the server/pooler dropped an idle connection
+            _pool.putconn(conn, close=True)
+            conn = _pool.getconn()
+    except Exception:
+        _slots.release()
+        raise
+    _local.conn = conn
     try:
         yield conn
         conn.commit()
@@ -34,7 +68,9 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         conn.rollback()
         raise
     finally:
+        _local.conn = None
         _pool.putconn(conn)
+        _slots.release()
 
 
 def run_migrations(database_url: str) -> None:
@@ -107,6 +143,9 @@ def run_migrations(database_url: str) -> None:
     # populate this at insert time (see Store.create_location); this backfills
     # any rows written before the column existed.
     cur.execute("ALTER TABLE locations ADD COLUMN IF NOT EXISTS geog GEOGRAPHY(POINT, 4326)")
+    # A whole city/neighbourhood rather than a street address (e.g. a driver
+    # heading to "Sacramento"); matching treats it as an area, not a point.
+    cur.execute("ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_general BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("""
         UPDATE locations SET geog = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)::geography
         WHERE geog IS NULL
@@ -165,7 +204,7 @@ def run_migrations(database_url: str) -> None:
     """)
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS notes TEXT")
     # The driver's actual road route (from OSRM at creation time), so search can
-    # match riders against a corridor rather than just the two endpoints. NULL
+    # match passengers against a corridor rather than just the two endpoints. NULL
     # for trips created before this existed or while routing was unavailable;
     # search falls back to endpoint-radius matching for those.
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_geog GEOGRAPHY(LINESTRING, 4326)")
@@ -173,7 +212,7 @@ def run_migrations(database_url: str) -> None:
     cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS route_duration_s DOUBLE PRECISION")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_driver_trips_route_geog ON driver_trips USING GIST (route_geog)")
 
-    # Trips a rider has skipped when the system proposed their next match, so
+    # Trips a passenger has skipped when the system proposed their next match, so
     # the same trip isn't proposed again for that request. No FKs: a skip is
     # just a hint and shouldn't block deleting/archiving either listing.
     cur.execute("""
@@ -186,7 +225,7 @@ def run_migrations(database_url: str) -> None:
     """)
 
     # Same idea from the driver's side: ride requests a driver skipped when the
-    # system proposed a rider for their trip. Separate from match_skips so one
+    # system proposed a passenger for their trip. Separate from match_skips so one
     # side's skip never hides the listing from the other.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS driver_match_skips (
@@ -323,7 +362,7 @@ def run_migrations(database_url: str) -> None:
         )
     """)
 
-    # ── Trip-planning, trust and trip-day data (rider/driver redesign) ──────
+    # ── Trip-planning, trust and trip-day data (passenger/driver redesign) ──────
     # Optional exact departure time alongside the date + flexibility window;
     # arrival is derived from the stored route duration, never stored.
     cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS departure_time TIME")
@@ -339,8 +378,10 @@ def run_migrations(database_url: str) -> None:
     # Set by an admin after checking ID; drives the "Verified" badge/filter
     # and auto-accept.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id_verified BOOLEAN NOT NULL DEFAULT FALSE")
-    # Trip-day: when the rider tapped "I'm at the pickup spot".
+    # Trip-day: when the passenger tapped "I'm at the pickup spot".
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS rider_at_pickup_at TIMESTAMPTZ")
+    # Driver confirmed the passenger is in the car (the ride is en route).
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (
@@ -380,6 +421,125 @@ def run_migrations(database_url: str) -> None:
             fulfilled_at            TIMESTAMPTZ
         )
     """)
+
+    # ── Preferences, trust, receipts and safety (redesign, part 2) ─────────
+    # First-run welcome screen: shown until the user finishes it once.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ")
+    # Optional, self-declared, never shown to other users. Only used to honour
+    # the "Women-only rides" preference (see ride_preferences.women_only).
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS gender TEXT")
+
+    # "Ride preferences": how the rider wants search narrowed and ranked, plus
+    # the driver's own ride vibe (copied onto each trip they post).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ride_preferences (
+            user_id           TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            max_walk_minutes  INTEGER CHECK (max_walk_minutes IS NULL OR max_walk_minutes BETWEEN 1 AND 60),
+            vibes             TEXT[] NOT NULL DEFAULT '{}',
+            verified_only     BOOLEAN NOT NULL DEFAULT FALSE,
+            women_only        BOOLEAN NOT NULL DEFAULT FALSE,
+            coworkers_first   BOOLEAN NOT NULL DEFAULT FALSE,
+            route_checkins    BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at        TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS vibes TEXT[] NOT NULL DEFAULT '{}'")
+
+    # "Saved places": one-tap Home / Work (and a few named extras) on Home.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS saved_places (
+            id          TEXT PRIMARY KEY,
+            user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL CHECK (kind IN ('home', 'work', 'other')),
+            label       TEXT NOT NULL,
+            location_id TEXT NOT NULL REFERENCES locations(id),
+            created_at  TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_places_home_work
+        ON saved_places (user_id, kind) WHERE kind IN ('home', 'work')
+    """)
+
+    # How a user settles the gas split outside the app (no card data is ever
+    # stored: in-app payments are out of MVP scope). Shown to accepted partners
+    # and printed on receipts.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settlement_preferences (
+            user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            method     TEXT NOT NULL,
+            handle     TEXT,
+            updated_at TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+    # Request-status and receipt timeline, and the safety PIN the rider reads
+    # out to the driver before getting in.
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS ride_pin TEXT")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS pin_verified_at TIMESTAMPTZ")
+
+    # Immutable snapshot of a completed ride's cost split, so a receipt never
+    # changes if the trip, prices or profiles are edited later.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trip_receipts (
+            id                TEXT PRIMARY KEY,
+            receipt_number    BIGSERIAL UNIQUE,
+            connection_id     TEXT NOT NULL UNIQUE REFERENCES connections(id) ON DELETE CASCADE,
+            rider_id          TEXT NOT NULL REFERENCES users(id),
+            driver_id         TEXT NOT NULL REFERENCES users(id),
+            driver_name       TEXT,
+            vehicle_label     TEXT,
+            pickup_label      TEXT NOT NULL,
+            dropoff_label     TEXT NOT NULL,
+            trip_date         DATE NOT NULL,
+            departure_time    TIME,
+            completed_at      TIMESTAMPTZ NOT NULL,
+            distance_km       DOUBLE PRECISION NOT NULL,
+            gas_cost_cents    INTEGER NOT NULL,
+            split_between     INTEGER NOT NULL,
+            seats             INTEGER NOT NULL,
+            price_per_seat_cents INTEGER NOT NULL,
+            amount_cents      INTEGER NOT NULL,
+            settlement_method TEXT,
+            created_at        TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_receipts_rider ON trip_receipts (rider_id, completed_at DESC)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_receipts_driver ON trip_receipts (driver_id, completed_at DESC)")
+
+    # Quick feedback chips on the rating screen ("On time", "Clean car", ...).
+    cur.execute("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}'")
+
+    # "Ride with them again": people a user wants to see first in results.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ride_buddies (
+            user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            buddy_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (user_id, buddy_id)
+        )
+    """)
+
+    # Trusted contacts the user shares live trips with.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emergency_contacts (
+            id           TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name         TEXT NOT NULL,
+            relationship TEXT,
+            phone        TEXT NOT NULL,
+            share_mode   TEXT NOT NULL DEFAULT 'every_trip'
+                         CHECK (share_mode IN ('every_trip', 'night_only', 'off')),
+            created_at   TIMESTAMPTZ NOT NULL
+        )
+    """)
+
+    # "Report an issue with this trip": a report can point at a ride and carry
+    # a category so the admin queue can triage safety issues first.
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS connection_id TEXT REFERENCES connections(id) ON DELETE SET NULL")
+    cur.execute("ALTER TABLE reports ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'other'")
 
     cur.close()
     conn.close()

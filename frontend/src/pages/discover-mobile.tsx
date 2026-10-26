@@ -9,10 +9,10 @@ import {
 import type { Listing, RideTag, CarType, LuggageSize } from './home'
 
 // ─── Mobile Discover screen primitives ─────────────────────────────────────────
-// Shared by both mode branches (rider's FeedView and driver's DriverHomeView) so
+// Shared by both mode branches (passenger's FeedView and driver's DriverHomeView) so
 // neither duplicates the search/filter/card logic the other already has.
 
-// Uber-style two-stop search: the origin is always the rider's current
+// Uber-style two-stop search: the origin is always the passenger's current
 // location (the feed is already sorted around it), so only the destination is
 // editable — one prominent "Where to?" field instead of a page header.
 export function MobileSearchBar({ value, onChange, hasLocation }: {
@@ -217,9 +217,11 @@ export function SectionHeader({ label, count, noun }: { label: string; count: nu
   )
 }
 
-export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected = false }: {
+export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn, alreadyConnected = false, extra }: {
   listing: Listing; onConnect: (l: Listing) => void; currentUserId: string; onEditOwn: () => void
   alreadyConnected?: boolean
+  // Optional badges under the route, e.g. a driver's match score for a passenger.
+  extra?: ReactNode
 }) {
   const isDriver = listing.type === 'driver'
   const freeSeats = isDriver ? (listing.seats! - (listing.seatsUsed ?? 0)) : 0
@@ -254,6 +256,8 @@ export function MobileListingCard({ listing, onConnect, currentUserId, onEditOwn
         <ArrowRight className="size-3 text-muted-foreground shrink-0" />
         <span className="font-semibold text-foreground truncate">{listing.to}</span>
       </div>
+
+      {extra}
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         {!isDriver && (
