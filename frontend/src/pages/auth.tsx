@@ -8,7 +8,7 @@ const SERIF: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans
 const FEATURES = [
   { Icon: MapPin, title: 'Nearby matches', desc: 'Rides near your location' },
   { Icon: Fuel,   title: 'Gas split',      desc: 'Automated cost sharing'  },
-  { Icon: Shield, title: 'Verified riders', desc: 'Email-verified community' },
+  { Icon: Shield, title: 'Verified passengers', desc: 'Email-verified community' },
 ] as const
 
 const INPUT = 'w-full rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none focus:border-primary'
@@ -110,7 +110,7 @@ export function Auth() {
             <Car className="size-6 text-primary-foreground" />
           </div>
           <h1 style={SERIF} className="text-3xl sm:text-4xl text-foreground leading-tight">Let's Carpool</h1>
-          <p className="mt-1.5 text-sm text-muted-foreground">Connect with drivers and riders near you.</p>
+          <p className="mt-1.5 text-sm text-muted-foreground">Connect with drivers and passengers near you.</p>
         </div>
 
         {/* Auth card */}

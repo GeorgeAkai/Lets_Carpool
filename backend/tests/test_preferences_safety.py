@@ -152,7 +152,10 @@ def test_completing_a_ride_writes_a_receipt_with_the_settle_up_method() -> None:
     assert receipt["receipt_number"].startswith("CP-")
     assert receipt["driver_name"] == "Dee Driver"
     assert receipt["seats"] == 2
-    assert receipt["amount_cents"] == receipt["price_per_seat_cents"] * 2
+    # The receipt records the fare settled on completion.
+    fare = next(c for c in api.get("/me/connections", headers=rider_headers).json() if c["id"] == conn["id"])["fare"]
+    assert fare["status"] == "paid" and receipt["amount_cents"] == fare["amount_cents"]
+    assert receipt["price_per_seat_cents"] == round(receipt["amount_cents"] / 2)
     assert receipt["settlement_method"] == "venmo"
     assert api.get(f"/connections/{conn['id']}/receipt", headers=driver_headers).json()["id"] == receipt["id"]
     _, outsider_headers = auth(api, "outsider@example.com", "Out Sider")

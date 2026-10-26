@@ -64,7 +64,7 @@ export type ApiDriverTrip = {
   luggage_capacity: string;
   car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the trip; only set on corridor searches
+  // Minutes this passenger would add to the trip; only set on corridor searches
   // (search with both pickup and destination coordinates).
   detour_minutes?: number | null;
   vibes?: RideVibe[];
@@ -101,8 +101,12 @@ export type ApiRideRequest = {
   luggage_size: string;
   preferred_car_type: string | null;
   notes: string | null;
-  // Minutes this rider would add to the driver's trip; only set on driver-side proposals.
+  // Minutes this passenger would add to the driver's trip; only set on driver-side proposals.
   detour_minutes?: number | null;
+  // Driver-side matches: metres from the passenger's pickup to the trip's route,
+  // and a 0-100 match score.
+  off_route_m?: number | null;
+  match_score?: number | null;
   departure_time?: string | null;
   rider_stats?: UserStats;
 };
@@ -129,6 +133,18 @@ export type ApiConnection = {
   pin_verified_at?: string | null;
   // How the driver would like the gas split settled (accepted/completed rides).
   settlement?: SettlementPreference | null;
+  // Driver confirmed the passenger is in the car — the ride is en route.
+  picked_up_at?: string | null;
+  // Automatic fare: an estimate until the ride completes, then "paid".
+  fare?: ApiFare;
+};
+
+export type ApiFare = {
+  amount_cents: number;
+  currency: string;
+  distance_km: number;
+  passengers: number;
+  status: "estimated" | "paid";
 };
 
 export type ApiProfile = {
@@ -264,6 +280,7 @@ export type WsMessage =
   | { type: "chat_message"; connection_id: string; message: ApiMessage }
   | { type: "connection_update"; connection_id: string; status: string }
   | { type: "pickup_updated"; connection_id: string }
+  | { type: "notification"; notification: ApiNotification }
   | { type: "driver_nearby"; user_id: string; display_name: string; latitude: number; longitude: number; heading: number | null; car_type: string | null }
   | { type: "pong" };
 
@@ -304,6 +321,9 @@ function createWebSocket(userId: string, onMessage: (msg: WsMessage) => void): W
 // changes arrive within ~20s, which is fine outside localhost (where the
 // WebSocket gives instant updates).
 export const POLL_INTERVAL_MS = 20000;
+// While a request is waiting on an answer, poll faster so accept/decline
+// shows up within seconds instead of up to POLL_INTERVAL_MS.
+export const PENDING_POLL_INTERVAL_MS = 5000;
 
 export type RealtimeStrategy = "websocket" | "polling";
 
@@ -319,6 +339,10 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
   let primed = false;
   let stopped = false;
   let running = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const nextDelay = () =>
+    [...statuses.values()].includes("pending") ? PENDING_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+  const schedule = () => { if (!stopped) timer = setTimeout(() => void poll().finally(schedule), nextDelay()); };
 
   const poll = async () => {
     if (stopped || running || document.hidden) return;
@@ -340,6 +364,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
         if (seenNotifications.has(n.id)) continue;
         seenNotifications.add(n.id);
         if (primed && n.type === "chat_message" && n.related_id) chatConnectionIds.add(n.related_id);
+        else if (primed) events.push({ type: "notification", notification: n });
       }
       for (const connectionId of chatConnectionIds) {
         const messages = await getMessages(connectionId);
@@ -353,12 +378,11 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
     finally { running = false; }
   };
 
-  void poll();
-  const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+  void poll().finally(schedule);
   const onVisible = () => { if (!document.hidden) void poll(); };
   document.addEventListener("visibilitychange", onVisible);
   return {
-    close: () => { stopped = true; clearInterval(timer); document.removeEventListener("visibilitychange", onVisible); },
+    close: () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); },
   };
 }
 
@@ -447,8 +471,10 @@ export function suggestRoute(
 
 // ─── Locations ────────────────────────────────────────────────────────────────
 
-export function createLocation(label: string, latitude: number, longitude: number): Promise<LocationView> {
-  return request<LocationView>("POST", "/locations", { label, latitude, longitude });
+// `isGeneral`: the point stands for a whole area (a city), not an address, so
+// searches treat it as the surrounding area rather than a pin.
+export function createLocation(label: string, latitude: number, longitude: number, isGeneral = false): Promise<LocationView> {
+  return request<LocationView>("POST", "/locations", { label, latitude, longitude, ...(isGeneral ? { is_general: true } : {}) });
 }
 
 // ─── Driver trips ─────────────────────────────────────────────────────────────
@@ -480,7 +506,7 @@ export function createDriverTrip(data: {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
 
-// "Each rider pays" while the driver is still filling in the form.
+// "Each passenger pays" while the driver is still filling in the form.
 export function previewTripPrice(pickupLocationId: string, destinationLocationId: string, seatsAvailable: number): Promise<TripPricing & { duration_minutes: number }> {
   return request("POST", "/driver-trips/price-preview", {
     pickup_location_id: pickupLocationId, destination_location_id: destinationLocationId, seats_available: seatsAvailable,
@@ -489,6 +515,26 @@ export function previewTripPrice(pickupLocationId: string, destinationLocationId
 
 export function cancelDriverTrip(tripId: string): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/cancel`);
+}
+
+export function pauseDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/pause`);
+}
+
+export function resumeDriverTrip(tripId: string): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("POST", `/driver-trips/${tripId}/resume`);
+}
+
+export type DriverTripEdit = {
+  target_date?: string;
+  flexibility?: string;
+  seats_available?: number;
+  departure_time?: string | null;
+  notes?: string | null;
+};
+
+export function updateDriverTrip(tripId: string, edit: DriverTripEdit): Promise<ApiDriverTrip> {
+  return request<ApiDriverTrip>("PATCH", `/driver-trips/${tripId}`, edit);
 }
 
 export function getMyDriverTrips(): Promise<ApiDriverTrip[]> {
@@ -558,6 +604,10 @@ export type ApiDriverProposal = { request: ApiRideRequest | null; remaining: num
 
 export function getDriverTripProposal(driverTripId: string): Promise<ApiDriverProposal> {
   return request<ApiDriverProposal>("GET", `/driver-trips/${driverTripId}/proposal`);
+}
+
+export function getDriverTripMatches(driverTripId: string): Promise<ApiRideRequest[]> {
+  return request<ApiRideRequest[]>("GET", `/driver-trips/${driverTripId}/matches`);
 }
 
 export function skipDriverTripProposal(driverTripId: string, rideRequestId: string): Promise<{ status: string }> {
@@ -684,6 +734,8 @@ export function rateConnection(connectionId: string, stars: number, comment?: st
 export type TripDayStatus = {
   connection_id: string;
   pickup: { label: string; latitude: number; longitude: number };
+  destination: { label: string; latitude: number; longitude: number };
+  picked_up_at: string | null;
   departure_time: string | null;
   driver: { latitude: number; longitude: number; updated_at: string; distance_to_pickup_m: number; eta_minutes: number } | null;
   rider_at_pickup_at: string | null;
@@ -691,6 +743,10 @@ export type TripDayStatus = {
 
 export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {
   return request("GET", `/connections/${connectionId}/live`);
+}
+
+export function markPickedUp(connectionId: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/picked-up`);
 }
 
 export function markAtPickup(connectionId: string): Promise<ApiConnection> {

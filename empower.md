@@ -23,7 +23,7 @@ detours.
   1. **Search**: manual, symmetric, endpoint-radius only — PostGIS `ST_DWithin` around the
      destination and pickup points separately (`_geo_search_clauses`,
      `backend/app/domain.py:817-842`), plus exact-match filters (date, tag, seats, car type,
-     luggage). Riders and drivers browse each other and manually request/offer a
+     luggage). Passengers and drivers browse each other and manually request/offer a
      `Connection`, which the other side accepts/declines.
   2. **"Best Matches" ranking** (`frontend/src/pages/home.tsx:541`): a client-side scoring
      layer on top of search results — 45% date/flexibility closeness, 40% shared profile
@@ -110,7 +110,7 @@ WHERE dt.status IN ('open', 'matched')
   AND dt.route_geog IS NOT NULL
   AND ST_DWithin(dt.route_geog, rider_pickup.geog, %(buffer_m)s)
   AND ST_DWithin(dt.route_geog, rider_dest.geog, %(buffer_m)s)
-  -- direction guard: rider's dest must be *ahead* of their pickup along the driver's line,
+  -- direction guard: passenger's dest must be *ahead* of their pickup along the driver's line,
   -- not behind it — cheap check via ST_LineLocatePoint fractions
   AND ST_LineLocatePoint(dt.route_geog::geometry, rider_pickup.geog::geometry)
     < ST_LineLocatePoint(dt.route_geog::geometry, rider_dest.geog::geometry)
@@ -119,7 +119,7 @@ WHERE dt.status IN ('open', 'matched')
 `buffer_m` ~800m-1.5km (tune later). The `ST_LineLocatePoint` ordering check is what stops
 matching a driver going the opposite direction on the same road — the current endpoint-radius
 filter has no concept of direction at all, which is a real correctness gap today (a driver
-headed away from downtown and a rider headed into downtown along the same corridor could
+headed away from downtown and a passenger headed into downtown along the same corridor could
 currently both pass the existing radius filter).
 
 This runs cheaply with the GIST index and keeps the candidate set small — same role
@@ -144,7 +144,7 @@ def detour_minutes(trip: DriverTrip, rider_pickup: Location, rider_dest: Locatio
 ```
 
 This is the actual Empower-equivalent number: minutes added to the driver's trip by picking
-this rider up. Expose it from `search_driver_trips` / a new `/driver-trips/{id}/match-score`
+this passenger up. Expose it from `search_driver_trips` / a new `/driver-trips/{id}/match-score`
 endpoint as `detour_minutes`.
 
 ### 4. Replace the scoring formula in `home.tsx`

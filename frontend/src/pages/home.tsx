@@ -3,10 +3,10 @@ import React, {
   useId,
 } from 'react'
 import {
-  MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle,
+  MapPin, Calendar, Users, Car, Search, ArrowRight, MessageCircle, Pencil, Pause, Play,
   Check, X, Fuel, ChevronRight, Dot, Bell, LogOut,
   Send, MoreHorizontal, Flag, UserX, UserPlus,
-  ClipboardList, Shield, Map, Package, Camera, Moon, Sun, PlusCircle, User, Navigation,
+  ClipboardList, Shield, Map, Package, Volume2, VolumeX, Camera, Moon, Sun, PlusCircle, User, Navigation,
   ChevronLeft, Copy, Settings2, ShieldCheck, User as UserIcon, Archive, Home as HomeIcon,
 } from 'lucide-react'
 import { motion } from 'motion/react'
@@ -15,28 +15,32 @@ import { useTheme } from 'next-themes'
 import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
+import { searchPlaces, reverseGeocode, autocompletePlaces } from '../lib/googleMaps'
+import type { PlaceResult } from '../lib/googleMaps'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
+import { IncomingRequests } from './incoming-requests'
 import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
+import { playSound, soundForNotification, installSoundUnlock, isMuted, setMuted } from '../lib/sounds'
 import {
-  HomeScreen, ResultsScreen, RideDetailScreen, TripDayScreen, OfferRideScreen, StarRating, fmtTime,
+  HomeScreen, ResultsScreen, RideDetailScreen, FindRideScreen, TripDayScreen, OfferRideScreen, RideOutcome, RideCompleteSheet, fmtTime, fmtMoney,
   defaultRideSearch, pickNextTrip, type RideSearch,
 } from './ride-flow'
 import {
   MobileSearchBar, MobileFilterBar, FilterSheet, MobileListingCard, SectionHeader,
-  ViewToggleFab, OfferRideFab,
+  ViewToggleFab, OfferRideFab, BottomSheet,
 } from './discover-mobile'
 import { AdminView } from './admin'
 import {
-  PreferencesScreen, ProfileHub, ReceiptScreen, RequestStatusScreen, SafetyScreen, WelcomeScreen,
+  PreferencesScreen, ProfileHub, ReceiptScreen, SafetyScreen, WelcomeScreen,
 } from './account-screens'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
-  | 'results' | 'ride' | 'trip' | 'offer' | 'preferences' | 'safety' | 'receipt' | 'request'
+  | 'results' | 'ride' | 'trip' | 'offer' | 'finding' | 'preferences' | 'safety' | 'receipt'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -52,8 +56,8 @@ export interface Listing {
   tags: RideTag[]; vehicle?: string; carType?: CarType; luggageSize?: LuggageSize
   luggageCapacity?: LuggageSize; status: 'open' | 'matched'; postedAt: string
   notes?: string | null
-  // Minutes this rider would add to the driver's trip; undefined when the
-  // listing isn't on the rider's route corridor (or no route to compare to).
+  // Minutes this passenger would add to the driver's trip; undefined when the
+  // listing isn't on the passenger's route corridor (or no route to compare to).
   detourMinutes?: number | null
 }
 
@@ -103,47 +107,19 @@ export interface LocationValue {
   label: string
   lat: number
   lng: number
+  // A whole city/area rather than a street address (drivers may pick these).
+  general?: boolean
 }
 
 // ─── Location autocomplete ────────────────────────────────────────────────────
 
-interface NominatimResult {
-  place_id: number
-  display_name: string
-  name: string
-  lat: string
-  lon: string
-  address?: { city?: string; town?: string; village?: string; state?: string; country?: string }
-}
-
-export async function reverseGeocode(lat: number, lng: number): Promise<string> {
-  try {
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`,
-      { headers: { 'Accept-Language': 'en' } },
-    )
-    const data: NominatimResult = await res.json()
-    const label = shortLabel(data)
-    return label || 'My location'
-  } catch {
-    return 'My location'
-  }
-}
-
-function shortLabel(r: NominatimResult): string {
-  const parts = [r.name || r.display_name.split(',')[0]]
-  const a = r.address ?? {}
-  const city = a.city ?? a.town ?? a.village
-  if (city) parts.push(city)
-  if (a.state) parts.push(a.state)
-  // formatPlace drops the repeat when the place *is* the city ("Sacramento,
-  // Sacramento, California" → "Sacramento, CA").
-  return formatPlace(parts.filter(Boolean).join(', '))
-}
+export { reverseGeocode }
 
 export function LocationInput({
-  label, value, onChange, placeholder, required, nearCoords, variant = 'form',
+  label, value, onChange, placeholder, required, nearCoords, variant = 'form', requireExact = false,
 }: {
+  // Passengers must pick a street address or named place, not a city or region.
+  requireExact?: boolean
   // 'bare': borderless field with a small caption, for the Home search card.
   variant?: 'form' | 'bare'
   label: string
@@ -154,9 +130,10 @@ export function LocationInput({
   nearCoords?: { lat: number; lng: number } | null
 }) {
   const [query, setQuery] = useState(value?.label ?? '')
-  const [suggestions, setSuggestions] = useState<NominatimResult[]>([])
+  const [suggestions, setSuggestions] = useState<PlaceResult[]>([])
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [notExact, setNotExact] = useState(false)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const listboxId = useId()
@@ -171,25 +148,17 @@ export function LocationInput({
     debounceRef.current = setTimeout(async () => {
       setLoading(true)
       try {
-        // Bias (not restrict) toward the user's area: a ~1° box (~100km) around
-        // their location tells Nominatim to rank local matches higher, without
-        // `bounded=1` — which would hide a deliberate search for a far-away
-        // place entirely. The client-side distance sort below is what actually
-        // guarantees the nearest match comes first, since viewbox alone is only
-        // a soft hint and a same-named city on the other side of the world can
-        // still outrank it on Nominatim's own "importance" score.
-        const viewbox = nearCoords
-          ? `&viewbox=${nearCoords.lng - 1},${nearCoords.lat + 1},${nearCoords.lng + 1},${nearCoords.lat - 1}`
-          : ''
-        const res = await fetch(
-          `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=6&addressdetails=1${viewbox}`,
-          { headers: { 'Accept-Language': 'en' } },
-        )
-        const data: NominatimResult[] = await res.json()
-        if (nearCoords) {
+        // Google geocoding biased (not restricted) toward the user's area; the
+        // distance sort guarantees the nearest match comes first, since bias is
+        // only a soft hint. Falls back to Nominatim if Google is unavailable.
+        // Places autocomplete gives as-you-type street addresses; plain
+        // geocoding is the fallback when it isn't enabled for the key.
+        const predictions = await autocompletePlaces(q, nearCoords)
+        const data = predictions ?? await searchPlaces(q, nearCoords)
+        if (nearCoords && !predictions) {
           data.sort((a, b) =>
-            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(a.lat), parseFloat(a.lon)]) -
-            distanceMeters([nearCoords.lat, nearCoords.lng], [parseFloat(b.lat), parseFloat(b.lon)]),
+            distanceMeters([nearCoords.lat, nearCoords.lng], [a.lat, a.lng]) -
+            distanceMeters([nearCoords.lat, nearCoords.lng], [b.lat, b.lng]),
           )
         }
         setSuggestions(data)
@@ -210,12 +179,22 @@ export function LocationInput({
     return () => document.removeEventListener('mousedown', handler)
   }, [])
 
-  const select = (r: NominatimResult) => {
-    const lbl = shortLabel(r)
-    setQuery(lbl)
-    onChange({ label: lbl, lat: parseFloat(r.lat), lng: parseFloat(r.lon) })
+  const select = async (picked: PlaceResult) => {
     setOpen(false)
     setSuggestions([])
+    setQuery(picked.label)
+    let r = picked
+    if (r.resolve) {
+      setLoading(true)
+      try { r = await r.resolve() } catch { setNotExact(false); setLoading(false); return } finally { setLoading(false) }
+    }
+    if (requireExact && r.exact === false) {
+      setNotExact(true)
+      onChange(null)
+      return
+    }
+    setNotExact(false)
+    onChange({ label: r.label, lat: r.lat, lng: r.lng, general: r.exact === false })
   }
 
   const bare = variant === 'bare'
@@ -235,6 +214,7 @@ export function LocationInput({
           aria-expanded={open}
           onChange={e => {
             setQuery(e.target.value)
+            setNotExact(false)
             onChange(null)
             search(e.target.value)
           }}
@@ -254,7 +234,7 @@ export function LocationInput({
             className="absolute z-50 top-full mt-1.5 w-full bg-card border border-border rounded-2xl shadow-xl overflow-hidden"
           >
             {suggestions.map(r => (
-              <li key={r.place_id} role="option" aria-selected={false}>
+              <li key={r.id} role="option" aria-selected={false}>
                 <button
                   type="button"
                   onMouseDown={e => { e.preventDefault(); select(r) }}
@@ -262,8 +242,8 @@ export function LocationInput({
                 >
                   <MapPin className="size-3.5 text-primary shrink-0 mt-0.5" />
                   <div className="min-w-0">
-                    <p className="font-medium text-foreground truncate">{shortLabel(r)}</p>
-                    <p className="text-xs text-muted-foreground truncate mt-0.5">{r.display_name}</p>
+                    <p className="font-medium text-foreground truncate">{r.label}</p>
+                    <p className="text-xs text-muted-foreground truncate mt-0.5">{r.detail}</p>
                   </div>
                 </button>
               </li>
@@ -271,6 +251,11 @@ export function LocationInput({
           </ul>
         )}
       </div>
+      {notExact && (
+        <p role="alert" className="text-xs text-destructive">
+          That's a general area. Enter a full street address (number and street) or a named place so your driver can find you.
+        </p>
+      )}
     </div>
   )
 }
@@ -285,6 +270,9 @@ export const FLEX_LABEL: Record<Flexibility, string> = {
 export const FLEX_DOT: Record<Flexibility, string> = {
   morning: 'bg-amber-500', afternoon: 'bg-blue-600', evening: 'bg-violet-600', flexible: 'bg-emerald-600',
 }
+
+// One-tap replies once chat is unlocked, for the usual pickup coordination.
+const QUICK_REPLIES = ['On my way 🚗', "I'm here", 'Running a few minutes late', 'Where exactly should we meet?', 'Thanks!']
 
 const CANNED_MESSAGES: Record<string, string> = {
   timing: 'Can we coordinate the exact timing?',
@@ -395,7 +383,7 @@ export function todayLocalISO(): string {
 // Upcoming = still bookable (open/matched) and not already in the past;
 // everything else (cancelled, completed, expired, or a stale date) is archive.
 function isActiveListing(l: MyListing): boolean {
-  return (l.status === 'open' || l.status === 'matched') && l.date >= todayLocalISO()
+  return (l.status === 'open' || l.status === 'paused' || l.status === 'matched') && l.date >= todayLocalISO()
 }
 
 export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId: string): Connection {
@@ -431,20 +419,6 @@ export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId
 }
 
 // ─── Small utility components ─────────────────────────────────────────────────
-
-// Gas saved this month on completed rides you took as a rider: what driving
-// solo would have cost minus the seat price you paid.
-function monthSavings(connections: Connection[]): { cents: number; trips: number } {
-  const month = todayLocalISO().slice(0, 7)
-  let cents = 0, trips = 0
-  for (const c of connections) {
-    const p = c.raw?.driver_trip.pricing
-    if (c.status !== 'completed' || c.myRole !== 'rider' || !c.date.startsWith(month) || !p) continue
-    cents += Math.max(0, p.gas_cost_cents - p.price_per_seat_cents)
-    trips += 1
-  }
-  return { cents, trips }
-}
 
 export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'card' | 'lg'; photoUrl?: string | null }) {
   const cls = { sm: 'size-7 text-xs', md: 'size-9 text-sm', 'card': 'size-10 text-sm', lg: 'size-14 text-xl' }[size]
@@ -496,6 +470,7 @@ function ConnStatusBadge({ status }: { status: ConnStatus }) {
 function ListingStatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
     open:      'bg-green-500/15 text-green-700 dark:text-green-400',
+    paused:    'bg-amber-500/15 text-amber-700 dark:text-amber-400',
     matched:   'bg-primary/10 text-primary',
     expired:   'bg-muted text-muted-foreground',
     cancelled: 'bg-red-500/10 text-red-600 dark:text-red-400',
@@ -540,6 +515,8 @@ function NotePreview({ notes }: { notes: string }) {
   )
 }
 
+// Quick-reply chips in the chat composer: outlined pills that read as tappable.
+const CHIP_BTN = 'shrink-0 inline-flex items-center min-h-9 px-3.5 py-1.5 rounded-full border border-primary/40 bg-card text-sm font-medium text-primary cursor-pointer select-none hover:bg-primary hover:text-primary-foreground active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 disabled:cursor-not-allowed transition-all'
 const CHIP = 'text-xs px-2 py-0.5 rounded-full font-medium bg-muted text-muted-foreground'
 const GHOST_BTN = 'inline-flex items-center gap-1.5 rounded-xl border border-border bg-card px-3 py-2 text-xs font-semibold text-foreground hover:bg-muted disabled:opacity-60 transition-colors'
 
@@ -558,7 +535,7 @@ function Toast({ toast }: { toast: { message: string; type: 'success' | 'error' 
 
 // Detour is computed server-side from the driver's real route, so the card can
 // say how much a pickup costs the driver without ever receiving exact pins.
-// Only listings inside the rider's route corridor carry a value, and the
+// Only listings inside the passenger's route corridor carry a value, and the
 // corridor check is direction-aware — hence "same direction".
 function DetourBadge({ minutes }: { minutes: number | null | undefined }) {
   if (minutes == null) return null
@@ -653,17 +630,17 @@ function ListingCard({ listing, onConnect, currentUserId, alreadyConnected }: { 
 // ─── Algorithmic match ranking ─────────────────────────────────────────────────
 //
 // Ranks candidates using signals that are available pre-connection. The dominant
-// one, when the rider has an open request with coordinates, is the server-computed
-// detour (minutes added to the driver's trip by picking this rider up) — the
+// one, when the passenger has an open request with coordinates, is the server-computed
+// detour (minutes added to the driver's trip by picking this passenger up) — the
 // backend does the route math, so exact pins are never sent to the client. The
 // rest are tie-breakers: closeness of target date and flexibility window, shared
-// profile interests and verified status. Without a rider reference (e.g. driver
+// profile interests and verified status. Without a passenger reference (e.g. driver
 // mode) there's no detour signal and the original three-term score is used.
 
 const DETOUR_CUTOFF_MIN = 15
 
 function detourScore(detourMinutes: number | null | undefined): number {
-  if (detourMinutes == null) return 0 // not on the rider's route corridor
+  if (detourMinutes == null) return 0 // not on the passenger's route corridor
   return Math.min(Math.max(1 - detourMinutes / DETOUR_CUTOFF_MIN, 0), 1)
 }
 
@@ -877,8 +854,8 @@ function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
 
 // ─── Proposed match (Empower-style) ─────────────────────────────────────────────
 //
-// For a rider with an open request, the server picks the single best driver trip
-// (lowest detour on the corridor, then date/flexibility). The rider either
+// For a passenger with an open request, the server picks the single best driver trip
+// (lowest detour on the corridor, then date/flexibility). The passenger either
 // requests it — the normal pending Connection, driver still accepts/declines —
 // or skips it and gets the next one. Skips are remembered per request.
 
@@ -970,7 +947,7 @@ function ProposedRider({ trip, onAccepted, showToast }: {
   }, [trip.id])
   useEffect(() => { load() }, [load])
 
-  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best rider…</p>
+  if (loading && !proposal) return <p className="text-sm text-muted-foreground animate-pulse">Finding your best passenger…</p>
   const req = proposal?.request
   if (!req) return null
   const listing = { ...requestToListing(req), detourMinutes: req.detour_minutes ?? undefined }
@@ -990,8 +967,8 @@ function ProposedRider({ trip, onAccepted, showToast }: {
   return (
     <div className="rounded-3xl border border-primary/30 bg-primary/5 p-5 space-y-4">
       <div>
-        <h2 className="text-lg font-semibold text-foreground">Your best rider</h2>
-        <p className="text-sm text-muted-foreground mt-0.5">The rider along your route who adds the least time.</p>
+        <h2 className="text-lg font-semibold text-foreground">Your best passenger</h2>
+        <p className="text-sm text-muted-foreground mt-0.5">The passenger along your route who adds the least time.</p>
       </div>
       <div className="flex items-center gap-3">
         <Avatar initials={listing.user.initials} photoUrl={listing.user.photoUrl} />
@@ -1055,15 +1032,165 @@ function BestMatches({ listings, referenceListing, currentUserId, currentUserInt
 
 // ─── Driver-mode home ───────────────────────────────────────────────────────────
 
+// ─── Published-trip quick actions (Edit · Pause · Cancel) ─────────────────────
+
+export interface TripActions {
+  onEdit: (trip: MyListing, edit: api.DriverTripEdit) => Promise<void>
+  onPause: (trip: MyListing) => Promise<void>
+  onResume: (trip: MyListing) => Promise<void>
+  onCancel: (trip: MyListing) => Promise<void>
+}
+
+function EditTripSheet({ trip, onSave, onClose }: {
+  trip: MyListing; onSave: (edit: api.DriverTripEdit) => Promise<void>; onClose: () => void
+}) {
+  const minSeats = Math.max(1, trip.seatsReserved ?? 0)
+  const [date, setDate] = useState(trip.date)
+  const [flexibility, setFlexibility] = useState<Flexibility>(trip.flexibility)
+  const [seats, setSeats] = useState(trip.seats ?? 1)
+  const [notes, setNotes] = useState(trip.notes ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const optionCls = (active: boolean) => `px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${active ? 'bg-primary text-primary-foreground border-primary' : 'bg-input-background text-muted-foreground border-border hover:text-foreground'}`
+  const save = async () => {
+    setSaving(true); setError('')
+    try { await onSave({ target_date: date, flexibility, seats_available: seats, notes: notes.trim() || null }); onClose() }
+    catch (e) { setError(e instanceof Error ? e.message : 'Could not save changes'); setSaving(false) }
+  }
+  return (
+    <BottomSheet open onClose={onClose} title="Edit trip">
+      <p className="text-sm text-muted-foreground -mt-2">{trip.from} → {trip.to}. To change the route, post a new trip.</p>
+      <div className="space-y-1.5">
+        <label htmlFor="edit-trip-date" className="text-sm font-semibold">Date</label>
+        <input id="edit-trip-date" type="date" min={todayLocalISO()} value={date} onChange={e => setDate(e.target.value)}
+          className="w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm" />
+      </div>
+      <div className="space-y-1.5">
+        <span className="text-sm font-semibold">Flexibility</span>
+        <div className="flex gap-2 flex-wrap" role="radiogroup" aria-label="Flexibility">
+          {(Object.entries(FLEX_LABEL) as [Flexibility, string][]).map(([k, l]) => (
+            <button key={k} type="button" role="radio" aria-checked={flexibility === k} onClick={() => setFlexibility(k)} className={optionCls(flexibility === k)}>{l}</button>
+          ))}
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <span className="text-sm font-semibold" id="edit-seats-label">Seats available</span>
+        <div className="flex items-center gap-3" role="group" aria-labelledby="edit-seats-label">
+          <button type="button" aria-label="Fewer seats" disabled={seats <= minSeats} onClick={() => setSeats(seats - 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold disabled:opacity-40">−</button>
+          <span style={MONO} className="w-8 text-center text-xl font-bold">{seats}</span>
+          <button type="button" aria-label="More seats" disabled={seats >= 8} onClick={() => setSeats(seats + 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold disabled:opacity-40">+</button>
+          {minSeats > 1 && <span className="text-xs text-muted-foreground">{trip.seatsReserved} already booked</span>}
+        </div>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor="edit-trip-notes" className="text-sm font-semibold">Note for passengers</label>
+        <textarea id="edit-trip-notes" rows={3} maxLength={500} value={notes} onChange={e => setNotes(e.target.value)}
+          className="w-full px-4 py-3 rounded-xl bg-input-background border border-border text-sm resize-none" />
+      </div>
+      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      <button type="button" onClick={save} disabled={saving || !date}
+        className="w-full py-3 rounded-xl bg-primary text-primary-foreground text-sm font-bold disabled:opacity-60">{saving ? 'Saving…' : 'Save changes'}</button>
+    </BottomSheet>
+  )
+}
+
+function TripQuickActions({ trip, actions, onDark = false, showCancel = true }: { trip: MyListing; actions: TripActions; onDark?: boolean; showCancel?: boolean }) {
+  const [editing, setEditing] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const paused = trip.status === 'paused'
+  const btn = onDark
+    ? 'inline-flex items-center gap-1.5 rounded-xl bg-white/15 px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-white/25 disabled:opacity-60 transition-colors'
+    : GHOST_BTN
+  const run = async (fn: () => Promise<void>) => { setBusy(true); try { await fn() } finally { setBusy(false); setConfirming(false) } }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Trip actions">
+      <button type="button" onClick={() => setEditing(true)} disabled={busy} className={btn}><Pencil className="size-3.5" />Edit</button>
+      <button type="button" onClick={() => run(() => paused ? actions.onResume(trip) : actions.onPause(trip))} disabled={busy} className={btn}>
+        {paused ? <><Play className="size-3.5" />Resume</> : <><Pause className="size-3.5" />Pause</>}
+      </button>
+      {showCancel && (confirming ? (
+        <span className="inline-flex items-center gap-1.5">
+          <button type="button" onClick={() => setConfirming(false)} disabled={busy} className={btn}>Keep trip</button>
+          <button type="button" onClick={() => run(() => actions.onCancel(trip))} disabled={busy} className="inline-flex items-center gap-1.5 rounded-xl bg-destructive px-3 py-2 text-xs font-semibold text-white disabled:opacity-60">
+            {busy ? 'Cancelling…' : 'Confirm cancel'}
+          </button>
+        </span>
+      ) : (
+        <button type="button" onClick={() => setConfirming(true)} disabled={busy} className={btn}><X className="size-3.5" />Cancel</button>
+      ))}
+      {editing && <EditTripSheet trip={trip} onClose={() => setEditing(false)} onSave={edit => actions.onEdit(trip, edit)} />}
+    </div>
+  )
+}
+
+// The driver's published trip, pinned above everything else on Discover.
+function ActiveTripCard({ trip, actions }: { trip: MyListing; actions: TripActions }) {
+  const paused = trip.status === 'paused'
+  return (
+    <section aria-label="Your active trip" className={`rounded-2xl p-5 shadow-lg ${paused ? 'bg-muted text-foreground border border-border' : 'bg-primary text-primary-foreground shadow-primary/25'}`}>
+      <div className="flex items-center justify-between gap-3">
+        <span className={`text-xs font-semibold uppercase tracking-wide ${paused ? 'text-muted-foreground' : 'text-primary-foreground/70'}`}>Active trip</span>
+        <span className={`text-[11px] font-semibold px-2.5 py-1 rounded-full ${paused ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300' : 'bg-white/15'}`}>{paused ? 'Paused · hidden from passengers' : 'Open'}</span>
+      </div>
+      <div className="flex items-center gap-2 mt-3 text-lg font-semibold">
+        <span className="truncate">{trip.from}</span>
+        <ArrowRight className="size-4 opacity-60 shrink-0" />
+        <span className="truncate">{trip.to}</span>
+      </div>
+      <div className={`flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-sm ${paused ? 'text-muted-foreground' : 'text-primary-foreground/80'}`}>
+        <span className="flex items-center gap-1.5"><Calendar className="size-3.5" />{trip.date}</span>
+        <span className="flex items-center gap-1.5"><Users className="size-3.5" />{(trip.seats ?? 0) - (trip.seatsReserved ?? 0)} of {trip.seats} seat{trip.seats !== 1 ? 's' : ''} free</span>
+      </div>
+      <div className="mt-4"><TripQuickActions trip={trip} actions={actions} onDark={!paused} /></div>
+    </section>
+  )
+}
+
+// Per-passenger route fit for a driver's trip: how long the pickup adds, how far
+// off the route it is, and an overall match score.
+interface RiderFit { detourMinutes: number | null; offRouteM: number | null; score: number | null }
+
+function useRiderFits(trip: MyListing | undefined): Record<string, RiderFit> {
+  const [fits, setFits] = useState<Record<string, RiderFit>>({})
+  const tripId = trip?.status === 'open' ? trip.id : null
+  useEffect(() => {
+    if (!tripId) { setFits({}); return }
+    let cancelled = false
+    api.getDriverTripMatches(tripId)
+      .then(rows => { if (!cancelled) setFits(Object.fromEntries(rows.map(r => [r.id, { detourMinutes: r.detour_minutes ?? null, offRouteM: r.off_route_m ?? null, score: r.match_score ?? null }]))) })
+      .catch(() => { if (!cancelled) setFits({}) })
+    return () => { cancelled = true }
+  }, [tripId])
+  return fits
+}
+
+function RiderFitBadges({ fit }: { fit: RiderFit | undefined }) {
+  if (!fit) return null
+  const off = fit.offRouteM
+  return (
+    <div className="flex flex-wrap items-center gap-1.5" aria-label="Route fit">
+      {fit.score != null && <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">{fit.score}% match</span>}
+      {fit.detourMinutes != null && (
+        <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-secondary text-secondary-foreground">
+          {fit.detourMinutes < 1 ? 'On your way' : `+${Math.round(fit.detourMinutes)} min detour`}
+        </span>
+      )}
+      {off != null && <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-muted text-muted-foreground">{off < 100 ? 'On route' : off < 1000 ? `${Math.round(off / 10) * 10} m off route` : `${(off / 1000).toFixed(1)} km off route`}</span>}
+    </div>
+  )
+}
+
 function DriverHomeView({
-  myOpenTrip, listings, currentUserId, currentUserInterests, onConnect, onProposalAccepted, showToast, setView,
+  myOpenTrip, tripActions, listings, currentUserId, currentUserInterests, onConnect, onProposalAccepted, showToast, setView,
   searchQuery, setSearchQuery, filterType, setFilterType, filterTag, setFilterTag,
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen, hasLocation, connectedListingIds,
 }: {
   hasLocation: boolean
-  myOpenTrip: MyListing | undefined; listings: Listing[]
+  myOpenTrip: MyListing | undefined; tripActions: TripActions; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<unknown>; showToast: (msg: string, type: 'success' | 'error') => void
   onProposalAccepted: (conn: api.ApiConnection) => void
@@ -1079,11 +1206,18 @@ function DriverHomeView({
   connectedListingIds: Set<string>
 }) {
   const candidates = useMemo(() => listings.filter(l => l.type === 'rider'), [listings])
-  const { matches, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
+  const { matches: ranked, loading } = useRankedMatches(candidates, myOpenTrip, currentUserId, currentUserInterests)
   const isMobile = useIsMobile()
+  // Route fit (match score, detour, distance off route) from the server, which
+  // knows the trip's real route; passengers it scored best come first.
+  const fits = useRiderFits(myOpenTrip)
+  const matches = useMemo(
+    () => Object.keys(fits).length === 0 ? ranked : [...ranked].sort((a, b) => (fits[b.listing.apiId]?.score ?? -1) - (fits[a.listing.apiId]?.score ?? -1)),
+    [ranked, fits],
+  )
 
   // Mobile-only: candidates are always ride requests (type 'rider'), so the
-  // vehicle-size filter and rider-facing "seats needed" pill never apply here
+  // vehicle-size filter and passenger-facing "seats needed" pill never apply here
   // — applying them would just zero out every result rather than doing
   // anything useful, so they're deliberately left out of this predicate.
   const mobileMatches = useMemo(() => {
@@ -1105,27 +1239,27 @@ function DriverHomeView({
       // pb-28 keeps the last card's CTA clear of the floating Map View / + controls.
       <div className="space-y-4 pb-28">
         <MobileSearchBar value={searchQuery} onChange={setSearchQuery} hasLocation={hasLocation} />
-        {/* Seats-needed is a rider-side filter; a driver browsing ride requests has no use for it. */}
+        {/* Seats-needed is a passenger-side filter; a driver browsing ride requests has no use for it. */}
         <MobileFilterBar
           onOpenFilters={() => setFilterSheetOpen(true)}
           activeCount={activeFilterCount}
           quickDate={quickDateFilter} onQuickDate={setQuickDateFilter}
           seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded} showSeats={false}
         />
-        {!myOpenTrip && (
+        {myOpenTrip ? <ActiveTripCard trip={myOpenTrip} actions={tripActions} /> : (
           <div className="rounded-2xl border border-dashed border-border bg-card p-5 text-center">
             <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
             <button onClick={() => setView('post')} className="mt-3 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">Publish a route</button>
           </div>
         )}
-        {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
-        <SectionHeader label="Nearby Riders" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
+        {myOpenTrip?.status === 'open' && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
+        <SectionHeader label="Nearby Passengers" count={mobileMatches.length} noun={mobileMatches.length === 1 ? 'rider' : 'riders'} />
         {loading ? (
           <p className="text-sm text-muted-foreground animate-pulse text-center py-10">Finding nearby requests…</p>
         ) : mobileMatches.length > 0 ? (
           <div className="space-y-3">
             {mobileMatches.map(m => (
-              <MobileListingCard key={m.listing.id} listing={m.listing} onConnect={l => { onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error')) }} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} alreadyConnected={connectedListingIds.has(m.listing.apiId)} />
+              <MobileListingCard key={m.listing.id} listing={m.listing} onConnect={l => { onConnect(l).then(() => showToast('Ride offered!', 'success')).catch(e => showToast(e instanceof Error ? e.message : 'Failed', 'error')) }} currentUserId={currentUserId} onEditOwn={() => setView('my-listings')} alreadyConnected={connectedListingIds.has(m.listing.apiId)} extra={<RiderFitBadges fit={fits[m.listing.apiId]} />} />
             ))}
           </div>
         ) : (
@@ -1154,21 +1288,7 @@ function DriverHomeView({
       </div>
 
       {myOpenTrip ? (
-        <div className="rounded-2xl bg-primary text-primary-foreground p-6 shadow-lg shadow-primary/25">
-          <div className="flex items-center justify-between gap-3">
-            <span className="text-xs font-semibold uppercase tracking-wide text-primary-foreground/70">Active trip</span>
-            <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-white/15">Open</span>
-          </div>
-          <div className="flex items-center gap-2 mt-3 text-lg font-semibold">
-            <span className="truncate">{myOpenTrip.from}</span>
-            <ArrowRight className="size-4 text-primary-foreground/60 shrink-0" />
-            <span className="truncate">{myOpenTrip.to}</span>
-          </div>
-          <div className="flex items-center gap-4 mt-2 text-sm text-primary-foreground/80">
-            <span className="flex items-center gap-1.5"><Calendar className="size-3.5" />{myOpenTrip.date}</span>
-            <span className="flex items-center gap-1.5"><Users className="size-3.5" />{myOpenTrip.seats} seat{myOpenTrip.seats !== 1 ? 's' : ''}</span>
-          </div>
-        </div>
+        <ActiveTripCard trip={myOpenTrip} actions={tripActions} />
       ) : (
         <div className="rounded-2xl border border-dashed border-border bg-card p-6 text-center">
           <p className="text-sm text-muted-foreground">You don't have an active trip yet.</p>
@@ -1176,11 +1296,11 @@ function DriverHomeView({
         </div>
       )}
 
-      {myOpenTrip && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
+      {myOpenTrip?.status === 'open' && <ProposedRider key={myOpenTrip.id} trip={myOpenTrip} onAccepted={onProposalAccepted} showToast={showToast} />}
 
       <div>
         <div className="flex items-center justify-between">
-          <SectionLabel>Riders needing a driver</SectionLabel>
+          <SectionLabel>Passengers needing a driver</SectionLabel>
           {!loading && <span className="text-xs text-muted-foreground mb-3">{matches.length} nearby</span>}
         </div>
 
@@ -1211,6 +1331,7 @@ function DriverHomeView({
                         <span className="text-xs text-muted-foreground">🧍 {l.passengers} passenger{(l.passengers ?? 0) > 1 ? 's' : ''}</span>
                       </div>
                       <RouteLine from={l.from} to={l.to} flexibility={l.flexibility} />
+                      <div className="mt-2"><RiderFitBadges fit={fits[l.apiId]} /></div>
                     </div>
                     <div className="flex flex-col items-end gap-1 shrink-0">
                       <span className="text-xs text-muted-foreground">{l.date}</span>
@@ -1283,7 +1404,7 @@ function FeedView({
           seatsNeeded={seatsNeeded} onSeatsNeeded={setSeatsNeeded}
         />
         <SectionHeader
-          label={filterType === 'driver' ? 'Nearby Drivers' : filterType === 'rider' ? 'Nearby Riders' : 'Nearby Rides'}
+          label={filterType === 'driver' ? 'Nearby Drivers' : filterType === 'rider' ? 'Nearby Passengers' : 'Nearby Rides'}
           count={listings.length}
           noun={filterType === 'driver' ? (listings.length === 1 ? 'driver' : 'drivers') : filterType === 'rider' ? (listings.length === 1 ? 'rider' : 'riders') : (listings.length === 1 ? 'ride' : 'rides')}
         />
@@ -1319,7 +1440,7 @@ function FeedView({
     <div className="space-y-6">
       <div>
         <h1 style={SERIF} className="text-[2.75rem] leading-tight text-foreground">Find your ride</h1>
-        <p className="text-sm text-muted-foreground mt-1">Connect with drivers and riders heading your way.</p>
+        <p className="text-sm text-muted-foreground mt-1">Connect with drivers and passengers heading your way.</p>
       </div>
 
       <div className="space-y-4">
@@ -1408,7 +1529,7 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 }) {
   // Locked to the app-wide mode (chosen at login / switched deliberately from
   // Profile) rather than an independent in-form toggle — posting the "other"
-  // type while in Rider/Driver mode is exactly the kind of mixed-page
+  // type while in Passenger/Driver mode is exactly the kind of mixed-page
   // behavior the mode gate exists to remove.
   const type = defaultType
   const submittingRef = useRef(false)
@@ -1419,7 +1540,6 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
   const [flexibility, setFlexibility] = useState<Flexibility>(prefill?.flexibility ?? 'morning')
   const [seats, setSeats] = useState(prefill?.seats ? String(prefill.seats) : myVehicle?.seats ? String(myVehicle.seats) : '3')
   const [passengers, setPassengers] = useState(prefill?.passengers ? String(prefill.passengers) : '1')
-  const [gasEstimate, setGasEstimate] = useState('')
   const [tags, setTags] = useState<Set<RideTag>>(new Set(prefill?.tags ?? []))
   const [vehicle, setVehicle] = useState(myVehicle ? [myVehicle.color, myVehicle.make, myVehicle.model].filter(Boolean).join(' ') : '')
   const [carType, setCarType] = useState<CarType | ''>(prefill?.carType ?? (myVehicle?.car_type as CarType) ?? '')
@@ -1440,8 +1560,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
     setSubmitted(true); setError('')
     try {
       const [pickupLoc, destLoc] = await Promise.all([
-        api.createLocation(from.label, from.lat, from.lng),
-        api.createLocation(to.label, to.lat, to.lng),
+        api.createLocation(from.label, from.lat, from.lng, from.general),
+        api.createLocation(to.label, to.lat, to.lng, to.general),
       ])
       if (type === 'driver') {
         const trip = await api.createDriverTrip({
@@ -1488,8 +1608,8 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-6">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <LocationInput label="From" value={from} onChange={setFrom} placeholder="Your area" required nearCoords={userCoords} />
-          <LocationInput label="To" value={to} onChange={setTo} placeholder="Destination" required nearCoords={userCoords} />
+          <LocationInput label="From" value={from} onChange={setFrom} placeholder={type === 'rider' ? 'Pickup street address' : 'Your area'} required nearCoords={userCoords} requireExact={type === 'rider'} />
+          <LocationInput label="To" value={to} onChange={setTo} placeholder={type === 'rider' ? 'Drop-off street address' : 'Destination'} required nearCoords={userCoords} requireExact={type === 'rider'} />
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1519,13 +1639,6 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
               <button type="button" aria-label="Decrease" onClick={() => setCount(parseInt(countValue, 10) - 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">−</button>
               <span style={MONO} className="w-8 text-center text-xl font-bold text-foreground">{countValue}</span>
               <button type="button" aria-label="Increase" onClick={() => setCount(parseInt(countValue, 10) + 1)} className="size-11 rounded-xl bg-input-background border border-border text-lg font-bold text-foreground hover:bg-muted transition-colors">+</button>
-            </div>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-sm font-semibold">Gas split ($/person)</label>
-            <div className="relative">
-              <span style={MONO} className="absolute left-4 top-1/2 -translate-y-1/2 font-semibold text-muted-foreground pointer-events-none">$</span>
-              <input value={gasEstimate} onChange={e => setGasEstimate(e.target.value)} placeholder="0.00" inputMode="decimal" style={MONO} className={iconInputCls.replace('pl-10', 'pl-8')} />
             </div>
           </div>
         </div>
@@ -1608,9 +1721,10 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 
 type RidesTab = 'active' | 'past' | 'pools'
 
-function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClone, onCancel }: {
+function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClone, onCancel, tripActions }: {
   listing: MyListing; conversationCount: number
   onManage: () => void; onViewMatches: () => void; onClone: () => void; onCancel: () => Promise<void>
+  tripActions?: TripActions
 }) {
   const [confirming, setConfirming] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -1662,6 +1776,11 @@ function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClo
             <button onClick={onViewMatches} className="flex-1 min-w-[8rem] inline-flex items-center justify-center gap-1.5 rounded-xl border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
               <Search className="size-4" />View Matches
             </button>
+            {isDriver && tripActions && listing.status !== 'matched' && (
+              <div className="w-full flex flex-wrap items-center gap-2">
+                <TripQuickActions trip={listing} actions={tripActions} showCancel={false} />
+              </div>
+            )}
             <div className="w-full flex items-center justify-between gap-2">
               <button onClick={onClone} className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors">
                 <Copy className="size-3.5" />Clone
@@ -1697,8 +1816,9 @@ function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClo
   )
 }
 
-function MyListingsView({ myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay }: {
+function MyListingsView({ tripActions, myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay }: {
   onOpenTripDay: (c: Connection) => void
+  tripActions: TripActions
   myListings: MyListing[]; connections: Connection[]
   onCancel: (listing: MyListing) => Promise<void>
   onManage: (listing: MyListing) => void; onViewMatches: (listing: MyListing) => void
@@ -1804,7 +1924,7 @@ function MyListingsView({ myListings, connections, onCancel, onManage, onViewMat
             <MyRideCard
               key={listing.id} listing={listing} conversationCount={conversationCount(listing)}
               onManage={() => onManage(listing)} onViewMatches={() => onViewMatches(listing)}
-              onClone={() => onClone(listing)} onCancel={() => onCancel(listing)}
+              onClone={() => onClone(listing)} onCancel={() => onCancel(listing)} tripActions={tripActions}
             />
           ))}
         </div>
@@ -1904,14 +2024,10 @@ function ConversationPane({
       : null,
   )
   const [savingPickup, setSavingPickup] = useState(false)
-  const [myRating, setMyRating] = useState<number | null>(connection.raw?.my_rating ?? null)
   const [msgs, setMsgs] = useState<api.ApiMessage[]>([])
   const [msgsLoaded, setMsgsLoaded] = useState(false)
   const [msgText, setMsgText] = useState('')
   const [sending, setSending] = useState(false)
-  const [gasSuggestion, setGasSuggestion] = useState<api.GasSplitSuggestion | null>(null)
-  const [splitAmount, setSplitAmount] = useState('')
-  const [splitDone, setSplitDone] = useState(connection.splitConfirmed)
   const [reportReason, setReportReason] = useState('')
   const [reportMode, setReportMode] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -1940,13 +2056,6 @@ function ConversationPane({
     if (el) el.scrollTop = el.scrollHeight
   }, [msgs.length])
 
-  useEffect(() => {
-    if (panel !== 'gassplit' || gasSuggestion || status !== 'accepted') return
-    api.suggestGasSplit(connectionId)
-      .then(s => { setGasSuggestion(s); setSplitAmount((s.amount_cents / 100).toFixed(2)) })
-      .catch(() => {})
-  }, [panel, gasSuggestion, status, connectionId])
-
   const appendSent = (msg: api.ApiMessage) => { setMsgs(prev => [...prev, msg]); onMessageSent(connectionId, msg) }
 
   const sendCanned = async (key: string) => {
@@ -1964,12 +2073,6 @@ function ConversationPane({
     finally { setSending(false) }
   }
 
-  const confirmSplit = async () => {
-    const cents = Math.round(parseFloat(splitAmount) * 100)
-    if (isNaN(cents) || cents < 1) return
-    try { await api.confirmGasSplit(connectionId, cents, gasSuggestion?.assumptions ?? {}); setSplitDone(true); showToast('Split confirmed ✓', 'success') }
-    catch (e) { showToast(e instanceof Error ? e.message : 'Failed to confirm', 'error') }
-  }
 
   const run = (fn: (id: string) => Promise<void>, ok: string) => async () => {
     setBusy(true)
@@ -1987,7 +2090,7 @@ function ConversationPane({
     catch (e) { showToast(e instanceof Error ? e.message : 'Error', 'error') }
   }
 
-  // Rider-only, once accepted: the exact pickup address the driver navigates to.
+  // Passenger-only, once accepted: the exact pickup address the driver navigates to.
   const handleSavePickup = async () => {
     if (!pickupDraft) return
     setSavingPickup(true)
@@ -2024,7 +2127,6 @@ function ConversationPane({
             </p>
             <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2">
               <span className="inline-flex items-center gap-1"><Calendar className="size-3" />{connection.date}</span>
-              {splitDone && <span className="inline-flex items-center gap-1 text-green-600 dark:text-green-400"><Check className="size-3" />Split confirmed</span>}
             </p>
           </div>
           <button onClick={() => setPanel(panel === 'safety' ? null : 'safety')} aria-label="Safety options" className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground"><MoreHorizontal className="size-4" /></button>
@@ -2054,7 +2156,7 @@ function ConversationPane({
                 {connection.myRole === 'rider' && (
                   <button onClick={() => setPanel(panel === 'pickup' ? null : 'pickup')} aria-pressed={panel === 'pickup'} className={btnOutline}><MapPin className="size-4" />Pickup address</button>
                 )}
-                <button onClick={() => setPanel(panel === 'gassplit' ? null : 'gassplit')} aria-pressed={panel === 'gassplit'} className={`${btn} ${panel === 'gassplit' ? 'bg-accent/20 text-amber-800 dark:text-amber-300' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Gas Split</button>
+                <button onClick={() => setPanel(panel === 'gassplit' ? null : 'gassplit')} aria-pressed={panel === 'gassplit'} className={`${btn} ${panel === 'gassplit' ? 'bg-accent/20 text-amber-800 dark:text-amber-300' : 'border border-border text-foreground hover:bg-muted'}`}><Fuel className="size-4" />Fare</button>
                 <button onClick={run(onComplete, 'Ride completed!')} disabled={busy} className={btnOutline}><Check className="size-4" />Complete</button>
                 <button onClick={run(onCancel, 'Ride cancelled')} disabled={busy} className={`${btn} text-muted-foreground hover:text-destructive hover:bg-destructive/10`}>Cancel</button>
               </>
@@ -2065,30 +2167,22 @@ function ConversationPane({
 
       {/* ── Collapsible panels ── */}
       {panel === 'gassplit' && status === 'accepted' && (
-        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
-          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Confirm gas split</p>
-          {gasSuggestion ? (
+        <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-2">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Fare</p>
+          {connection.raw?.fare ? (
             <>
-              <p className="text-sm text-muted-foreground">Suggested: <span style={MONO} className="text-foreground font-medium">${(gasSuggestion.amount_cents / 100).toFixed(2)}</span></p>
-              {splitDone ? (
-                <p className="text-sm text-green-700 dark:text-green-400 font-medium flex items-center gap-1"><Check className="size-4" />Split confirmed</p>
-              ) : (
-                <div className="flex gap-2 items-center">
-                  <div className="relative flex-1 max-w-[140px]">
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-                    <input type="number" step="0.01" min="0.01" value={splitAmount} onChange={e => setSplitAmount(e.target.value)} aria-label="Split amount" className="w-full pl-7 pr-3 py-2 rounded-xl bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20" />
-                  </div>
-                  <button onClick={confirmSplit} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Confirm</button>
-                </div>
-              )}
-              <p className="text-xs text-muted-foreground">Payment happens outside the app.</p>
+              <p className="text-sm text-muted-foreground">
+                <span style={MONO} className="text-foreground font-semibold text-lg">{fmtMoney(connection.raw.fare.amount_cents)}</span>
+                {' '}· {connection.raw.fare.distance_km} km{connection.raw.fare.passengers > 1 ? ` · ${connection.raw.fare.passengers} passengers` : ''}
+              </p>
+              <p className="text-xs text-muted-foreground">Calculated automatically from the trip distance. It's charged to the passenger and paid out to the driver when the ride is marked complete.</p>
             </>
-          ) : <p className="text-sm text-muted-foreground animate-pulse">Loading suggestion…</p>}
+          ) : <p className="text-sm text-muted-foreground animate-pulse">Calculating fare…</p>}
         </div>
       )}
       {panel === 'pickup' && status === 'accepted' && connection.myRole === 'rider' && (
         <div className="shrink-0 border-b border-border bg-muted/40 px-5 py-4 space-y-3">
-          <LocationInput label="Pickup address" value={pickupDraft} onChange={setPickupDraft} placeholder="Search for your pickup address…" />
+          <LocationInput label="Pickup address" value={pickupDraft} onChange={setPickupDraft} placeholder="Search for your pickup address…" requireExact />
           <div className="flex gap-2">
             <button onClick={handleSavePickup} disabled={!pickupDraft || savingPickup} className="px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-60 transition-colors">
               {savingPickup ? 'Saving…' : 'Save'}
@@ -2149,26 +2243,32 @@ function ConversationPane({
         {status === 'pending' ? (
           <div className="space-y-2">
             <p className="text-xs text-muted-foreground">Quick messages while the request is pending — full chat unlocks once accepted.</p>
-            <div className="flex gap-2 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <div role="group" aria-label="Quick messages" className="flex gap-2 overflow-x-auto py-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               {Object.entries(CANNED_MESSAGES).map(([key, text]) => (
-                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className="shrink-0 px-3 py-1.5 rounded-full bg-muted text-sm text-foreground hover:bg-muted/70 disabled:opacity-50 transition-colors">{text}</button>
+                <button key={key} onClick={() => sendCanned(key)} disabled={sending} className={CHIP_BTN}>{text}</button>
               ))}
             </div>
           </div>
         ) : status === 'accepted' ? (
+          <div className="space-y-2">
+          <div role="group" aria-label="Quick replies" className="flex gap-2 overflow-x-auto py-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {QUICK_REPLIES.map(text => (
+              <button key={text} type="button" disabled={sending} className={CHIP_BTN}
+                onClick={async () => {
+                  setSending(true)
+                  try { appendSent(await api.sendMessage(connectionId, text)) }
+                  catch (e) { showToast(e instanceof Error ? e.message : 'Failed to send', 'error') }
+                  finally { setSending(false) }
+                }}>{text}</button>
+            ))}
+          </div>
           <form className="flex gap-2" onSubmit={e => { e.preventDefault(); sendFree() }}>
             <input type="text" value={msgText} onChange={e => setMsgText(e.target.value)} placeholder={`Message ${connection.withUser.name}…`} aria-label="Message" className="flex-1 min-w-0 px-4 py-2.5 rounded-full bg-input-background border border-transparent text-sm focus:border-primary/30 focus:outline-none focus:ring-2 focus:ring-ring/20 transition-colors" />
             <button type="submit" disabled={sending || !msgText.trim()} aria-label="Send message" className="shrink-0 size-10 rounded-full bg-primary text-primary-foreground disabled:opacity-50 flex items-center justify-center transition-colors"><Send className="size-4" /></button>
           </form>
-        ) : status === 'completed' ? (
-          <div className="flex flex-col items-center gap-1">
-            <p className="text-sm text-muted-foreground">{myRating ? 'Your rating' : `Rate your ride with ${connection.withUser.name}`}</p>
-            <StarRating value={myRating} onChange={async n => {
-              setMyRating(n)
-              try { await api.rateConnection(connectionId, n); showToast('Thanks for rating', 'success') }
-              catch (e) { setMyRating(connection.raw?.my_rating ?? null); showToast(e instanceof Error ? e.message : 'Failed', 'error') }
-            }} />
           </div>
+        ) : status === 'completed' ? (
+          <RideOutcome connection={connection} showToast={showToast} />
         ) : (
           <p className="text-sm text-muted-foreground text-center">This conversation is closed — the ride was {status}.</p>
         )}
@@ -2286,7 +2386,7 @@ function InboxView({
               <div className="text-center py-16 px-6 text-muted-foreground">
                 <MessageCircle className="size-10 mx-auto mb-4 opacity-20" />
                 <p className="font-medium">{connections.length === 0 ? 'No connections yet' : filter === 'archived' ? 'Nothing archived' : 'No conversations here'}</p>
-                <p className="text-sm mt-1">{connections.length === 0 ? 'Connect with a driver or rider from Discover.' : 'Try another filter.'}</p>
+                <p className="text-sm mt-1">{connections.length === 0 ? 'Connect with a driver or passenger from Discover.' : 'Try another filter.'}</p>
               </div>
             ) : visible.map(c => (
               <ConversationListItem key={c.id} connection={c} currentUserId={currentUserId} selected={c.id === selectedId} onSelect={() => select(c.id)} />
@@ -2320,7 +2420,7 @@ type NotifCategory = 'all' | 'connections' | 'chat' | 'payments'
 
 function notifCategory(type: string): Exclude<NotifCategory, 'all'> {
   if (type === 'chat_message') return 'chat'
-  if (type === 'gas_split_confirmed') return 'payments'
+  if (type === 'gas_split_confirmed' || type === 'payment_processed') return 'payments'
   return 'connections'
 }
 
@@ -2342,13 +2442,17 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
     if (type.includes('connection_received')) return { icon: <UserPlus className="size-4 text-primary" />, bg: 'bg-secondary' }
     if (type.includes('accepted') || type.includes('chat_unlocked')) return { icon: <Check className="size-4 text-emerald-600" />, bg: 'bg-emerald-500/15' }
     if (type.includes('chat')) return { icon: <MessageCircle className="size-4 text-primary" />, bg: 'bg-secondary' }
-    if (type.includes('gas_split')) return { icon: <Fuel className="size-4 text-amber-600" />, bg: 'bg-amber-500/15' }
+    if (type.includes('gas_split') || type.includes('payment')) return { icon: <Fuel className="size-4 text-amber-600" />, bg: 'bg-amber-500/15' }
+    if (type === 'ride_started') return { icon: <Car className="size-4 text-primary" />, bg: 'bg-secondary' }
     if (type.includes('declined') || type.includes('cancelled')) return { icon: <X className="size-4 text-destructive" />, bg: 'bg-destructive/10' }
     return { icon: <Bell className="size-4 text-muted-foreground" />, bg: 'bg-muted' }
   }
 
   const unreadCount = notifications.filter(n => !n.read).length
-  const visible = [...notifications].reverse().filter(n => filter === 'all' || notifCategory(n.type) === filter)
+  // Strictly newest first, whatever order the API / websocket delivered them in.
+  const visible = [...notifications]
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .filter(n => filter === 'all' || notifCategory(n.type) === filter)
 
   return (
     <div className="space-y-6">
@@ -2410,7 +2514,7 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onOpenAdmin, hub }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
   onOpenAdmin: () => void
@@ -2446,7 +2550,7 @@ function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
   }
   const removeInterest = (tag: string) => setInterests(prev => prev.filter(t => t !== tag))
 
-  // Only what actually changed gets saved — in particular, a rider who never
+  // Only what actually changed gets saved — in particular, a passenger who never
   // touches the vehicle section must not end up with an empty vehicle record
   // (which would mark them as "driver ready" and skip vehicle setup later).
   const profileDirty =
@@ -2510,7 +2614,7 @@ function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
     <div className="space-y-6">
       <div>
         <h1 style={SERIF} className="text-[2.25rem] xl:text-[2.75rem] leading-tight text-foreground">Profile</h1>
-        <p className="text-muted-foreground mt-1">How riders and drivers see you, plus your vehicle details.</p>
+        <p className="text-muted-foreground mt-1">How passengers and drivers see you, plus your vehicle details.</p>
       </div>
 
       {hub}
@@ -2586,7 +2690,8 @@ function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
           </div>
         </section>
 
-        {/* ── Right: driver readiness ── */}
+        {/* ── Right: driver readiness (driver mode only — passengers never see it) ── */}
+        {mode === 'driver' && (
         <section className="rounded-3xl bg-card border border-border p-6 space-y-5">
           <div className="flex items-start justify-between gap-3">
             <div>
@@ -2608,7 +2713,7 @@ function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
             <div className="space-y-1.5 col-span-2">
               <label htmlFor="veh-plate" className="text-sm font-medium">License plate</label>
               <input id="veh-plate" value={plate} onChange={e => setPlate(e.target.value.toUpperCase())} maxLength={10} placeholder="e.g. 8KXR214" className={`${inputCls} uppercase tracking-wider`} />
-              <p className="text-xs text-muted-foreground">Riders see it only after you accept them, so they can find your car at pickup.</p>
+              <p className="text-xs text-muted-foreground">Passengers see it only after you accept them, so they can find your car at pickup.</p>
             </div>
           </div>
           <div className="space-y-1.5">
@@ -2634,6 +2739,7 @@ function ProfileView({ currentUser, onProfileUpdate, onOpenAdmin, hub }: {
             ))}
           </div>
         </section>
+        )}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2 items-start">
@@ -2778,6 +2884,7 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, ini
   onSignOut: () => void; onOpenAdmin: () => void; initials: string; darkMode: boolean; onToggleDark: () => void; mode: ListingType
 }) {
   const iconBtn = 'size-8 rounded-full bg-muted text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors'
+  const [soundOff, setSoundOff] = useState(isMuted())
   return (
     <header className="sticky top-0 z-40 bg-card text-foreground border-b border-border">
       <div className="px-4 lg:px-8 h-14 flex items-center justify-between gap-4">
@@ -2787,10 +2894,13 @@ function TopBar({ setView, currentUser, unreadCount, onSignOut, onOpenAdmin, ini
         </button>
         <div className="hidden xl:flex items-center gap-2">
           <span className="text-sm font-semibold text-muted-foreground">Riding as</span>
-          <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{mode === 'driver' ? '🚗 Driver' : '🧍 Rider'}</span>
+          <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground">{mode === 'driver' ? '🚗 Driver' : '🧍 Passenger'}</span>
         </div>
         {currentUser ? (
           <div className="flex items-center gap-2">
+            <button onClick={() => { const next = !soundOff; setMuted(next); setSoundOff(next); if (!next) playSound('message') }} className={iconBtn} aria-label={soundOff ? 'Turn notification sounds on' : 'Turn notification sounds off'}>
+              {soundOff ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+            </button>
             <button onClick={onToggleDark} className={iconBtn} aria-label="Toggle dark mode">
               {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </button>
@@ -2817,7 +2927,7 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   // Home / Trips / Messages / Profile. Searching, posting and the map all
   // start from Home; Pools lives inside Trips.
   const items: Array<{ id: View; label: string; icon: React.ReactNode; also: View[] }> = [
-    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post', 'request'] },
+    { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post', 'finding'] },
     { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools'] },
     { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
     { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin', 'preferences', 'safety', 'receipt'] },
@@ -2890,13 +3000,13 @@ function Sidebar({ view, setView, unreadCount }: { view: View; setView: (v: View
 
 // ─── Mode choice gate ───────────────────────────────────────────────────────
 // Shown once per session, before any Discover content — replaces the old
-// anytime toggle with an explicit up-front choice so Rider/Driver stop
+// anytime toggle with an explicit up-front choice so Passenger/Driver stop
 // feeling like two variants of one mixed page.
 
 function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
   const options: Array<{ mode: ListingType; icon: React.ReactNode; title: string; desc: string }> = [
     { mode: 'rider', icon: <Users className="size-8" />, title: 'I need a ride', desc: 'Find drivers heading your way and request a seat.' },
-    { mode: 'driver', icon: <Car className="size-8" />, title: "I'm offering a ride", desc: 'Publish your route, pick up riders, and split costs.' },
+    { mode: 'driver', icon: <Car className="size-8" />, title: "I'm offering a ride", desc: 'Publish your route, pick up passengers, and split costs.' },
   ]
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center px-4 py-10">
@@ -2938,16 +3048,16 @@ const FEED_REFRESH_MS = 120_000
 
 const VIEW_PATHS: Record<View, string> = {
   home: '/discover', feed: '/discover', admin: '/admin',
-  results: '/rides', ride: '/rides/detail', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
+  results: '/rides', ride: '/rides/detail', finding: '/rides/finding', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
   'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
-  preferences: '/preferences', safety: '/safety', receipt: '/receipt', request: '/request',
+  preferences: '/preferences', safety: '/safety', receipt: '/receipt',
 }
 const PATH_VIEWS: Record<string, View> = {
   '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
   '/my-rides': 'my-listings', '/connections': 'connections', '/inbox': 'connections',
   '/notifications': 'notifications', '/profile': 'profile', '/admin': 'admin',
-  '/rides': 'results', '/rides/detail': 'ride', '/trip': 'trip', '/offer': 'offer',
-  '/preferences': 'preferences', '/safety': 'safety', '/receipt': 'receipt', '/request': 'request',
+  '/rides': 'results', '/rides/detail': 'ride', '/rides/finding': 'finding', '/trip': 'trip', '/offer': 'offer',
+  '/preferences': 'preferences', '/safety': 'safety', '/receipt': 'receipt',
 }
 
 export function Home() {
@@ -3024,18 +3134,22 @@ export function Home() {
   const [rideSearch, setRideSearch] = useState<RideSearch>(defaultRideSearch)
   const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
   const [tripDayId, setTripDayId] = useState<string | null>(null)
-  // Account screens: which ride a receipt / request status / safety screen is
+  // Account screens: which ride a receipt / safety screen is
   // about, and where "Ride preferences" returns to.
   const [receiptId, setReceiptId] = useState<string | null>(null)
-  const [requestId, setRequestId] = useState<string | null>(null)
   const [safetyConnId, setSafetyConnId] = useState<string | null>(null)
   const [prefsReturn, setPrefsReturn] = useState<View>('profile')
+  // Find-a-ride flow: a driver the passenger picked (null = auto top match) and drivers already tried.
+  const [findTrip, setFindTrip] = useState<api.ApiDriverTrip | null>(null)
+  const [findNonce, setFindNonce] = useState(0)
+  const [passedTripIds, setPassedTripIds] = useState<string[]>([])
   const [savedRoutes, setSavedRoutes] = useState<api.SavedRoute[]>([])
   useEffect(() => { if (view !== 'post') setPostPrefill(null) }, [view])
 
   // ── Connections ──
   const [connections, setConnections] = useState<Connection[]>([])
   const connectionsRef = useRef<Connection[]>([])
+  const loadMyListingsRef = useRef<() => void>(() => {})
   useEffect(() => { connectionsRef.current = connections }, [connections])
   const [incomingMessage, setIncomingMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
   const [inboxListingFilter, setInboxListingFilter] = useState<{ id: string; label: string } | null>(null)
@@ -3045,6 +3159,14 @@ export function Home() {
 
   // ── Driving-to-pickup (for Map view) ──
   const [drivingTo, setDrivingTo] = useState<DrivingTarget | null>(null)
+  // Completed rides we've already prompted for a rating this session.
+  const [reviewDismissed, setReviewDismissed] = useState<string[]>([])
+  // The ride just rated stays on screen until the user taps Done.
+  const [reviewRatedId, setReviewRatedId] = useState<string | null>(null)
+  // The newest ride finished in the last day that this user hasn't rated yet.
+  const pendingReview = connections.find(c =>
+    c.status === 'completed' && c.raw && (c.raw.my_rating == null || c.id === reviewRatedId) && !reviewDismissed.includes(c.id)
+    && Date.now() - new Date(c.raw.updated_at).getTime() < 24 * 3600 * 1000) ?? null
 
   // ── Notifications ──
   const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
@@ -3064,6 +3186,8 @@ export function Home() {
   }, [])
   showToastRef.current = showToast
 
+  useEffect(() => installSoundUnlock(), [])
+
   useEffect(() => {
     if (!currentUser) { wsRef.current?.close(); wsRef.current = null; return }
     const ws = api.createRealtime(currentUser.id, (msg: WsMessage) => {
@@ -3077,11 +3201,30 @@ export function Home() {
         const senderName = conn?.withUser.name ?? 'Someone'
         const preview = msg.message.content.length > 45 ? msg.message.content.slice(0, 45) + '…' : msg.message.content
         showToastRef.current(`💬 ${senderName}: ${preview}`, 'success')
+        if (m.sender_id !== currentUser.id) playSound('message')
         setNotifications(prev => [{ id: `ws_${Date.now()}`, user_id: currentUser.id, type: 'chat_message', title: `${senderName} sent a message`, body: msg.message.content, created_at: new Date().toISOString(), read: false, related_id: msg.connection_id }, ...prev])
       } else if (msg.type === 'connection_update') {
+        const before = connectionsRef.current.find(c => c.id === msg.connection_id)
         setConnections(prev => prev.map(c => c.id === msg.connection_id ? { ...c, status: msg.status as Connection['status'] } : c))
-      } else if (msg.type === 'pickup_updated') {
+        if (before && before.initiatorUserId === currentUser.id) {
+          if (msg.status === 'accepted') { showToastRef.current(`🎉 ${before.withUser.name} accepted your request`, 'success'); playSound('accepted') }
+          else if (msg.status === 'declined') { showToastRef.current(`${before.withUser.name} declined your request`, 'error'); playSound('declined') }
+        }
+        // Accepting reveals the pickup details and changes seat counts; refetch.
         loadConnections(currentUser.id)
+        loadMyListingsRef.current()
+      } else if (msg.type === 'pickup_updated') {
+        // A connection we hadn't seen yet (someone requested us) or new pickup details.
+        const known = new Set(connectionsRef.current.map(c => c.id))
+        if (!known.has(msg.connection_id)) { showToastRef.current('🚗 New ride request', 'success'); playSound('request') }
+        loadConnections(currentUser.id)
+        loadMyListingsRef.current()
+      } else if (msg.type === 'notification') {
+        const n = msg.notification
+        setNotifications(prev => (prev.some(x => x.id === n.id) ? prev : [n, ...prev]))
+        // Accept/decline/request/chat already sound from their own events above.
+        const snd = soundForNotification(n.type)
+        if (snd === 'driving' || snd === 'arrived' || snd === 'paid') { playSound(snd); showToastRef.current(n.title, 'success') }
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
@@ -3179,6 +3322,7 @@ export function Home() {
       setMyListings(combined)
     } catch { }
   }, [])
+  loadMyListingsRef.current = loadMyListings
 
   useEffect(() => { if (currentUser) loadMyListings() }, [currentUser, loadMyListings])
   useEffect(() => { if (currentUser) api.getSavedRoutes().then(setSavedRoutes).catch(() => {}) }, [currentUser])
@@ -3190,7 +3334,7 @@ export function Home() {
   // sheet are what narrow the list, not a silent, invisible GPS distance
   // cutoff a listing could fall just outside of with no indication why.
   //
-  // The one exception to "no pre-filter": when the rider has an open request, a
+  // The one exception to "no pre-filter": when the passenger has an open request, a
   // second, corridor-filtered search supplies per-trip detour minutes. It only
   // annotates the unfiltered feed above — it never removes anything from it.
   const reqKey = myListings.find(l => l.type === 'rider' && l.status === 'open' && l.pickupLat != null && l.destLat != null)
@@ -3250,8 +3394,8 @@ export function Home() {
   // ── Listings the current user has already acted on ──────────────────────────
   // onConnect always creates a fresh ride_request/driver_trip on our side, so
   // the only way to recognize "I already requested/offered on this listing" is
-  // by the OTHER party's id it points at: a rider's connection records the
-  // driver's trip id, a driver's connection records the rider's request id —
+  // by the OTHER party's id it points at: a passenger's connection records the
+  // driver's trip id, a driver's connection records the passenger's request id —
   // which is exactly listing.apiId for that listing either way. Only pending/
   // accepted count: once declined/cancelled/expired, the listing is fair game
   // again instead of being permanently stuck.
@@ -3266,7 +3410,7 @@ export function Home() {
 
   // ── Handlers ──
   // `opts` comes from the Home → Results → Ride details flow, which knows the
-  // rider's real start, destination, seats and time; the plain feed falls back
+  // passenger's real start, destination, seats and time; the plain feed falls back
   // to the current location for both ends.
   const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }): Promise<Connection | undefined> => {
     try {
@@ -3289,9 +3433,8 @@ export function Home() {
       const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
       const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
       setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
-      if (opts?.quiet) return newConn
-      setInboxListingFilter(null); setConnDeepLink({ connectionId: newConn.id, section: 'chat' }); setView('connections')
-      return newConn
+      if (opts?.quiet) return
+      setTripDayId(newConn.id); setView('trip')
     } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error'); if (opts?.quiet) throw e }
   }, [currentUser, userCoords, showToast, setView])
 
@@ -3307,7 +3450,7 @@ export function Home() {
   }, [setView])
 
   // Opens Discover pre-searched for the listing's destination, showing the
-  // opposite side of the marketplace (riders for a trip, drivers for a request).
+  // opposite side of the marketplace (passengers for a trip, drivers for a request).
   const onViewMatches = useCallback((listing: MyListing) => {
     setSearchQuery(listing.to.split(',')[0])
     setFilterType(listing.type === 'driver' ? 'rider' : 'driver')
@@ -3339,15 +3482,26 @@ export function Home() {
     showToast('Listing cancelled', 'success')
   }, [loadMyListings, showToast])
 
+  const tripActions = useMemo<TripActions>(() => ({
+    onEdit: async (trip, edit) => { await api.updateDriverTrip(trip.id, edit); await loadMyListings(); showToast('Trip updated', 'success') },
+    onPause: async trip => { await api.pauseDriverTrip(trip.id); await loadMyListings(); showToast('Trip paused — passengers can’t see it until you resume', 'success') },
+    onResume: async trip => { await api.resumeDriverTrip(trip.id); await loadMyListings(); showToast('Trip is live again', 'success') },
+    onCancel: onCancelListing,
+  }), [loadMyListings, showToast, onCancelListing])
+
+  // The driver's published trip (open or paused) and how well each passenger fits its route.
+  const driverTrip = mode === 'driver' ? myListings.find(l => l.type === 'driver' && (l.status === 'open' || l.status === 'paused')) : undefined
+  const riderFits = useRiderFits(driverTrip)
+
   const transact = useCallback(async (id: string, action: 'accept' | 'decline' | 'cancel' | 'complete') => {
     const updated = await api.transitionConnection(id, action)
-    setConnections(prev => prev.map(c => c.id === id ? { ...c, status: updated.status as ConnStatus } : c))
+    setConnections(prev => prev.map(c => c.id === id ? { ...c, status: updated.status as ConnStatus, raw: updated } : c))
+    return updated
   }, [])
 
-  const onAccept = useCallback((id: string) => transact(id, 'accept'), [transact])
-  const onDecline = useCallback((id: string) => transact(id, 'decline'), [transact])
-  const onCancel = useCallback((id: string) => transact(id, 'cancel'), [transact])
-  const onComplete = useCallback((id: string) => transact(id, 'complete'), [transact])
+  const onDecline = useCallback(async (id: string) => { await transact(id, 'decline') }, [transact])
+  const onCancel = useCallback(async (id: string) => { await transact(id, 'cancel') }, [transact])
+  const onComplete = useCallback(async (id: string) => { await transact(id, 'complete') }, [transact])
 
   const onUpdatePickup = useCallback(async (connectionId: string, rideRequestId: string, pickup: LocationValue) => {
     const location = await api.createLocation(pickup.label, pickup.lat, pickup.lng)
@@ -3372,15 +3526,29 @@ export function Home() {
     setView('map')
   }, [setView])
 
-  const onStartDriving = useCallback((conn: Connection) => {
-    if (!conn.riderPickupLat || !conn.riderPickupLng) return
+  const onStartDriving = useCallback((conn: Connection, target: 'pickup' | 'destination' = 'pickup') => {
+    const dest = conn.raw?.ride_request.destination
+    const lat = target === 'destination' ? dest?.latitude : conn.riderPickupLat
+    const lng = target === 'destination' ? dest?.longitude : conn.riderPickupLng
+    if (!lat || !lng) return
     setTripRoute(null)
     setDrivingTo({
-      connectionId: conn.id, pickupLat: conn.riderPickupLat, pickupLng: conn.riderPickupLng,
-      pickupLabel: conn.riderPickupLabel ?? 'Pickup', partnerName: conn.withUser.name,
+      connectionId: conn.id, pickupLat: lat, pickupLng: lng, kind: target,
+      pickupLabel: target === 'destination' ? formatPlace(dest?.label) : conn.riderPickupLabel ?? 'Pickup',
+      partnerName: conn.withUser.name,
     })
     setView('map')
   }, [setView])
+
+  // Accepting a ride that's for today puts the driver straight onto the
+  // drive-to-pickup map; a future ride just confirms and waits for its day.
+  const onAccept = useCallback(async (id: string) => {
+    const updated = await transact(id, 'accept')
+    if (!currentUser) return
+    const conn = apiConnectionToConnection(updated, currentUser.id)
+    if (conn.myRole !== 'driver') return
+    if (conn.date <= todayLocalISO()) onStartDriving(conn)
+  }, [transact, currentUser, onStartDriving])
 
   const onStopDriving = useCallback(() => {
     setDrivingTo(null)
@@ -3432,22 +3600,21 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'preferences', 'safety', 'receipt', 'request']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding', 'preferences', 'safety', 'receipt']
   const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
-  const requestConnection = connections.find(c => c.id === requestId) ?? null
   const safetyConnection = connections.find(c => c.id === safetyConnId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
     : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
     // Screens that need in-memory context fall back after a reload.
     : view === 'ride' && !selectedTrip ? 'results'
+    : view === 'finding' && !rideSearch.to ? 'feed'
     : view === 'trip' && !tripDayConnection ? 'my-listings'
-    : view === 'request' && !requestConnection ? 'my-listings'
     : view === 'receipt' && !receiptId ? 'profile'
     : view
   // Full-screen flow steps bring their own back/close controls and sticky
   // action bar, so the app chrome steps aside on phones (as on the map).
-  const immersive = (['map', 'results', 'ride', 'trip', 'offer', 'preferences', 'safety', 'receipt', 'request'] as View[]).includes(guardedView)
+  const immersive = (['map', 'results', 'ride', 'trip', 'offer', 'finding', 'preferences', 'safety', 'receipt'] as View[]).includes(guardedView)
   const hideTopBarOnMobile = immersive || guardedView === 'feed'
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
@@ -3500,6 +3667,15 @@ export function Home() {
       <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
+      {pendingReview && (
+        <RideCompleteSheet
+          connection={pendingReview}
+          showToast={showToast}
+          onClose={() => setReviewDismissed(prev => [...prev, pendingReview.id])}
+          onRated={(id, stars) => { setReviewRatedId(id); setConnections(prev => prev.map(c => c.id === id && c.raw ? { ...c, raw: { ...c.raw, my_rating: stars } } : c)) }}
+        />
+      )}
+
       {/* The immersive full-bleed Map view supplies its own floating header on
           mobile, so the app's own top bar would just double up with it there. */}
       <div className={hideTopBarOnMobile ? 'hidden xl:block' : ''}>
@@ -3511,6 +3687,14 @@ export function Home() {
       <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
+            {guardedView !== 'map' && guardedView !== 'connections' && (
+              <IncomingRequests
+                connections={connections} currentUserId={currentUser.id}
+                onAccept={onAccept} onDecline={onDecline} onStartDriving={onStartDriving}
+                onOpenChat={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
+                reload={() => loadConnections(currentUser.id)} showToast={showToast}
+              />
+            )}
             {guardedView === 'feed' && isMobile && (
               <HomeScreen
                 mode={mode} currentUser={currentUser} hasLocation={!!userCoords}
@@ -3522,7 +3706,7 @@ export function Home() {
                     : userCoords ? { label: await reverseGeocode(userCoords.lat, userCoords.lng), lat: userCoords.lat, lng: userCoords.lng } : null
                   if (!from) { showToast('Turn on location or pick a start point first', 'error'); return }
                   try {
-                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng), api.createLocation(to.label, to.lat, to.lng)])
+                    const [p, d] = await Promise.all([api.createLocation(from.label, from.lat, from.lng, from.general), api.createLocation(to.label, to.lat, to.lng, to.general)])
                     const route = await api.createSavedRoute({ label, pickup_location_id: p.id, destination_location_id: d.id, departure_time: rideSearch.time || null })
                     setSavedRoutes(prev => [...prev, route]); showToast('Route saved', 'success')
                   } catch (e) { showToast(e instanceof Error ? e.message : 'Could not save route', 'error') }
@@ -3533,21 +3717,25 @@ export function Home() {
                 }}
                 nextTrip={pickNextTrip(connections, mode)}
                 onPrimary={() => setView(mode === 'driver' ? 'offer' : 'results')}
+                onFindMe={() => { setFindTrip(null); setPassedTripIds([]); setFindNonce(n => n + 1); setView('finding') }}
                 onOpenTrip={c => { setTripDayId(c.id); setView('trip') }}
                 onOpenProfile={() => setView('profile')}
                 onOpenMap={() => setView('map')}
                 onOpenNotifications={() => setView('notifications')}
                 unreadNotifications={unreadCount}
                 onSwitchMode={handleSetMode}
+                topSlot={driverTrip ? <ActiveTripCard trip={driverTrip} actions={tripActions} /> : undefined}
               >
                 {mode === 'driver' && (() => {
-                  const requests = filteredListings.filter(l => l.type === 'rider' && l.ownerId !== currentUser.id).slice(0, 5)
+                  const requests = filteredListings.filter(l => l.type === 'rider' && l.ownerId !== currentUser.id)
+                    .sort((a, b) => (riderFits[b.apiId]?.score ?? -1) - (riderFits[a.apiId]?.score ?? -1)).slice(0, 5)
                   return requests.length > 0 ? (
                     <section className="flex flex-col gap-2.5">
-                      <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Riders looking for a ride</h2>
+                      <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Passengers looking for a ride</h2>
                       {requests.map(l => (
                         <MobileListingCard key={l.id} listing={l} currentUserId={currentUser.id} onEditOwn={() => setView('my-listings')}
                           alreadyConnected={connectedListingIds.has(l.apiId)}
+                          extra={<RiderFitBadges fit={riderFits[l.apiId]} />}
                           onConnect={l2 => { onConnect(l2).catch(() => {}) }} />
                       ))}
                     </section>
@@ -3562,6 +3750,7 @@ export function Home() {
                 onBack={() => setView('feed')}
                 onOpenPreferences={() => { setPrefsReturn('results'); setView('preferences') }}
                 onOpenTrip={t => { setSelectedTrip(t); setView('ride') }}
+                onRequestTrip={async t => { setFindTrip(t); setFindNonce(n => n + 1); setView('finding') }}
                 onNotify={async () => {
                   const to = rideSearch.to; if (!to) return
                   const d = await api.createLocation(to.label, to.lat, to.lng)
@@ -3576,24 +3765,37 @@ export function Home() {
                 trip={selectedTrip} seats={rideSearch.seats}
                 requested={connectedListingIds.has(selectedTrip.id)}
                 onBack={() => setView('results')}
-                onRequest={async () => {
-                  const conn = await onConnect(tripToListing(selectedTrip), {
-                    from: rideSearch.from, to: rideSearch.to, seats: rideSearch.seats, time: rideSearch.time, quiet: true,
-                  })
-                  if (conn) { setRequestId(conn.id); setView('request') }
+                onRequest={async () => { setFindTrip(selectedTrip); setFindNonce(n => n + 1); setView('finding') }}
+              />
+            )}
+            {guardedView === 'finding' && (
+              <FindRideScreen
+                key={findNonce}
+                search={rideSearch} userCoords={userCoords} currentUserId={currentUser.id}
+                excludeTripIds={new Set([...connectedListingIds, ...passedTripIds])}
+                firstTrip={findTrip}
+                onBack={() => setView('feed')}
+                onSeeAll={() => setView('results')}
+                onFindAnother={() => { setFindTrip(null); setFindNonce(n => n + 1) }}
+                onConnectionCreated={c => setConnections(prev => [apiConnectionToConnection(c, currentUser.id), ...prev.filter(x => x.id !== c.id)])}
+                onTripPassed={id => setPassedTripIds(prev => (prev.includes(id) ? prev : [...prev, id]))}
+                onAccepted={async id => {
+                  await loadConnections(currentUser.id)
+                  setTripDayId(id); setView('trip'); showToast('🎉 Ride confirmed', 'success')
                 }}
+                showToast={showToast}
               />
             )}
             {guardedView === 'trip' && tripDayConnection && (
               <TripDayScreen
                 connection={tripDayConnection} currentUserId={currentUser.id}
-                monthSavings={monthSavings(connections)}
                 onOpenSafety={c => { setSafetyConnId(c.id); setView('safety') }}
                 onOpenReceipt={c => { setReceiptId(c.id); setView('receipt') }}
                 onClose={() => setView('my-listings')}
                 onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 onStartDriving={onStartDriving}
                 onComplete={async id => { await onComplete(id); showToast('Ride completed!', 'success') }}
+                onChanged={() => loadConnections(currentUser.id)}
                 showToast={showToast}
               />
             )}
@@ -3611,16 +3813,6 @@ export function Home() {
             {guardedView === 'receipt' && receiptId && (
               <ReceiptScreen connectionId={receiptId} currentUserId={currentUser.id} onBack={() => window.history.back()} showToast={showToast} />
             )}
-            {guardedView === 'request' && requestConnection && (
-              <RequestStatusScreen connection={requestConnection}
-                onBack={() => setView('results')}
-                onTrack={() => { setTripDayId(requestConnection.id); setView('trip') }}
-                onSeeOthers={() => setView('results')}
-                onCancel={async () => {
-                  try { await onCancel(requestConnection.id); showToast('Request cancelled', 'success'); setView('results') }
-                  catch (e) { showToast(e instanceof Error ? e.message : 'Could not cancel', 'error') }
-                }} />
-            )}
             {guardedView === 'offer' && (
               <OfferRideScreen
                 initial={rideSearch} userCoords={userCoords} vehicle={currentUser.vehicle}
@@ -3632,7 +3824,7 @@ export function Home() {
             {guardedView === 'feed' && !isMobile && (
               mode === 'driver' ? (
                 <DriverHomeView
-                  myOpenTrip={myListings.find(l => l.type === 'driver' && l.status === 'open')}
+                  myOpenTrip={myListings.find(l => l.type === 'driver' && (l.status === 'open' || l.status === 'paused'))} tripActions={tripActions}
                   listings={allListings} currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                   onConnect={onConnect} showToast={showToast} setView={setView} connectedListingIds={connectedListingIds}
                   onProposalAccepted={conn => {
@@ -3683,7 +3875,7 @@ export function Home() {
             {guardedView === 'post' && <PostView key={postPrefill?.key ?? 'new'} onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} prefill={postPrefill} onClearPrefill={() => setPostPrefill(null)} />}
             {guardedView === 'my-listings' && (
               <MyListingsView
-                myListings={myListings} connections={connections} onCancel={onCancelListing}
+                tripActions={tripActions} myListings={myListings} connections={connections} onCancel={onCancelListing}
                 onManage={onManageListing} onViewMatches={onViewMatches} onClone={onCloneListing} onPostNew={() => setView('post')}
                 userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode}
                 onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}

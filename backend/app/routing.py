@@ -109,3 +109,64 @@ class OSRMClient:
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             logger.warning("OSRM route request failed: %s", exc)
             return None
+
+
+class GoogleRoutesClient(OSRMClient):
+    """Google Routes API client — the primary router when a map key is set.
+
+    Shares OSRMClient's concurrency limit and result cache. If Google can't
+    route a request (quota, key restrictions, API not enabled, no route) it
+    falls back to `fallback` (OSRM) when one is configured, so matching keeps
+    working instead of silently losing routes."""
+
+    ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
+
+    def __init__(self, api_key: str, fallback: OSRMClient | None = None, **kwargs) -> None:
+        super().__init__(base_url="", **kwargs)
+        self.api_key = api_key
+        self.fallback = fallback
+
+    def _fetch(self, points: list[LatLng]) -> RouteResult | None:
+        result = self._fetch_google(points)
+        if result is None and self.fallback is not None:
+            return self.fallback._fetch(points)
+        return result
+
+    @staticmethod
+    def _waypoint(point: LatLng) -> dict:
+        return {"location": {"latLng": {"latitude": point[0], "longitude": point[1]}}}
+
+    def _fetch_google(self, points: list[LatLng]) -> RouteResult | None:
+        body = {
+            "origin": self._waypoint(points[0]),
+            "destination": self._waypoint(points[-1]),
+            "travelMode": "DRIVE",
+            "polylineEncoding": "GEO_JSON_LINESTRING",
+        }
+        if len(points) > 2:
+            body["intermediates"] = [self._waypoint(p) for p in points[1:-1]]
+        try:
+            with self._slots:
+                resp = httpx.post(
+                    self.ENDPOINT,
+                    json=body,
+                    headers={
+                        "X-Goog-Api-Key": self.api_key,
+                        "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.geoJsonLinestring",
+                    },
+                    timeout=self.timeout,
+                )
+            resp.raise_for_status()
+            routes = resp.json().get("routes")
+            if not routes:
+                return None
+            best = routes[0]
+            return RouteResult(
+                distance_m=float(best["distanceMeters"]),
+                duration_s=float(str(best["duration"]).rstrip("s")),
+                coordinates=[(float(x), float(y)) for x, y in best["polyline"]["geoJsonLinestring"]["coordinates"]],
+            )
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            # Log the exception type only: httpx errors embed the request URL.
+            logger.warning("Google Routes request failed: %s", type(exc).__name__)
+            return None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time
 from typing import Any, Annotated, Literal
@@ -8,12 +9,14 @@ from typing import Any, Annotated, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg2.pool import PoolError
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
 from backend.app.domain import DomainError, DriverTrip, Store, User
-from backend.app.routing import OSRMClient
+from backend.app.realtime import ConnectionManager, build_bus
+from backend.app.routing import GoogleRoutesClient, OSRMClient
 
 
 class Settings(BaseSettings):
@@ -25,10 +28,16 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5173 http://127.0.0.1:5173"
 
     # Base URL of the self-hosted OSRM (see docker-compose.yml `osrm`). Used
-    # server-side to store driver routes and compute rider detours. Empty
+    # server-side to store driver routes and compute passenger detours. Empty
     # disables routing: trips are stored without a route and search falls back
     # to endpoint-radius matching.
     osrm_base_url: str = "http://localhost:5001"
+
+    # Google Maps Platform key (env MAP_API_KEY). Primary map provider: served
+    # to the browser via /config/maps for the Maps JavaScript API (so restrict
+    # it by HTTP referrer), and used server-side for the Routes API, with OSRM
+    # as the fallback router. Unset: the app falls back to OSRM + OpenStreetMap.
+    map_api_key: str | None = None
 
     # Supabase project URL (must match the frontend's VITE_SUPABASE_URL). Access
     # tokens are verified against its JWKS endpoint. Required for /auth/login.
@@ -46,6 +55,11 @@ class Settings(BaseSettings):
     # invoking scheduled requests. Required to trigger the /cron/expire sweep
     # or the manual expire endpoints below.
     cron_secret: str | None = None
+
+    # Redis URL (env REDIS_URL, e.g. rediss://default:pw@host:6379). When set,
+    # WebSocket messages fan out across all backend instances via pub/sub; unset,
+    # they're delivered only to sockets on the same instance.
+    redis_url: str | None = None
 
     # Space-separated allowlist of emails granted access to /admin/* endpoints
     # (see AdminUser below), matched case-insensitively.
@@ -96,7 +110,7 @@ class VehicleUpdate(BaseModel):
     has_license: bool = False
     has_insurance: bool = False
     has_good_driving_record: bool = False
-    # Omitted = keep the stored plate. Shown to riders only once accepted.
+    # Omitted = keep the stored plate. Shown to passengers only once accepted.
     plate: str | None = Field(default=None, max_length=12)
 
 
@@ -107,6 +121,8 @@ class LocationCreate(BaseModel):
     provider: str | None = None
     provider_place_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # True when the point stands for a whole area (a city) rather than an address.
+    is_general: bool = False
 
 
 class RideRequestCreate(BaseModel):
@@ -143,6 +159,14 @@ class PricePreview(BaseModel):
     pickup_location_id: str
     destination_location_id: str
     seats_available: int = Field(..., ge=1, le=8)
+
+
+class DriverTripUpdate(BaseModel):
+    target_date: date | None = None
+    flexibility: str | None = None
+    seats_available: int | None = Field(default=None, ge=1, le=8)
+    departure_time: time | None = None
+    notes: str | None = Field(default=None, max_length=500)
 
 
 class RatingCreate(BaseModel):
@@ -283,36 +307,21 @@ class WarnUserRequest(BaseModel):
     message: str = Field(..., min_length=1)
 
 
-# ─── WebSocket connection manager ─────────────────────────────────────────────
-
-class ConnectionManager:
-    def __init__(self) -> None:
-        self._sockets: dict[str, WebSocket] = {}
-
-    async def connect(self, user_id: str, ws: WebSocket) -> None:
-        await ws.accept()
-        self._sockets[user_id] = ws
-
-    def disconnect(self, user_id: str) -> None:
-        self._sockets.pop(user_id, None)
-
-    async def send(self, user_id: str, data: dict[str, Any]) -> None:
-        ws = self._sockets.get(user_id)
-        if ws:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                self.disconnect(user_id)
-
-    async def broadcast(self, user_ids: list[str], data: dict[str, Any]) -> None:
-        await asyncio.gather(*[self.send(uid, data) for uid in user_ids], return_exceptions=True)
-
-
 # ─── App factory ──────────────────────────────────────────────────────────────
 
 def create_app(store: Store | None = None, settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="Carpool API")
     s = settings or Settings()
+    manager = ConnectionManager(build_bus(s.redis_url))
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        await manager.start()
+        try:
+            yield
+        finally:
+            await manager.stop()
+
+    app = FastAPI(title="Carpool API", lifespan=lifespan)
     origins = s.allowed_origins.split()
     app.add_middleware(
         CORSMiddleware,
@@ -322,17 +331,29 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.state.store = store or Store(
-        s.database_url, router=OSRMClient(s.osrm_base_url) if s.osrm_base_url else None,
-    )
+    osrm = OSRMClient(s.osrm_base_url) if s.osrm_base_url else None
+    router = GoogleRoutesClient(s.map_api_key, fallback=osrm) if s.map_api_key else osrm
+    app.state.store = store or Store(s.database_url, router=router)
     app.state.settings = s
-    app.state.ws_manager = ConnectionManager()
+    app.state.ws_manager = manager
+
+    @app.exception_handler(PoolError)
+    async def handle_pool_busy(_: Any, exc: PoolError) -> JSONResponse:
+        # Busy, not broken: tell the client to retry (and keep CORS headers on the reply).
+        return JSONResponse(status_code=503, content={"detail": "Server is busy, please retry"}, headers={"Retry-After": "2"})
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(_: Any, exc: DomainError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     # ── Core ──────────────────────────────────────────────────────────────────
+
+    @app.get("/config/maps")
+    def maps_config() -> dict[str, Any]:
+        # Public on purpose: the Maps JavaScript API key is necessarily visible
+        # to the browser; it is secured by its HTTP-referrer restriction.
+        return {"provider": "google" if app.state.settings.map_api_key else None,
+                "api_key": app.state.settings.map_api_key}
 
     @app.get("/")
     def root() -> dict[str, Any]:
@@ -477,7 +498,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.patch("/ride-requests/{request_id}/pickup")
     async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser) -> dict[str, Any]:
         request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
-        # Lets a driver who already accepted this rider see the corrected pickup
+        # Lets a driver who already accepted this passenger see the corrected pickup
         # point without polling — mirrors the transition_connection broadcast below.
         for c in app.state.store.get_user_connections(user.id):
             if c.ride_request_id == request.id and c.status == "accepted":
@@ -516,7 +537,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.post("/driver-trips/price-preview")
     def driver_trip_price_preview(payload: PricePreview, user: CurrentUser) -> dict[str, Any]:
-        """'Each rider pays' while a driver is still filling in the post form."""
+        """'Each passenger pays' while a driver is still filling in the post form."""
         _ = user
         app.state.store._validate_location_ids(payload.pickup_location_id, payload.destination_location_id)
         draft = DriverTrip(
@@ -536,6 +557,19 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.post("/driver-trips/{trip_id}/cancel")
     def cancel_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
         trip = app.state.store.cancel_driver_trip(user.id, trip_id)
+        return serialize_driver_trip(app.state.store, trip, exact=True)
+
+    @app.post("/driver-trips/{trip_id}/pause")
+    def pause_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        return serialize_driver_trip(app.state.store, app.state.store.pause_driver_trip(user.id, trip_id), exact=True)
+
+    @app.post("/driver-trips/{trip_id}/resume")
+    def resume_driver_trip(trip_id: str, user: CurrentUser) -> dict[str, Any]:
+        return serialize_driver_trip(app.state.store, app.state.store.resume_driver_trip(user.id, trip_id), exact=True)
+
+    @app.patch("/driver-trips/{trip_id}")
+    def update_driver_trip(trip_id: str, payload: DriverTripUpdate, user: CurrentUser) -> dict[str, Any]:
+        trip = app.state.store.update_driver_trip(user.id, trip_id, payload.model_dump(exclude_unset=True))
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.get("/driver-trips/search")
@@ -565,6 +599,11 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
             "remaining": result["remaining"],
         }
+
+    @app.get("/driver-trips/{trip_id}/matches")
+    def driver_trip_matches(trip_id: str, user: CurrentUser) -> list[dict[str, Any]]:
+        matches = app.state.store.rider_matches(user.id, trip_id)
+        return [serialize_ride_request(app.state.store, rr, exact=False) for rr in matches]
 
     @app.post("/driver-trips/{trip_id}/proposal/skip")
     def skip_driver_trip_proposal(trip_id: str, payload: DriverProposalSkip, user: CurrentUser) -> dict[str, Any]:
@@ -731,6 +770,13 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.get("/connections/{connection_id}/live")
     def connection_live_status(connection_id: str, user: CurrentUser) -> dict[str, Any]:
         return serialize(app.state.store.trip_day_status(user.id, connection_id))
+
+    @app.post("/connections/{connection_id}/picked-up")
+    async def driver_picked_up(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        connection = app.state.store.mark_picked_up(user.id, connection_id)
+        rr = app.state.store.get_ride_request(connection.ride_request_id)
+        await app.state.ws_manager.broadcast([rr.rider_id], {"type": "connection_update", "connection_id": connection_id, "status": connection.status})
+        return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/{connection_id}/at-pickup")
     async def rider_at_pickup(connection_id: str, user: CurrentUser) -> dict[str, Any]:
@@ -955,19 +1001,17 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.websocket("/ws/{user_id}")
     async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
         manager: ConnectionManager = app.state.ws_manager
-        await manager.connect(user_id, websocket)
+        # Authenticate before accepting: the socket carries a user's private
+        # updates, so a missing, invalid or someone-else's token is refused at
+        # the handshake (the client sees a failed connection).
         token = websocket.query_params.get("token")
-        if token:
-            try:
-                decoded_id = decode_access_token(token, app.state.settings.jwt_secret)
-                if decoded_id != user_id:
-                    await websocket.close(code=4001)
-                    manager.disconnect(user_id)
-                    return
-            except DomainError:
-                await websocket.close(code=4001)
-                manager.disconnect(user_id)
-                return
+        try:
+            if not token or decode_access_token(token, app.state.settings.jwt_secret) != user_id:
+                raise DomainError("Unauthorized", 401)
+        except DomainError:
+            await websocket.close(code=4001)
+            return
+        await manager.connect(user_id, websocket)
         try:
             while True:
                 data = await websocket.receive_json()
@@ -1116,7 +1160,7 @@ def serialize_driver_trip(store: Store, trip: Any, exact: bool) -> dict[str, Any
     data["driver_photo_url"] = driver_profile.photo_url if driver_profile else None
     data["driver_stats"] = store.user_stats(trip.driver_id)
     vehicle = store.get_vehicle(trip.driver_id)
-    # Make/model/color help riders spot the car; the plate waits for acceptance.
+    # Make/model/color help passengers spot the car; the plate waits for acceptance.
     data["vehicle"] = ({"make": vehicle.make, "model": vehicle.model, "color": vehicle.color,
                         "car_type": vehicle.car_type} if vehicle else None)
     data["pricing"] = store.trip_pricing(trip)
@@ -1135,13 +1179,13 @@ def serialize_connection(store: Store, connection: Any, viewer_id: str | None = 
     data["rider_profile"] = _public_profile(store, rr.rider_id)
     data["driver_profile"] = _public_profile(store, trip.driver_id)
     # Contact details unlock once the ride is accepted: the other party's
-    # phone and, for the rider, the plate to look for at pickup.
+    # phone and, for the passenger, the plate to look for at pickup.
     if exact:
-        rider = store.get_profile(rr.rider_id)
+        passenger = store.get_profile(rr.rider_id)
         driver = store.get_profile(trip.driver_id)
         vehicle = store.get_vehicle(trip.driver_id)
         if data["rider_profile"] is not None:
-            data["rider_profile"]["phone"] = rider.phone if rider else None
+            data["rider_profile"]["phone"] = passenger.phone if passenger else None
         if data["driver_profile"] is not None:
             data["driver_profile"]["phone"] = driver.phone if driver else None
         data["driver_trip"]["vehicle"] = {**(data["driver_trip"]["vehicle"] or {}),
@@ -1154,6 +1198,7 @@ def serialize_connection(store: Store, connection: Any, viewer_id: str | None = 
     if exact or connection.status == "completed":
         # How the driver would like to be paid back, once there's a ride to settle.
         data["settlement"] = serialize(store.get_settlement_preference(trip.driver_id))
+    data["fare"] = store.connection_fare(connection)
     return data
 
 

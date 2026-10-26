@@ -46,7 +46,7 @@ const ME_RESPONSE = {
   email: "ada@example.com",
   email_domain: "example.com",
   onboarded_at: "2026-01-01T00:00:00Z",
-  profile: { user_id: "usr_abc", display_name: "Ada Rider", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
+  profile: { user_id: "usr_abc", display_name: "Ada Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
   vehicle: null,
 };
 
@@ -258,7 +258,8 @@ describe("Feed view", () => {
     const connectBtn = screen.getByRole("button", { name: /instant request match/i });
     await user.click(connectBtn);
 
-    await waitFor(() => screen.getByText(/track pending offers/i));
+    // The request lands the passenger on the trip screen, waiting on the driver.
+    await waitFor(() => screen.getByText(/to accept/i));
   });
 });
 
@@ -317,7 +318,7 @@ describe("Post listing view", () => {
 
     render(<MemoryRouter><App /></MemoryRouter>);
     // Driver mode is pre-seeded before render, so Discover shows DriverHomeView
-    // ("Your route") rather than the rider-mode "Find your ride" heading.
+    // ("Your route") rather than the passenger-mode "Find your ride" heading.
     await waitFor(() => screen.getByRole("heading", { name: /^your route$/i }));
 
     // Navigate to Post view
@@ -423,7 +424,7 @@ describe("Post listing view", () => {
 
     render(<MemoryRouter><App /></MemoryRouter>);
     // Driver mode is pre-seeded before render, so Discover shows DriverHomeView
-    // ("Your route") rather than the rider-mode "Find your ride" heading.
+    // ("Your route") rather than the passenger-mode "Find your ride" heading.
     await waitFor(() => screen.getByRole("heading", { name: /^your route$/i }));
 
     await user.click(screen.getByRole("button", { name: /^post$/i }));
@@ -480,6 +481,8 @@ describe("Connections view", () => {
 
     // Create a connection by clicking connect
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
+    await waitFor(() => screen.getByText(/to accept/i));
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 
     // Accept the connection
@@ -528,6 +531,8 @@ describe("Connections view", () => {
     await waitFor(() => screen.getByText("Logan Airport"));
 
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
+    await waitFor(() => screen.getByText(/to accept/i));
+    await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 
     const declineBtn = screen.getByRole("button", { name: /decline/i });
@@ -580,7 +585,7 @@ describe("Connections view", () => {
     expect(pane()).toHaveTextContent("Driver Alpha");
     expect(pane()).not.toHaveTextContent("Message from Beta");
     // Trip controls live in the pane header for accepted rides.
-    expect(screen.getByRole("button", { name: /gas split/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^fare$/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /complete/i })).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /driver beta/i }));
@@ -692,7 +697,7 @@ describe("Profile view", () => {
     // `hidden`/`xl:` classes aren't computed without real CSS) — either one
     // navigates the same place, so just take the first match.
     await user.click(screen.getAllByRole("button", { name: /^profile$/i })[0]);
-    await waitFor(() => expect(screen.getAllByText("Ada Rider").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("Ada Passenger").length).toBeGreaterThan(0));
   });
 
   it("shows ride stats and account settings above the profile form", async () => {
@@ -729,6 +734,7 @@ describe("Profile view", () => {
       return { ok: false, json: async () => ({ detail: "not found" }) };
     });
     vi.stubGlobal("fetch", fetchMock);
+    sessionStorage.setItem("carpool_mode", "driver");
 
     render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
     await waitFor(() => screen.getByText(/driver readiness/i));
@@ -757,7 +763,9 @@ describe("Profile view", () => {
     });
 
     render(<MemoryRouter initialEntries={["/profile"]}><App /></MemoryRouter>);
-    await waitFor(() => screen.getByText(/driver readiness/i));
+    await waitFor(() => screen.getByRole("checkbox", { name: /driver mode/i }));
+    // Passenger mode: the driver-only vehicle form stays out of the way.
+    expect(screen.queryByText(/driver readiness/i)).toBeNull();
 
     expect(screen.queryByRole("button", { name: /sign out/i })).toBeNull();
     await user.click(screen.getByRole("button", { name: /account/i }));
@@ -772,14 +780,14 @@ describe("Profile view", () => {
       "GET /driver-trips/search": [],
       "GET /ride-requests/search": [],
       "GET /me/driver-trips": [{ ...DRIVER_TRIP_1, driver_id: "usr_abc", target_date: future, destination: { id: "loc_d", label: "Driver Destination", exact: true } }],
-      "GET /me/ride-requests": [{ ...RIDE_REQUEST_1, rider_id: "usr_abc", target_date: future, destination: { id: "loc_r", label: "Rider Destination", exact: true } }],
+      "GET /me/ride-requests": [{ ...RIDE_REQUEST_1, rider_id: "usr_abc", target_date: future, destination: { id: "loc_r", label: "Passenger Destination", exact: true } }],
     });
 
     render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
     await waitFor(() => screen.getByRole("heading", { name: /^my rides$/i }));
 
     // Passenger mode (pre-seeded) — only ride requests, never driver trips.
-    await waitFor(() => screen.getByText("Rider Destination"));
+    await waitFor(() => screen.getByText("Passenger Destination"));
     expect(screen.getByText("Your ride requests")).toBeTruthy();
     expect(screen.queryByText("Driver Destination")).toBeNull();
   });
