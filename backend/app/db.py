@@ -25,7 +25,11 @@ def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10) -> None:
     # Each Cloud Run instance holds its own pool, so total connections =
     # instances x DB_POOL_MAX — keep that under the database's limit.
     maxconn = int(os.environ.get("DB_POOL_MAX", maxconn))
-    _pool = ThreadedConnectionPool(minconn, maxconn, dsn=database_url)
+    # Keepalives stop idle pooled connections being silently dropped by NAT/poolers.
+    _pool = ThreadedConnectionPool(
+        minconn, maxconn, dsn=database_url,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
     # psycopg2's pool raises the instant it is empty. A page load fires many
     # requests at once, so callers queue on this semaphore for a free connection instead.
     _slots = threading.BoundedSemaphore(maxconn)
@@ -37,6 +41,20 @@ def close_pool() -> None:
         _pool.closeall()
         _pool = None
     _slots = None
+
+
+def _is_alive(conn: psycopg2.extensions.connection) -> bool:
+    """True if the server still answers on this connection (conn.closed only
+    reflects drops we've already noticed, not ones the pooler did silently)."""
+    if conn.closed:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.rollback()
+        return True
+    except psycopg2.Error:
+        return False
 
 
 @contextmanager
@@ -54,7 +72,11 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         raise PoolError("timed out waiting for a database connection")
     try:
         conn = _pool.getconn()
-        if conn.closed:  # the server/pooler dropped an idle connection
+        # The server/pooler may have dropped an idle connection: replace it
+        # (the pool opens a fresh one when it has no spare).
+        for _ in range(3):
+            if _is_alive(conn):
+                break
             _pool.putconn(conn, close=True)
             conn = _pool.getconn()
     except Exception:
@@ -65,11 +87,14 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass  # connection is dead; it is discarded below
         raise
     finally:
         _local.conn = None
-        _pool.putconn(conn)
+        _pool.putconn(conn, close=bool(conn.closed))
         _slots.release()
 
 
