@@ -579,7 +579,12 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         # Tell the other party right away (e.g. a passenger who was just offered a
         # ride); the client treats an unknown connection id as a new request.
         other_id = trip.driver_id if user.id == rr.rider_id else rr.rider_id
-        await app.state.ws_manager.broadcast([other_id], {"type": "pickup_updated", "connection_id": connection.id})
+        if connection.status == "pending":
+            await app.state.ws_manager.broadcast([other_id], {"type": "pickup_updated", "connection_id": connection.id})
+        else:  # confirmed on creation (mutual request / auto-accept)
+            await app.state.ws_manager.broadcast([rr.rider_id, trip.driver_id], {
+                "type": "connection_update", "connection_id": connection.id, "status": connection.status,
+            })
         return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/expire")

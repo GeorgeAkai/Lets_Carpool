@@ -44,3 +44,20 @@ def test_driver_offer_is_pushed_to_the_passenger_socket():
             json={"ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]},
         ).json()
         assert ws.receive_json() == {"type": "pickup_updated", "connection_id": connection["id"]}
+
+
+def test_mutual_requests_confirm_instead_of_both_waiting():
+    from backend.tests.test_mvp_api import make_request_and_trip
+
+    c = client()
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(c)
+    body = {"ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]}
+
+    first = c.post("/connections", headers=rider_headers, json=body).json()
+    again = c.post("/connections", headers=rider_headers, json=body).json()
+    assert again["id"] == first["id"] and again["status"] == "pending"
+
+    # The driver offers the same pair: the passenger's pending request is accepted.
+    mutual = c.post("/connections", headers=driver_headers, json=body).json()
+    assert mutual["id"] == first["id"] and mutual["status"] == "accepted"
+    assert len(c.get("/me/connections", headers=driver_headers).json()) == 1

@@ -1356,6 +1356,24 @@ class Store:
         if self.is_blocked(rr.rider_id, trip.driver_id):
             raise DomainError("Blocked users cannot connect", 403)
 
+        # A passenger's request and a driver's offer for the same pair would
+        # otherwise sit as two pending connections, each waiting on the other.
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT * FROM connections
+                   WHERE ride_request_id = %s AND driver_trip_id = %s AND status = 'pending'
+                   ORDER BY created_at LIMIT 1""",
+                (rr.id, trip.id),
+            )
+            existing = cur.fetchone()
+        if existing:
+            existing_conn = _row_to_connection(existing)
+            if existing_conn.initiator_user_id == user_id:
+                return existing_conn  # repeat tap: nothing new to send
+            # The other party already asked: both want this ride, so confirm it.
+            return self.transition_connection(user_id, existing_conn.id, "accept")
+
         conn_obj = Connection(
             id=new_id("con"), ride_request_id=rr.id,
             driver_trip_id=trip.id, initiator_user_id=user_id,
