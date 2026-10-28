@@ -29,3 +29,18 @@ def test_websocket_requires_a_token_for_that_user():
     with c.websocket_connect(f"/ws/{me['id']}?token={_token(my_headers)}") as ws:
         ws.send_json({"type": "ping"})
         assert ws.receive_json() == {"type": "pong"}
+
+
+def test_driver_offer_is_pushed_to_the_passenger_socket():
+    from backend.tests.test_mvp_api import make_request_and_trip
+
+    c = client()
+    passenger, rider_headers, driver, driver_headers, ride_request, driver_trip = make_request_and_trip(c)
+
+    with c.websocket_connect(f"/ws/{passenger['id']}?token={_token(rider_headers)}") as ws:
+        connection = c.post(
+            "/connections",
+            headers=driver_headers,
+            json={"ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]},
+        ).json()
+        assert ws.receive_json() == {"type": "pickup_updated", "connection_id": connection["id"]}

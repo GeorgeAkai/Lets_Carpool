@@ -572,8 +572,14 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     # ── Connections ───────────────────────────────────────────────────────────
 
     @app.post("/connections")
-    def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
+    async def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
         connection = app.state.store.create_connection(user.id, payload.model_dump())
+        rr = app.state.store.get_ride_request(connection.ride_request_id)
+        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        # Tell the other party right away (e.g. a passenger who was just offered a
+        # ride); the client treats an unknown connection id as a new request.
+        other_id = trip.driver_id if user.id == rr.rider_id else rr.rider_id
+        await app.state.ws_manager.broadcast([other_id], {"type": "pickup_updated", "connection_id": connection.id})
         return serialize_connection(app.state.store, connection, viewer_id=user.id)
 
     @app.post("/connections/expire")
