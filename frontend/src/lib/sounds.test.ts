@@ -7,6 +7,8 @@ describe("notification sounds", () => {
   it("maps backend notification types to tones", () => {
     expect(soundForNotification("connection_received")).toBe("request");
     expect(soundForNotification("connection_accepted")).toBe("accepted");
+    expect(soundForNotification("new_match")).toBe("request");
+    expect(soundForNotification("connection_declined")).toBe("declined");
     expect(soundForNotification("ride_started")).toBe("driving");
     expect(soundForNotification("chat_message")).toBe("message");
     expect(soundForNotification("payment_processed")).toBe("paid");

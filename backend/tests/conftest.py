@@ -24,6 +24,7 @@ TABLES = [
     "gas_split_confirmations",
     "messages",
     "connections",
+    "match_candidates",
     "match_skips",
     "driver_match_skips",
     "driver_trips",

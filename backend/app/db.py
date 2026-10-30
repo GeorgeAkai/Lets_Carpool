@@ -1,8 +1,10 @@
 """PostgreSQL connection pool and schema bootstrap."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Generator
 
@@ -10,14 +12,22 @@ import psycopg2
 import psycopg2.extras
 from psycopg2.pool import PoolError, ThreadedConnectionPool
 
+log = logging.getLogger("carpool.db")
+
 _pool: ThreadedConnectionPool | None = None
 
 
 # How long a request waits for a free connection before giving up (seconds).
 POOL_WAIT_SECONDS = float(os.environ.get("DB_POOL_WAIT_SECONDS", "20"))
 
+# A pooled connection is only probed with a round trip if it has sat idle this
+# long (seconds); busy connections are trusted. TCP keepalives cover the gap.
+VALIDATE_AFTER_IDLE_SECONDS = float(os.environ.get("DB_VALIDATE_AFTER_IDLE_SECONDS", "30"))
+
 _slots: threading.BoundedSemaphore | None = None
 _local = threading.local()
+# id(conn) -> time.monotonic() when it was last returned to the pool.
+_last_returned: dict[int, float] = {}
 
 
 def init_pool(database_url: str, minconn: int = 1, maxconn: int = 10) -> None:
@@ -41,6 +51,23 @@ def close_pool() -> None:
         _pool.closeall()
         _pool = None
     _slots = None
+    _last_returned.clear()
+
+
+def _needs_probe(conn: psycopg2.extensions.connection) -> bool:
+    """Fresh connections and ones idle for a while get probed; ones that just
+    served a request are assumed healthy, which saves a round trip per checkout."""
+    returned = _last_returned.get(id(conn))
+    return returned is None or time.monotonic() - returned > VALIDATE_AFTER_IDLE_SECONDS
+
+
+def _release(conn: psycopg2.extensions.connection) -> None:
+    discard = bool(conn.closed)
+    if discard:
+        _last_returned.pop(id(conn), None)
+    else:
+        _last_returned[id(conn)] = time.monotonic()
+    _pool.putconn(conn, close=discard)  # type: ignore[union-attr]
 
 
 def _is_alive(conn: psycopg2.extensions.connection) -> bool:
@@ -75,8 +102,11 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         # The server/pooler may have dropped an idle connection: replace it
         # (the pool opens a fresh one when it has no spare).
         for _ in range(3):
+            if not _needs_probe(conn) and not conn.closed:
+                break
             if _is_alive(conn):
                 break
+            _last_returned.pop(id(conn), None)
             _pool.putconn(conn, close=True)
             conn = _pool.getconn()
     except Exception:
@@ -94,7 +124,7 @@ def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
         raise
     finally:
         _local.conn = None
-        _pool.putconn(conn, close=bool(conn.closed))
+        _release(conn)
         _slots.release()
 
 
@@ -182,7 +212,7 @@ def run_migrations(database_url: str) -> None:
     # Store.get_nearby_drivers rather than by deleting rows, so a driver who
     # briefly drops offline doesn't lose their last-known position outright.
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS driver_locations (
+        CREATE UNLOGGED TABLE IF NOT EXISTS driver_locations (
             user_id     TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             geog        GEOGRAPHY(POINT, 4326) NOT NULL,
             heading     DOUBLE PRECISION,
@@ -446,6 +476,146 @@ def run_migrations(database_url: str) -> None:
             fulfilled_at            TIMESTAMPTZ
         )
     """)
+
+    # ── Secondary indexes ──────────────────────────────────────────────────────
+    # Postgres indexes only primary keys and UNIQUE constraints by itself, so
+    # every foreign-key lookup and status/date filter below was a sequential scan.
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS idx_connections_ride_request ON connections (ride_request_id)",
+        "CREATE INDEX IF NOT EXISTS idx_connections_driver_trip ON connections (driver_trip_id)",
+        "CREATE INDEX IF NOT EXISTS idx_connections_pending ON connections (updated_at) WHERE status = 'pending'",
+        "CREATE INDEX IF NOT EXISTS idx_messages_connection ON messages (connection_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications (user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks (blocked_id, blocker_id)",
+        "CREATE INDEX IF NOT EXISTS idx_gas_splits_connection ON gas_split_confirmations (connection_id)",
+        # Discovery only ever looks at live listings, so index just those.
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_live ON driver_trips (target_date) WHERE status IN ('open', 'matched')",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_live ON ride_requests (target_date) WHERE status IN ('open', 'matched')",
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_driver ON driver_trips (driver_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_rider ON ride_requests (rider_id)",
+        # The locations GiST index drives spatial search; these let it join back to listings.
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_pickup_loc ON driver_trips (pickup_location_id)",
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_dest_loc ON driver_trips (destination_location_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_pickup_loc ON ride_requests (pickup_location_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_dest_loc ON ride_requests (destination_location_id)",
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_tags ON driver_trips USING GIN (tags)",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_tags ON ride_requests USING GIN (tags)",
+        "CREATE INDEX IF NOT EXISTS idx_pool_memberships_user ON pool_memberships (user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pool_messages_pool ON pool_messages (pool_id, created_at)",
+    ):
+        cur.execute(statement)
+
+    # One live connection per request/trip pair: the "already pending" check in
+    # Store.create_connection is read-then-insert, so two simultaneous taps could
+    # both pass it. If old data already holds duplicates the index can't be
+    # built; log it instead of refusing to boot, and fix the rows by hand.
+    try:
+        cur.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_connections_live_pair
+               ON connections (ride_request_id, driver_trip_id)
+               WHERE status IN ('pending', 'accepted')"""
+        )
+    except psycopg2.Error:
+        log.exception("Could not create uq_connections_live_pair: duplicate live connections exist")
+
+    # ── Connection response tracking ───────────────────────────────────────────
+    # responded_at: when the non-initiating side accepted or declined (drives the
+    # "usually replies in N min" signal). reminded_at: the one nudge sent to a
+    # recipient who has not answered yet.
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ")
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_connections_pending_created ON connections (created_at) WHERE status = 'pending'")
+
+    # ── Denormalized coordinates on listings ───────────────────────────────────
+    # Search and matching used to join `locations` twice per listing just to reach
+    # its point. The point and area flag are copied onto the listing instead, by a
+    # trigger so every write path (create, pickup edit, series) stays consistent.
+    # Locations are immutable, so the copies can't go stale.
+    for table in ("ride_requests", "driver_trips"):
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pickup_geog GEOGRAPHY(POINT, 4326)")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS dest_geog GEOGRAPHY(POINT, 4326)")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pickup_is_general BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS dest_is_general BOOLEAN NOT NULL DEFAULT FALSE")
+        # When the pair-matching candidates were last computed for this listing; NULL = not yet.
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS matches_computed_at TIMESTAMPTZ")
+        cur.execute(f"""
+            UPDATE {table} x SET pickup_geog = p.geog, pickup_is_general = p.is_general,
+                                 dest_geog = d.geog, dest_is_general = d.is_general
+            FROM locations p, locations d
+            WHERE x.pickup_geog IS NULL AND p.id = x.pickup_location_id AND d.id = x.destination_location_id
+        """)
+    cur.execute("""
+        CREATE OR REPLACE FUNCTION listing_copy_geo() RETURNS trigger AS $$
+        BEGIN
+            SELECT geog, is_general INTO NEW.pickup_geog, NEW.pickup_is_general
+              FROM locations WHERE id = NEW.pickup_location_id;
+            SELECT geog, is_general INTO NEW.dest_geog, NEW.dest_is_general
+              FROM locations WHERE id = NEW.destination_location_id;
+            RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql
+    """)
+    for table in ("ride_requests", "driver_trips"):
+        trigger = f"trg_{table}_copy_geo"
+        cur.execute("SELECT 1 FROM pg_trigger WHERE tgname = %s", (trigger,))
+        if not cur.fetchone():
+            cur.execute(f"""
+                CREATE TRIGGER {trigger} BEFORE INSERT OR UPDATE OF pickup_location_id, destination_location_id
+                ON {table} FOR EACH ROW EXECUTE FUNCTION listing_copy_geo()
+            """)
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_pickup_geog ON ride_requests USING GIST (pickup_geog) WHERE status IN ('open', 'matched')",
+        "CREATE INDEX IF NOT EXISTS idx_ride_requests_dest_geog ON ride_requests USING GIST (dest_geog) WHERE status IN ('open', 'matched')",
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_pickup_geog ON driver_trips USING GIST (pickup_geog) WHERE status IN ('open', 'matched', 'paused')",
+        "CREATE INDEX IF NOT EXISTS idx_driver_trips_dest_geog ON driver_trips USING GIST (dest_geog) WHERE status IN ('open', 'matched', 'paused')",
+    ):
+        cur.execute(statement)
+
+    # ── Precomputed match candidates ───────────────────────────────────────────
+    # Which trips fit which requests is geometry that never changes once both
+    # listings exist, so it is worked out when a listing is created or edited and
+    # stored here with the (expensive, routed) detour. Proposals then only read
+    # this table and apply the live filters: status, seats, skips, blocks.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_candidates (
+            ride_request_id TEXT NOT NULL,
+            driver_trip_id  TEXT NOT NULL,
+            detour_minutes  DOUBLE PRECISION,
+            off_route_m     DOUBLE PRECISION,
+            computed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (ride_request_id, driver_trip_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_match_candidates_trip ON match_candidates (driver_trip_id)")
+
+    # driver_locations is ephemeral (5-minute TTL, rewritten every few seconds per
+    # driver), so skip the write-ahead log for it. Tables created before this
+    # change are converted once; losing it in a database crash only means drivers
+    # reappear on their next GPS tick.
+    cur.execute("SELECT relpersistence FROM pg_class WHERE relname = 'driver_locations'")
+    row = cur.fetchone()
+    if row and row[0] == "p":
+        cur.execute("ALTER TABLE driver_locations SET UNLOGGED")
+
+    # ── Integrity checks ───────────────────────────────────────────────────────
+    # Added NOT VALID so rows written before this existed can't block startup;
+    # they are enforced for every new write, and validated when the data allows.
+    for name, table, expr in (
+        ("driver_trips_seats_ck", "driver_trips", "seats_reserved >= 0 AND seats_reserved <= seats_available"),
+        ("driver_trips_status_ck", "driver_trips",
+         "status IN ('open', 'paused', 'matched', 'expired', 'cancelled', 'completed')"),
+        ("ride_requests_status_ck", "ride_requests",
+         "status IN ('open', 'matched', 'expired', 'cancelled', 'completed')"),
+        ("connections_status_ck", "connections",
+         "status IN ('pending', 'accepted', 'declined', 'cancelled', 'completed', 'expired')"),
+    ):
+        cur.execute("SELECT 1 FROM pg_constraint WHERE conname = %s", (name,))
+        if not cur.fetchone():
+            cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({expr}) NOT VALID")
+        try:
+            cur.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
+        except psycopg2.Error:
+            log.warning("Existing rows violate %s; new writes are still checked", name)
 
     cur.close()
     conn.close()

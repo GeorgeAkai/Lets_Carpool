@@ -109,6 +109,8 @@ Drivers can opt in to sharing a live GPS position (`DriverLocation`: lat/lng/hea
 - **Nearby-driver browsing**: passengers in browse mode see nearby sharing drivers as animated markers on the map, polled periodically.
 - **"Start Driving" pickup navigation**: once a connection is `accepted`, the driver can start navigation to the passenger's (now-revealed) pickup point. The map draws a routed line to the pickup, and the ETA/distance panel refreshes as the driver moves — enough movement or elapsed time triggers a fresh route, not every GPS tick. The driver ends this by marking arrival.
 
+A driver's position is always saved, but the broadcast to nearby users (and its lookups) is rate limited to once every 5 seconds per driver. `driver_locations` is an `UNLOGGED` table: it is ephemeral by design, so it skips the write-ahead log and is simply empty after a database crash until drivers report again.
+
 This is scoped to the pickup leg of one accepted connection, not a standing background service or full-ride tracking, and it is distinct from SOS/emergency journey sharing, which remains out of scope.
 
 ## Fare & Payment Confirmation
@@ -149,13 +151,18 @@ Connection states:
 - `cancelled`
 - `completed`
 
-Pending connections should expire if nobody responds before the relevant ride date.
+Pending connections expire if nobody responds before the relevant ride date, and also lapse 24 hours after they were sent. The person being asked gets one reminder after about 30 minutes (the hourly sweep sends it), and when a request is declined or lapses the sender is pointed at the next-best match.
+
+A passenger may have up to 3 requests out for the same ride request at once. The first accept wins: the passenger's other pending connections for that request are cancelled in the same transaction and their drivers are told.
 
 ## Proposed Matches
 
 - A passenger with an open `RideRequest` is shown one **proposed match**: the best open `DriverTrip` on their route corridor, ranked by detour, then date/flexibility. Trips with too few free seats, more than a day off, already skipped, or already connected to that request are never proposed.
 - The passenger **requests** it (a normal `pending` `Connection` the driver accepts/declines) or **skips** it (recorded per request in `match_skips`; the next-best is proposed).
 - Drivers get the mirror image for an open `DriverTrip`: the best open `RideRequest` along their route (both points in the corridor, destination ahead of pickup, enough seats for the passenger count). They **offer a ride** (a driver-initiated `pending` `Connection`) or **skip** it (`driver_match_skips`). Passenger and driver skips are independent.
+- Which trips fit which requests is computed when a listing is created or edited and stored in `match_candidates` (see `docs/adr/0002-precomputed-match-candidates.md`); a proposal reads those rows and applies the live filters (status, seats, dates, skips, blocks).
+- When both the request and the trip give an exact `departure_time`, ranking uses the gap between them, and pairs more than 3 hours apart are not proposed. The gap is returned as `time_gap_minutes`.
+- Publishing a listing notifies the best 3 matches on the other side (`new_match`), at most one unread nudge per person per listing.
 - There is no `proposed` connection state.
 
 Gas split confirmation is separate from connection state. Do not add payment or split states directly into the connection state machine.
@@ -241,6 +248,8 @@ Use in-app and email notifications for:
 - offer/request received
 - offer/request accepted
 - offer/request declined
+- a pending request nobody has answered (reminder to the recipient, lapse notice to the sender)
+- a new match for a listing you posted (`new_match`)
 - connection cancelled
 - chat unlocked
 - relevant chat messages

@@ -88,12 +88,18 @@ function tripTimes(trip: ApiDriverTrip): { depart: string; arrive: string | null
   return { depart: FLEX_LABEL[(trip.flexibility as Flexibility)] ?? 'Flexible', arrive: null }
 }
 
+/** "10 min", "2 hr" — how long someone usually takes to answer a request. */
+function formatReplyTime(minutes: number): string {
+  return minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 60)} hr`
+}
+
 function driverLine(trip: ApiDriverTrip): string {
   const s = trip.driver_stats
   const parts: string[] = []
   if (s?.rating_avg != null) parts.push(`★ ${s.rating_avg.toFixed(1)}`)
   else parts.push('New driver')
   if (s && s.completed_trips > 0) parts.push(`${s.completed_trips} trip${s.completed_trips === 1 ? '' : 's'}`)
+  if (s?.reply_median_minutes != null) parts.push(`replies in ~${formatReplyTime(s.reply_median_minutes)}`)
   const car = trip.vehicle ? [trip.vehicle.color, trip.vehicle.model ?? trip.vehicle.make].filter(Boolean).join(' ') : ''
   if (car) parts.push(car)
   return parts.join(' · ')
@@ -622,6 +628,7 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
     stats?.rating_avg != null ? `★ ${stats.rating_avg.toFixed(1)}` : 'New driver',
     stats && stats.completed_trips > 0 ? `${stats.completed_trips} trips` : null,
     stats?.id_verified ? 'ID verified' : null,
+    stats?.reply_median_minutes != null ? `Replies in ~${formatReplyTime(stats.reply_median_minutes)}` : null,
   ].filter(Boolean).join(' · ')
 
   return (

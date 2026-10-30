@@ -85,7 +85,7 @@ export function playSound(name: SoundName): void {
 
 /** Map a backend notification type to a sound (or null for silent). */
 export function soundForNotification(type: string): SoundName | null {
-  if (type === 'connection_received') return 'request'
+  if (type === 'connection_received' || type === 'new_match' || type === 'connection_reminder') return 'request'
   if (type.includes('accepted') || type === 'chat_unlocked') return 'accepted'
   if (type.includes('declined')) return 'declined'
   if (type === 'ride_started') return 'driving'

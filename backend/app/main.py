@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time
+from time import monotonic
 from typing import Any, Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg2.pool import PoolError
@@ -14,6 +17,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from backend.app.auth import create_access_token, decode_access_token, verify_supabase_token
+from backend.app.db import get_conn
 from backend.app.domain import DomainError, DriverTrip, Store, User
 from backend.app.realtime import ConnectionManager, build_bus
 from backend.app.routing import GoogleRoutesClient, OSRMClient
@@ -386,22 +390,44 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         vehicle = app.state.store.update_vehicle(user.id, data)
         return serialize(vehicle)
 
+    # A driver's phone reports every few seconds, but nearby passengers only need
+    # the fan-out occasionally, and each fan-out costs a spatial query plus two
+    # profile reads. The position itself is always saved; only the broadcast (and
+    # its lookups) is rate limited per driver, per process.
+    NEARBY_BROADCAST_INTERVAL_S = 5.0
+    last_broadcast: dict[str, float] = {}
+
     @app.put("/me/location")
     async def update_location(payload: DriverLocationUpdate, user: CurrentUser) -> dict[str, Any]:
-        loc = app.state.store.update_driver_location(user.id, payload.model_dump())
-        profile = app.state.store.get_profile(user.id)
-        vehicle = app.state.store.get_vehicle(user.id)
-        nearby = app.state.store.get_nearby_drivers(loc.latitude, loc.longitude, radius_meters=8000)
+        now = monotonic()
+        due = now - last_broadcast.get(user.id, float("-inf")) >= NEARBY_BROADCAST_INTERVAL_S
+        if due:
+            last_broadcast[user.id] = now
+            if len(last_broadcast) > 10_000:  # drop drivers who stopped reporting
+                for uid in [u for u, t in last_broadcast.items() if now - t > 600]:
+                    del last_broadcast[uid]
+
+        def save_and_find_nearby():
+            loc = app.state.store.update_driver_location(user.id, payload.model_dump())
+            if not due:
+                return loc, None, None, []
+            with get_conn():
+                return (loc, app.state.store.get_profile(user.id), app.state.store.get_vehicle(user.id),
+                        app.state.store.get_nearby_drivers(loc.latitude, loc.longitude, radius_meters=8000))
+
+        # psycopg2 blocks; keep it off the event loop that also delivers WebSocket messages.
+        loc, profile, vehicle, nearby = await run_in_threadpool(save_and_find_nearby)
         nearby_user_ids = [d["user_id"] for d in nearby if d["user_id"] != user.id]
-        await app.state.ws_manager.broadcast(nearby_user_ids, {
-            "type": "driver_nearby",
-            "user_id": user.id,
-            "display_name": profile.display_name if profile else "Driver",
-            "latitude": loc.latitude,
-            "longitude": loc.longitude,
-            "heading": loc.heading,
-            "car_type": vehicle.car_type if vehicle else None,
-        })
+        if nearby_user_ids:
+            await app.state.ws_manager.broadcast(nearby_user_ids, {
+                "type": "driver_nearby",
+                "user_id": user.id,
+                "display_name": profile.display_name if profile else "Driver",
+                "latitude": loc.latitude,
+                "longitude": loc.longitude,
+                "heading": loc.heading,
+                "car_type": vehicle.car_type if vehicle else None,
+            })
         return serialize(loc)
 
     # ── Nearby drivers ────────────────────────────────────────────────────────
@@ -433,9 +459,25 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     # ── Ride requests ─────────────────────────────────────────────────────────
 
+    def compute_matches(kind: str, listing_id: str, announce: bool = False) -> None:
+        """Background task: work out who fits the new/edited listing after the
+        response is sent, and (for a newly published one) tell the best matches
+        on the other side. A failure only costs the lazy compute on first proposal."""
+        try:
+            if kind == "request":
+                app.state.store.compute_matches_for_request(listing_id)
+            else:
+                app.state.store.compute_matches_for_trip(listing_id)
+            if announce:
+                app.state.store.notify_new_matches(kind, listing_id)
+        except Exception:
+            logging.getLogger("carpool.matching").exception("match computation failed for %s %s", kind, listing_id)
+
     @app.post("/ride-requests")
-    def create_ride_request(payload: RideRequestCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
+    def create_ride_request(payload: RideRequestCreate, user: CurrentUser, http_request: Request,
+                            background: BackgroundTasks) -> dict[str, Any]:
         request = app.state.store.create_ride_request(user.id, payload.model_dump())
+        background.add_task(compute_matches, "request", request.id, True)
         app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "ride_request", "id": request.id})
         return serialize_ride_request(app.state.store, request, exact=True)
 
@@ -450,33 +492,47 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return serialize_ride_request(app.state.store, request, exact=True)
 
     @app.patch("/ride-requests/{request_id}/pickup")
-    async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser) -> dict[str, Any]:
-        request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
+    async def update_ride_request_pickup(request_id: str, payload: RideRequestPickupUpdate, user: CurrentUser,
+                                         background: BackgroundTasks) -> dict[str, Any]:
+        def update():
+            request = app.state.store.update_ride_request_pickup(user.id, request_id, payload.pickup_location_id)
+            with get_conn():
+                accepted = [
+                    (c.id, app.state.store.get_driver_trip(c.driver_trip_id).driver_id)
+                    for c in app.state.store.get_user_connections(user.id)
+                    if c.ride_request_id == request.id and c.status == "accepted"
+                ]
+                return request, accepted, serialize_ride_request(app.state.store, request, exact=True)
+
+        request, accepted, body = await run_in_threadpool(update)
+        background.add_task(compute_matches, "request", request.id)
         # Lets a driver who already accepted this passenger see the corrected pickup
         # point without polling — mirrors the transition_connection broadcast below.
-        for c in app.state.store.get_user_connections(user.id):
-            if c.ride_request_id == request.id and c.status == "accepted":
-                trip = app.state.store.get_driver_trip(c.driver_trip_id)
-                await app.state.ws_manager.broadcast([trip.driver_id], {
-                    "type": "pickup_updated",
-                    "connection_id": c.id,
-                })
-        return serialize_ride_request(app.state.store, request, exact=True)
+        for connection_id, driver_id in accepted:
+            await app.state.ws_manager.broadcast([driver_id], {
+                "type": "pickup_updated",
+                "connection_id": connection_id,
+            })
+        return body
 
     @app.get("/ride-requests/search")
     def search_ride_requests(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         requests = app.state.store.search_ride_requests(user.id, query.to_store_query())
-        return [serialize_ride_request(app.state.store, r, exact=False) for r in requests]
+        # One connection, and the lookups serializing needs prefetched in bulk.
+        with app.state.store.read_scope(requests=requests):
+            return [serialize_ride_request(app.state.store, r, exact=False) for r in requests]
 
     @app.get("/me/ride-requests")
     def my_ride_requests(user: CurrentUser) -> list[dict[str, Any]]:
         requests = app.state.store.get_user_ride_requests(user.id)
-        return [serialize_ride_request(app.state.store, r, exact=True) for r in requests]
+        with app.state.store.read_scope(requests=requests):
+            return [serialize_ride_request(app.state.store, r, exact=True) for r in requests]
 
     # ── Driver trips ──────────────────────────────────────────────────────────
 
     @app.post("/driver-trips")
-    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, http_request: Request) -> dict[str, Any]:
+    def create_driver_trip(payload: DriverTripCreate, user: CurrentUser, http_request: Request,
+                           background: BackgroundTasks) -> dict[str, Any]:
         data = payload.model_dump()
         weekdays = data.pop("repeat_weekdays")
         if weekdays:
@@ -484,6 +540,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         else:
             trips = [app.state.store.create_driver_trip(user.id, data)]
         for t in trips:
+            background.add_task(compute_matches, "trip", t.id, True)
             app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": t.id})
         result = serialize_driver_trip(app.state.store, trips[0], exact=True)
         result["series_trip_ids"] = [t.id for t in trips]
@@ -522,23 +579,29 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         return serialize_driver_trip(app.state.store, app.state.store.resume_driver_trip(user.id, trip_id), exact=True)
 
     @app.patch("/driver-trips/{trip_id}")
-    def update_driver_trip(trip_id: str, payload: DriverTripUpdate, user: CurrentUser) -> dict[str, Any]:
-        trip = app.state.store.update_driver_trip(user.id, trip_id, payload.model_dump(exclude_unset=True))
+    def update_driver_trip(trip_id: str, payload: DriverTripUpdate, user: CurrentUser,
+                           background: BackgroundTasks) -> dict[str, Any]:
+        changes = payload.model_dump(exclude_unset=True)
+        trip = app.state.store.update_driver_trip(user.id, trip_id, changes)
+        if changes.get("target_date") is not None:
+            background.add_task(compute_matches, "trip", trip.id)
         return serialize_driver_trip(app.state.store, trip, exact=True)
 
     @app.get("/driver-trips/search")
     def search_driver_trips(user: CurrentUser, query: SearchQuery = Depends()) -> list[dict[str, Any]]:
         trips = app.state.store.search_driver_trips(user.id, query.to_store_query())
-        return [serialize_driver_trip(app.state.store, t, exact=False) for t in trips]
+        with app.state.store.read_scope(trips=trips):
+            return [serialize_driver_trip(app.state.store, t, exact=False) for t in trips]
 
     @app.get("/ride-requests/{request_id}/proposal")
     def ride_request_proposal(request_id: str, user: CurrentUser) -> dict[str, Any]:
         result = app.state.store.propose_match(user.id, request_id)
         trip = result["trip"]
-        return {
-            "trip": serialize_driver_trip(app.state.store, trip, exact=False) if trip else None,
-            "remaining": result["remaining"],
-        }
+        with app.state.store.read_scope(trips=[trip] if trip else []):
+            return {
+                "trip": serialize_driver_trip(app.state.store, trip, exact=False) if trip else None,
+                "remaining": result["remaining"],
+            }
 
     @app.post("/ride-requests/{request_id}/proposal/skip")
     def skip_ride_request_proposal(request_id: str, payload: ProposalSkip, user: CurrentUser) -> dict[str, Any]:
@@ -549,15 +612,17 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def driver_trip_proposal(trip_id: str, user: CurrentUser) -> dict[str, Any]:
         result = app.state.store.propose_rider(user.id, trip_id)
         rr = result["request"]
-        return {
-            "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
-            "remaining": result["remaining"],
-        }
+        with app.state.store.read_scope(requests=[rr] if rr else []):
+            return {
+                "request": serialize_ride_request(app.state.store, rr, exact=False) if rr else None,
+                "remaining": result["remaining"],
+            }
 
     @app.get("/driver-trips/{trip_id}/matches")
     def driver_trip_matches(trip_id: str, user: CurrentUser) -> list[dict[str, Any]]:
         matches = app.state.store.rider_matches(user.id, trip_id)
-        return [serialize_ride_request(app.state.store, rr, exact=False) for rr in matches]
+        with app.state.store.read_scope(requests=matches):
+            return [serialize_ride_request(app.state.store, rr, exact=False) for rr in matches]
 
     @app.post("/driver-trips/{trip_id}/proposal/skip")
     def skip_driver_trip_proposal(trip_id: str, payload: DriverProposalSkip, user: CurrentUser) -> dict[str, Any]:
@@ -567,15 +632,20 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.get("/me/driver-trips")
     def my_driver_trips(user: CurrentUser) -> list[dict[str, Any]]:
         trips = app.state.store.get_user_driver_trips(user.id)
-        return [serialize_driver_trip(app.state.store, t, exact=True) for t in trips]
+        with app.state.store.read_scope(trips=trips):
+            return [serialize_driver_trip(app.state.store, t, exact=True) for t in trips]
 
     # ── Connections ───────────────────────────────────────────────────────────
 
     @app.post("/connections")
     async def create_connection(payload: ConnectionCreate, user: CurrentUser) -> dict[str, Any]:
-        connection = app.state.store.create_connection(user.id, payload.model_dump())
-        rr = app.state.store.get_ride_request(connection.ride_request_id)
-        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        def create():
+            connection = app.state.store.create_connection(user.id, payload.model_dump())
+            with app.state.store.read_scope(connections=[connection]):
+                return (connection, app.state.store.get_ride_request(connection.ride_request_id),
+                        app.state.store.get_driver_trip(connection.driver_trip_id))
+
+        connection, rr, trip = await run_in_threadpool(create)
         # Tell the other party right away (e.g. a passenger who was just offered a
         # ride); the client treats an unknown connection id as a new request.
         other_id = trip.driver_id if user.id == rr.rider_id else rr.rider_id
@@ -585,7 +655,12 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             await app.state.ws_manager.broadcast([rr.rider_id, trip.driver_id], {
                 "type": "connection_update", "connection_id": connection.id, "status": connection.status,
             })
-        return serialize_connection(app.state.store, connection, viewer_id=user.id)
+
+        def render():
+            with app.state.store.read_scope(connections=[connection], viewer_id=user.id):
+                return serialize_connection(app.state.store, connection, viewer_id=user.id)
+
+        return await run_in_threadpool(render)
 
     @app.post("/connections/expire")
     def expire_connections(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
@@ -604,26 +679,42 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     @app.get("/me/connections")
     def my_connections(user: CurrentUser) -> list[dict[str, Any]]:
         connections = app.state.store.get_user_connections(user.id)
-        return [serialize_connection(app.state.store, c, viewer_id=user.id) for c in connections]
+        with app.state.store.read_scope(connections=connections, viewer_id=user.id):
+            return [serialize_connection(app.state.store, c, viewer_id=user.id) for c in connections]
+
+    @app.get("/me/changes")
+    def my_changes(user: CurrentUser) -> dict[str, str]:
+        # Cheap change detector for polling clients: refetch connections and
+        # notifications only when this token moves.
+        return {"version": app.state.store.changes_version(user.id)}
 
     @app.post("/connections/{connection_id}/transition")
     async def transition_connection(connection_id: str, payload: ConnectionAction, user: CurrentUser) -> dict[str, Any]:
-        connection = app.state.store.transition_connection(user.id, connection_id, payload.action)
-        rr = app.state.store.get_ride_request(connection.ride_request_id)
-        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        def transition():
+            connection = app.state.store.transition_connection(user.id, connection_id, payload.action)
+            with app.state.store.read_scope(connections=[connection], viewer_id=user.id):
+                return (connection, app.state.store.get_ride_request(connection.ride_request_id),
+                        app.state.store.get_driver_trip(connection.driver_trip_id),
+                        serialize_connection(app.state.store, connection, viewer_id=user.id))
+
+        connection, rr, trip, body = await run_in_threadpool(transition)
         await app.state.ws_manager.broadcast([rr.rider_id, trip.driver_id], {
             "type": "connection_update",
             "connection_id": connection_id,
             "status": connection.status,
         })
-        return serialize_connection(app.state.store, connection, viewer_id=user.id)
+        return body
 
     @app.post("/connections/{connection_id}/messages")
     async def add_message(connection_id: str, payload: MessageCreate, user: CurrentUser) -> dict[str, Any]:
-        message = app.state.store.add_message(user.id, connection_id, payload.model_dump())
-        connection = app.state.store.get_connection(connection_id)
-        rr = app.state.store.get_ride_request(connection.ride_request_id)
-        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        def add():
+            message = app.state.store.add_message(user.id, connection_id, payload.model_dump())
+            with get_conn():
+                connection = app.state.store.get_connection(connection_id)
+                return (message, app.state.store.get_ride_request(connection.ride_request_id),
+                        app.state.store.get_driver_trip(connection.driver_trip_id))
+
+        message, rr, trip = await run_in_threadpool(add)
         other_id = trip.driver_id if user.id == rr.rider_id else rr.rider_id
         await app.state.ws_manager.send(other_id, {
             "type": "chat_message",
@@ -657,7 +748,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def list_pools(community_tag: str | None = None, trip_date: date | None = None, user: CurrentUser = None) -> list[dict[str, Any]]:  # type: ignore[assignment]
         _ = user
         pools = app.state.store.list_pools(community_tag=community_tag, trip_date=trip_date)
-        return [serialize_pool(app.state.store, p) for p in pools]
+        with get_conn():
+            return [serialize_pool(app.state.store, p) for p in pools]
 
     @app.post("/pools")
     def create_pool(payload: PoolCreate, user: CurrentUser) -> dict[str, Any]:
@@ -737,17 +829,27 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
 
     @app.post("/connections/{connection_id}/picked-up")
     async def driver_picked_up(connection_id: str, user: CurrentUser) -> dict[str, Any]:
-        connection = app.state.store.mark_picked_up(user.id, connection_id)
-        rr = app.state.store.get_ride_request(connection.ride_request_id)
+        def mark():
+            connection = app.state.store.mark_picked_up(user.id, connection_id)
+            with app.state.store.read_scope(connections=[connection], viewer_id=user.id):
+                return (connection, app.state.store.get_ride_request(connection.ride_request_id),
+                        serialize_connection(app.state.store, connection, viewer_id=user.id))
+
+        connection, rr, body = await run_in_threadpool(mark)
         await app.state.ws_manager.broadcast([rr.rider_id], {"type": "connection_update", "connection_id": connection_id, "status": connection.status})
-        return serialize_connection(app.state.store, connection, viewer_id=user.id)
+        return body
 
     @app.post("/connections/{connection_id}/at-pickup")
     async def rider_at_pickup(connection_id: str, user: CurrentUser) -> dict[str, Any]:
-        connection = app.state.store.mark_rider_at_pickup(user.id, connection_id)
-        trip = app.state.store.get_driver_trip(connection.driver_trip_id)
+        def mark():
+            connection = app.state.store.mark_rider_at_pickup(user.id, connection_id)
+            with app.state.store.read_scope(connections=[connection], viewer_id=user.id):
+                return (connection, app.state.store.get_driver_trip(connection.driver_trip_id),
+                        serialize_connection(app.state.store, connection, viewer_id=user.id))
+
+        connection, trip, body = await run_in_threadpool(mark)
         await app.state.ws_manager.broadcast([trip.driver_id], {"type": "rider_at_pickup", "connection_id": connection_id})
-        return serialize_connection(app.state.store, connection, viewer_id=user.id)
+        return body
 
     @app.get("/me/routes")
     def my_saved_routes(user: CurrentUser) -> list[dict[str, Any]]:
@@ -915,6 +1017,7 @@ class SearchQuery(BaseModel):
     tag: str | None = None
     car_type: str | None = None
     luggage_size: str | None = None
+    limit: int = Field(100, ge=1, le=200)
 
     def to_store_query(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)

@@ -434,9 +434,9 @@ def test_search_excludes_listings_with_a_past_target_date() -> None:
     assert past_trip["id"] not in {t["id"] for t in trips}
     assert past_request["id"] not in {r["id"] for r in requests}
 
-    # Search should also actually archive them (flip status), not just hide
-    # them from this result set — so it doesn't depend on the hourly cron
-    # sweep having run to keep "My Listings" and other views honest too.
+    # Search only hides them (a read shouldn't write); the hourly sweep is what
+    # actually flips their status, which keeps "My Listings" honest.
+    api.get("/cron/expire", headers=CRON_HEADERS)
     my_trips = api.get("/me/driver-trips", headers=driver_headers).json()
     my_requests = api.get("/me/ride-requests", headers=rider_headers).json()
     assert next(t for t in my_trips if t["id"] == past_trip["id"])["status"] == "expired"
@@ -1319,3 +1319,516 @@ def test_driver_heading_to_a_general_area_is_visible_to_a_passenger_with_a_speci
 
     assert area_trip["id"] in found
     assert exact_trip["id"] not in found
+
+
+def test_search_filters_and_limit_are_applied_in_the_database() -> None:
+    api = client()
+    _, rider_headers, _, driver_headers, _, driver_trip = make_request_and_trip(api)
+
+    def search(**params):
+        return {t["id"] for t in api.get("/driver-trips/search", headers=rider_headers, params=params).json()}
+
+    assert driver_trip["id"] in search(tag="airport")
+    assert driver_trip["id"] not in search(tag="church")
+    assert driver_trip["id"] in search(target_date=date.today().isoformat())
+    assert driver_trip["id"] not in search(target_date=(date.today() + timedelta(days=2)).isoformat())
+    assert driver_trip["id"] in search(luggage_size="small")  # default capacity is medium
+    assert driver_trip["id"] not in search(luggage_size="oversized")
+    assert len(search(limit=1)) == 1
+    assert api.get("/driver-trips/search", headers=rider_headers, params={"limit": 0}).status_code == 422
+
+
+def test_simultaneous_requests_for_the_same_pair_create_one_pending_connection() -> None:
+    api = client()
+    _, rider_headers, _, _, ride_request, driver_trip = make_request_and_trip(api)
+    body = {"ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]}
+
+    first = api.post("/connections", headers=rider_headers, json=body).json()
+    again = api.post("/connections", headers=rider_headers, json=body).json()
+
+    assert again["id"] == first["id"]
+    connections = api.get("/me/connections", headers=rider_headers).json()
+    assert len(connections) == 1
+
+
+def test_concurrent_accepts_cannot_overbook_a_trip() -> None:
+    import threading
+
+    api = client()
+    store = api.app.state.store
+    _, driver_headers = auth(api, "full-driver@example.com", "Full Driver")
+    pickup = location(api, driver_headers, "Downtown Berkeley, CA", 37.8700, -122.2700)
+    destination = location(api, driver_headers, "SFO Terminal 2, San Francisco, CA", 37.6213, -122.3790)
+    trip = api.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible", "seats_available": 1, "tags": [],
+    }).json()
+    driver_id = api.get("/me", headers=driver_headers).json()["id"]
+    connection_ids = []
+    for n in range(6):
+        _, rider_headers = auth(api, f"racer{n}@example.edu", f"Racer {n}")
+        rr = api.post("/ride-requests", headers=rider_headers, json={
+            "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+            "target_date": date.today().isoformat(), "flexibility": "flexible", "passenger_count": 1, "tags": [],
+        }).json()
+        connection_ids.append(api.post("/connections", headers=rider_headers, json={
+            "ride_request_id": rr["id"], "driver_trip_id": trip["id"]}).json()["id"])
+
+    outcomes: list[str] = []
+
+    def accept(connection_id: str) -> None:
+        try:
+            store.transition_connection(driver_id, connection_id, "accept")
+            outcomes.append("accepted")
+        except Exception as exc:  # DomainError 409 for everyone who lost the race
+            outcomes.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=accept, args=(cid,)) for cid in connection_ids]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    assert outcomes.count("accepted") == 1
+    refreshed = store.get_driver_trip(trip["id"])
+    assert refreshed.seats_reserved == 1 and refreshed.status == "matched"
+    accepted = [c for c in store.get_user_connections(driver_id) if c.status == "accepted"]
+    assert len(accepted) == 1  # the losers' accept was rolled back with their notifications
+
+
+def test_a_passenger_request_cannot_be_accepted_by_two_drivers() -> None:
+    api = client()
+    store = api.app.state.store
+    _, rider_headers, _, driver_headers, ride_request, trip_one = make_request_and_trip(api, passenger_count=1)
+    _, other_driver_headers = auth(api, "second-driver@example.com", "Second Driver")
+    pickup = location(api, other_driver_headers, "Downtown Berkeley, CA", 37.8700, -122.2700)
+    destination = location(api, other_driver_headers, "SFO Terminal 2, San Francisco, CA", 37.6213, -122.3790)
+    trip_two = api.post("/driver-trips", headers=other_driver_headers, json={
+        "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible", "seats_available": 2, "tags": [],
+    }).json()
+    first = api.post("/connections", headers=rider_headers,
+                     json={"ride_request_id": ride_request["id"], "driver_trip_id": trip_one["id"]}).json()
+    second = api.post("/connections", headers=rider_headers,
+                      json={"ride_request_id": ride_request["id"], "driver_trip_id": trip_two["id"]}).json()
+
+    assert api.post(f"/connections/{first['id']}/transition", headers=driver_headers, json={"action": "accept"}).status_code == 200
+    # The passenger's other open request was closed by the first accept...
+    assert store.get_connection(second["id"]).status == "cancelled"
+    late = api.post(f"/connections/{second['id']}/transition", headers=other_driver_headers, json={"action": "accept"})
+
+    # ...so the second driver cannot book the same passenger, and no seat is taken.
+    assert late.status_code == 400
+    assert store.get_driver_trip(trip_two["id"]).seats_reserved == 0
+
+
+def test_cancelling_twice_only_returns_the_seat_once() -> None:
+    api = client()
+    store = api.app.state.store
+    _, rider_headers, _, driver_headers, ride_request, trip = make_request_and_trip(api, passenger_count=1, seats_available=3)
+    other_rider, other_headers = auth(api, "other-rider@example.edu", "Other Rider")
+    other_request = api.post("/ride-requests", headers=other_headers, json={
+        "pickup_location_id": ride_request["pickup"]["id"], "destination_location_id": ride_request["destination"]["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible", "passenger_count": 1, "tags": [],
+    }).json()
+    mine = api.post("/connections", headers=rider_headers, json={"ride_request_id": ride_request["id"], "driver_trip_id": trip["id"]}).json()
+    theirs = api.post("/connections", headers=other_headers, json={"ride_request_id": other_request["id"], "driver_trip_id": trip["id"]}).json()
+    for c in (mine, theirs):
+        api.post(f"/connections/{c['id']}/transition", headers=driver_headers, json={"action": "accept"})
+    assert store.get_driver_trip(trip["id"]).seats_reserved == 2
+
+    api.post(f"/connections/{mine['id']}/transition", headers=rider_headers, json={"action": "cancel"})
+    api.post(f"/connections/{mine['id']}/transition", headers=rider_headers, json={"action": "cancel"})
+
+    assert store.get_driver_trip(trip["id"]).seats_reserved == 1
+
+
+def test_changes_token_moves_when_a_connection_or_notification_changes() -> None:
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, trip = make_request_and_trip(api)
+
+    def token(headers):
+        return api.get("/me/changes", headers=headers).json()["version"]
+
+    before = token(driver_headers)
+    assert token(driver_headers) == before  # stable while nothing happens
+    api.post("/connections", headers=rider_headers, json={"ride_request_id": ride_request["id"], "driver_trip_id": trip["id"]})
+    assert token(driver_headers) != before
+    assert api.get("/me/changes").status_code == 401
+
+
+def test_serializing_connections_does_not_query_per_item(monkeypatch) -> None:
+    import psycopg2.extras
+
+    api = client()
+    _, rider_headers, _, driver_headers, ride_request, trip = make_request_and_trip(api, passenger_count=1, seats_available=6)
+    for n in range(4):
+        _, headers = auth(api, f"bulk{n}@example.edu", f"Bulk {n}")
+        rr = api.post("/ride-requests", headers=headers, json={
+            "pickup_location_id": ride_request["pickup"]["id"], "destination_location_id": ride_request["destination"]["id"],
+            "target_date": date.today().isoformat(), "flexibility": "flexible", "passenger_count": 1, "tags": [],
+        }).json()
+        api.post("/connections", headers=headers, json={"ride_request_id": rr["id"], "driver_trip_id": trip["id"]})
+
+    counted = {"n": 0}
+    real_execute = psycopg2.extras.RealDictCursor.execute
+
+    def counting(self, *args, **kwargs):
+        counted["n"] += 1
+        return real_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg2.extras.RealDictCursor, "execute", counting)
+    response = api.get("/me/connections", headers=driver_headers)
+
+    assert response.status_code == 200 and len(response.json()) == 4
+    print("queries for 4 connections:", counted["n"])
+    assert counted["n"] <= 15  # was ~15-20 per connection, i.e. 60+ for four
+
+
+# ─── Precomputed match candidates ─────────────────────────────────────────────
+
+def candidate_rows(store: Store) -> dict[tuple[str, str], float | None]:
+    from backend.app.db import get_conn
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT ride_request_id, driver_trip_id, detour_minutes FROM match_candidates")
+        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+
+def test_candidates_are_computed_when_either_listing_is_created_and_proposals_need_no_routing() -> None:
+    router = FakeRouter()
+    api = corridor_client(router)
+    store = api.app.state.store
+    _, rider_headers = auth(api, "cand-passenger@example.edu", "Cam Passenger")
+    _, early_headers = auth(api, "cand-early@example.com", "Early Driver")
+    _, late_headers = auth(api, "cand-late@example.com", "Late Driver")
+
+    a1 = location(api, early_headers, "A1", 37.0, -122.0)
+    b1 = location(api, early_headers, "B1", 37.0, -121.98)
+    early_trip = post_trip(api, early_headers, a1, b1)                      # trip before request
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    a2 = location(api, late_headers, "A2", 37.0, -122.0)
+    b2 = location(api, late_headers, "B2", 37.0, -121.98)
+    late_trip = post_trip(api, late_headers, a2, b2)                        # trip after request
+
+    rows = candidate_rows(store)
+    assert set(rows) == {(rr["id"], early_trip["id"]), (rr["id"], late_trip["id"])}
+    assert all(detour is not None for detour in rows.values())              # routed once, at write time
+
+    router.calls.clear()
+    proposal = api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()
+    assert proposal["trip"] is not None and proposal["remaining"] == 1
+    assert proposal["trip"]["detour_minutes"] is not None
+    assert router.calls == []                                               # reads never route
+
+    driver_view = api.get(f"/driver-trips/{early_trip['id']}/matches", headers=early_headers).json()
+    assert [m["id"] for m in driver_view] == [rr["id"]]
+    assert router.calls == []
+
+
+def test_proposals_still_apply_live_seat_status_and_date_filters() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "live-passenger@example.edu", "Liv Passenger")
+    _, driver_headers = auth(api, "live-driver@example.com", "Liv Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    proposal_url = f"/ride-requests/{rr['id']}/proposal"
+    assert api.get(proposal_url, headers=rider_headers).json()["trip"]["id"] == trip["id"]
+
+    api.post(f"/driver-trips/{trip['id']}/pause", headers=driver_headers)
+    assert api.get(proposal_url, headers=rider_headers).json()["trip"] is None
+    api.post(f"/driver-trips/{trip['id']}/resume", headers=driver_headers)
+    assert api.get(proposal_url, headers=rider_headers).json()["trip"]["id"] == trip["id"]
+
+    far_day = (date.today() + timedelta(days=5)).isoformat()
+    api.patch(f"/driver-trips/{trip['id']}", headers=driver_headers, json={"target_date": far_day})
+    assert api.get(proposal_url, headers=rider_headers).json()["trip"] is None
+
+
+def test_listings_without_candidates_get_them_on_first_proposal() -> None:
+    from backend.app.db import get_conn
+
+    api = corridor_client(FakeRouter())
+    store = api.app.state.store
+    _, rider_headers = auth(api, "legacy-passenger@example.edu", "Lee Passenger")
+    _, driver_headers = auth(api, "legacy-driver@example.com", "Lee Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    with get_conn() as conn:  # what a listing from before this feature looks like
+        cur = conn.cursor()
+        cur.execute("DELETE FROM match_candidates")
+        cur.execute("UPDATE ride_requests SET matches_computed_at = NULL")
+        cur.execute("UPDATE driver_trips SET matches_computed_at = NULL")
+
+    assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"]["id"] == trip["id"]
+    assert (rr["id"], trip["id"]) in candidate_rows(store)
+    assert [m["id"] for m in api.get(f"/driver-trips/{trip['id']}/matches", headers=driver_headers).json()] == [rr["id"]]
+
+
+def test_moving_the_pickup_recomputes_matches() -> None:
+    api = corridor_client(FakeRouter())
+    store = api.app.state.store
+    _, rider_headers = auth(api, "move-passenger@example.edu", "Mo Passenger")
+    _, driver_headers = auth(api, "move-driver@example.com", "Mo Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    assert (rr["id"], trip["id"]) in candidate_rows(store)
+
+    elsewhere = location(api, rider_headers, "Far away", 38.5, -122.0)
+    response = api.patch(f"/ride-requests/{rr['id']}/pickup", headers=rider_headers,
+                         json={"pickup_location_id": elsewhere["id"]})
+    assert response.status_code == 200, response.text
+
+    assert (rr["id"], trip["id"]) not in candidate_rows(store)
+    assert api.get(f"/ride-requests/{rr['id']}/proposal", headers=rider_headers).json()["trip"] is None
+
+
+def test_listing_coordinates_are_copied_by_the_database_and_follow_pickup_edits() -> None:
+    from backend.app.db import get_conn
+
+    api = client()
+    _, rider_headers = auth(api, "geo-passenger@example.edu", "Geo Passenger")
+    first = location(api, rider_headers, "First", 37.5, -122.5)
+    dest = location(api, rider_headers, "Dest", 37.6, -122.4)
+    rr = api.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": first["id"], "destination_location_id": dest["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible", "passenger_count": 1, "tags": []}).json()
+
+    def stored_pickup() -> tuple[float, float]:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT ST_Y(pickup_geog::geometry), ST_X(pickup_geog::geometry) FROM ride_requests WHERE id = %s", (rr["id"],))
+            return cur.fetchone()
+
+    assert stored_pickup() == (37.5, -122.5)
+    second = location(api, rider_headers, "Second", 37.7, -122.1)
+    api.patch(f"/ride-requests/{rr['id']}/pickup", headers=rider_headers, json={"pickup_location_id": second["id"]})
+    assert stored_pickup() == (37.7, -122.1)
+
+
+def test_expiry_sweep_drops_candidates_of_dead_listings() -> None:
+    api = corridor_client(FakeRouter())
+    store = api.app.state.store
+    _, rider_headers = auth(api, "sweep-passenger@example.edu", "Sam Passenger")
+    _, driver_headers = auth(api, "sweep-driver@example.com", "Sam Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = post_trip(api, driver_headers, a, b)
+    rr = make_rider_request(api, rider_headers, (37.0, -121.995), (37.0, -121.985))
+    assert candidate_rows(store)
+
+    api.post(f"/ride-requests/{rr['id']}/cancel", headers=rider_headers)
+    api.get("/cron/expire", headers=CRON_HEADERS)
+    assert candidate_rows(store) == {}
+    assert trip["id"]
+
+
+def test_nearby_broadcast_is_rate_limited_but_every_position_is_saved(monkeypatch) -> None:
+    api = client()
+    sent: list[list[str]] = []
+
+    async def record(user_ids, data):
+        sent.append(list(user_ids))
+
+    monkeypatch.setattr(api.app.state.ws_manager, "broadcast", record)
+    _, a_headers = auth(api, "ping-a@example.com", "Ping A")
+    _, b_headers = auth(api, "ping-b@example.com", "Ping B")
+    here = {"latitude": 37.0, "longitude": -122.0}
+
+    assert api.put("/me/location", headers=b_headers, json=here).status_code == 200
+    assert api.put("/me/location", headers=a_headers, json=here).status_code == 200
+    assert len(sent) == 1                                   # B is nearby and A's first report fans out
+    moved = {"latitude": 37.001, "longitude": -122.0}
+    assert api.put("/me/location", headers=a_headers, json=moved).status_code == 200
+    assert len(sent) == 1                                   # inside the interval: saved, not broadcast
+
+    nearby = api.get("/drivers/nearby", headers=b_headers, params={"lat": 37.0, "lng": -122.0}).json()
+    assert any(abs(d["latitude"] - 37.001) < 1e-9 for d in nearby)
+
+
+# ─── Phase 4: nudges, timing, reminders, first-accept-wins ───────────────────
+
+def notes_of(api: TestClient, headers: dict, type_: str) -> list[dict]:
+    return [n for n in api.get("/notifications", headers=headers).json() if n["type"] == type_]
+
+
+def timed_trip(api: TestClient, headers: dict, a: dict, b: dict, at: str | None, seats: int = 2) -> dict:
+    body = {"pickup_location_id": a["id"], "destination_location_id": b["id"],
+            "target_date": date.today().isoformat(), "flexibility": "Friday morning",
+            "seats_available": seats, "tags": []}
+    if at:
+        body["departure_time"] = at
+    response = api.post("/driver-trips", headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def timed_request(api: TestClient, headers: dict, at: str | None) -> dict:
+    p = location(api, headers, "Passenger pickup", 37.0, -121.995)
+    d = location(api, headers, "Passenger dest", 37.0, -121.985)
+    body = {"pickup_location_id": p["id"], "destination_location_id": d["id"],
+            "target_date": date.today().isoformat(), "flexibility": "Friday morning",
+            "passenger_count": 1, "tags": []}
+    if at:
+        body["departure_time"] = at
+    response = api.post("/ride-requests", headers=headers, json=body)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_publishing_a_listing_nudges_the_best_matches_once() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "nudge-passenger@example.edu", "Nia Passenger")
+    _, driver_headers = auth(api, "nudge-driver@example.com", "Nick Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+
+    rr = timed_request(api, rider_headers, None)
+    assert notes_of(api, rider_headers, "new_match") == []           # nobody to tell yet
+
+    timed_trip(api, driver_headers, a, b, None)                       # a driver appears -> passenger hears
+    nudges = notes_of(api, rider_headers, "new_match")
+    assert len(nudges) == 1 and nudges[0]["related_id"] == rr["id"]
+    assert notes_of(api, driver_headers, "new_match") == []           # the publisher isn't nudged
+
+    timed_trip(api, driver_headers, a, b, None)                       # a second trip: still one unread nudge
+    assert len(notes_of(api, rider_headers, "new_match")) == 1
+
+    _, late_rider = auth(api, "nudge-late@example.edu", "Lou Late")   # a passenger appears -> driver hears
+    timed_request(api, late_rider, None)
+    assert len(notes_of(api, driver_headers, "new_match")) >= 1
+
+
+def test_exact_departure_times_rank_and_filter_proposals() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "time-passenger@example.edu", "Tim Passenger")
+    _, d1 = auth(api, "time-d1@example.com", "Close Driver")
+    _, d2 = auth(api, "time-d2@example.com", "Later Driver")
+    _, d3 = auth(api, "time-d3@example.com", "Way Later Driver")
+    a = location(api, d1, "A", 37.0, -122.0)
+    b = location(api, d1, "B", 37.0, -121.98)
+    close = timed_trip(api, d1, a, b, "08:10:00")
+    later = timed_trip(api, d2, a, b, "09:30:00")
+    timed_trip(api, d3, a, b, "12:00:00")          # four hours off: never proposed
+    rr = timed_request(api, rider_headers, "08:00:00")
+    url = f"/ride-requests/{rr['id']}/proposal"
+
+    first = api.get(url, headers=rider_headers).json()
+    assert first["trip"]["id"] == close["id"]
+    assert first["trip"]["time_gap_minutes"] == 10
+    assert first["remaining"] == 1                  # the 12:00 trip was filtered out
+    api.post(f"{url}/skip", headers=rider_headers, json={"driver_trip_id": close["id"]})
+    second = api.get(url, headers=rider_headers).json()
+    assert second["trip"]["id"] == later["id"] and second["trip"]["time_gap_minutes"] == 90
+
+
+def test_first_accept_cancels_the_passengers_other_open_requests_and_requests_are_capped() -> None:
+    api = client()
+    store = api.app.state.store
+    _, rider_headers = auth(api, "multi-passenger@example.edu", "Mia Passenger")
+    _, driver_headers = auth(api, "multi-driver@example.com", "Max Driver")
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trips = [timed_trip(api, driver_headers, a, b, None) for _ in range(4)]
+    rr = timed_request(api, rider_headers, None)
+
+    ids = []
+    for trip in trips[:3]:
+        r = api.post("/connections", headers=rider_headers, json={"ride_request_id": rr["id"], "driver_trip_id": trip["id"]})
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["id"])
+    fourth = api.post("/connections", headers=rider_headers, json={"ride_request_id": rr["id"], "driver_trip_id": trips[3]["id"]})
+    assert fourth.status_code == 409
+    again = api.post("/connections", headers=rider_headers, json={"ride_request_id": rr["id"], "driver_trip_id": trips[0]["id"]})
+    assert again.status_code == 200 and again.json()["id"] == ids[0]   # a repeat tap at the limit is still fine
+
+    assert api.post(f"/connections/{ids[1]}/transition", headers=driver_headers, json={"action": "accept"}).status_code == 200
+    assert [store.get_connection(i).status for i in ids] == ["cancelled", "accepted", "cancelled"]
+    assert len(notes_of(api, driver_headers, "connection_cancelled")) == 2
+
+
+def test_declining_tells_the_sender_and_points_them_at_the_next_option() -> None:
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "dec-passenger@example.edu", "Dana Passenger")
+    _, first_driver = auth(api, "dec-d1@example.com", "First Driver")
+    _, second_driver = auth(api, "dec-d2@example.com", "Second Driver")
+    a = location(api, first_driver, "A", 37.0, -122.0)
+    b = location(api, first_driver, "B", 37.0, -121.98)
+    rr = timed_request(api, rider_headers, None)
+    first = timed_trip(api, first_driver, a, b, None)
+    timed_trip(api, second_driver, a, b, None)
+    for n in api.get("/notifications", headers=rider_headers).json():
+        api.delete(f"/notifications/{n['id']}", headers=rider_headers)   # clear the publish-time nudges
+
+    connection = api.post("/connections", headers=rider_headers,
+                          json={"ride_request_id": rr["id"], "driver_trip_id": first["id"]}).json()
+    api.post(f"/connections/{connection['id']}/transition", headers=first_driver, json={"action": "decline"})
+
+    assert len(notes_of(api, rider_headers, "connection_declined")) == 1
+    assert len(notes_of(api, rider_headers, "new_match")) == 1            # the other driver
+
+
+def test_unanswered_requests_get_one_reminder_then_lapse_with_a_next_option() -> None:
+    from backend.app.db import get_conn
+
+    api = corridor_client(FakeRouter())
+    _, rider_headers = auth(api, "idle-passenger@example.edu", "Ida Passenger")
+    _, slow_driver = auth(api, "idle-d1@example.com", "Slow Driver")
+    _, other_driver = auth(api, "idle-d2@example.com", "Other Driver")
+    a = location(api, slow_driver, "A", 37.0, -122.0)
+    b = location(api, slow_driver, "B", 37.0, -121.98)
+    rr = timed_request(api, rider_headers, None)
+    slow = timed_trip(api, slow_driver, a, b, None)
+    timed_trip(api, other_driver, a, b, None)
+    for n in api.get("/notifications", headers=rider_headers).json():
+        api.delete(f"/notifications/{n['id']}", headers=rider_headers)
+    connection = api.post("/connections", headers=rider_headers,
+                          json={"ride_request_id": rr["id"], "driver_trip_id": slow["id"]}).json()
+
+    def age(hours: float) -> None:
+        with get_conn() as conn:
+            conn.cursor().execute("UPDATE connections SET created_at = now() - make_interval(hours => %s) WHERE id = %s",
+                                  (hours, connection["id"]))
+
+    api.get("/cron/expire", headers=CRON_HEADERS)
+    assert notes_of(api, slow_driver, "connection_reminder") == []        # too soon
+
+    age(1)
+    api.get("/cron/expire", headers=CRON_HEADERS)
+    api.get("/cron/expire", headers=CRON_HEADERS)
+    assert len(notes_of(api, slow_driver, "connection_reminder")) == 1    # nudged once, not every sweep
+    assert api.get("/me/connections", headers=rider_headers).json()[0]["status"] == "pending"
+
+    age(25)
+    api.get("/cron/expire", headers=CRON_HEADERS)
+    assert api.get("/me/connections", headers=rider_headers).json()[0]["status"] == "expired"
+    assert len(notes_of(api, rider_headers, "connection_expired")) == 1
+    assert len(notes_of(api, rider_headers, "new_match")) == 1
+
+
+def test_reply_time_is_reported_once_there_are_enough_replies() -> None:
+    api = client()
+    store = api.app.state.store
+    _, driver_headers = auth(api, "reply-driver@example.com", "Rae Driver")
+    driver_id = api.get("/me", headers=driver_headers).json()["id"]
+    a = location(api, driver_headers, "A", 37.0, -122.0)
+    b = location(api, driver_headers, "B", 37.0, -121.98)
+    trip = timed_trip(api, driver_headers, a, b, None, seats=5)
+    assert store.user_stats(driver_id)["reply_median_minutes"] is None
+
+    for n in range(3):
+        _, headers = auth(api, f"reply-rider{n}@example.edu", f"Rider {n}")
+        rr = timed_request(api, headers, None)
+        c = api.post("/connections", headers=headers, json={"ride_request_id": rr["id"], "driver_trip_id": trip["id"]}).json()
+        if n < 2:
+            api.post(f"/connections/{c['id']}/transition", headers=driver_headers, json={"action": "accept"})
+            assert store.user_stats(driver_id)["reply_median_minutes"] is None   # fewer than 3 replies
+        else:
+            api.post(f"/connections/{c['id']}/transition", headers=driver_headers, json={"action": "decline"})
+
+    assert store.user_stats(driver_id)["reply_median_minutes"] == 1   # answered within a minute (floor of 1)

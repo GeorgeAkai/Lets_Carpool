@@ -34,6 +34,8 @@ export type UserStats = {
   rating_count: number;
   completed_trips: number;
   id_verified: boolean;
+  // Median minutes this person takes to answer a request; null until they have enough replies.
+  reply_median_minutes?: number | null;
 };
 
 export type TripPricing = {
@@ -64,6 +66,8 @@ export type ApiDriverTrip = {
   // Minutes this passenger would add to the trip; only set on corridor searches
   // (search with both pickup and destination coordinates).
   detour_minutes?: number | null;
+  // Proposals only: minutes between the passenger's exact departure time and this trip's.
+  time_gap_minutes?: number | null;
   departure_time?: string | null;        // "HH:MM:SS"
   estimated_arrival_time?: string | null; // "HH:MM:SS", from the route duration
   duration_minutes?: number;
@@ -314,6 +318,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
   const statuses = new Map<string, string>();
   const seenNotifications = new Set<string>();
   let primed = false;
+  let lastVersion: string | undefined;
   let stopped = false;
   let running = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -325,6 +330,11 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
     if (stopped || running || document.hidden) return;
     running = true;
     try {
+      // One cheap request tells us whether anything changed; only then download
+      // the full lists. An older backend without /me/changes just gets the full poll.
+      const changes = await getChanges().catch(() => null);
+      const version = typeof changes?.version === "string" ? changes.version : undefined;
+      if (primed && version !== undefined && version === lastVersion) return;
       const [connections, notifications] = await Promise.all([getMyConnections(), getNotifications()]);
       if (stopped) return;
 
@@ -350,6 +360,7 @@ function createPoller(onMessage: (msg: WsMessage) => void): { close: () => void 
       }
 
       primed = true;
+      lastVersion = version;
       if (!stopped) events.forEach(onMessage);
     } catch { /* transient network/auth error — try again next tick */ }
     finally { running = false; }
@@ -589,6 +600,10 @@ export function skipDriverTripProposal(driverTripId: string, rideRequestId: stri
   return request<{ status: string }>("POST", `/driver-trips/${driverTripId}/proposal/skip`, {
     ride_request_id: rideRequestId,
   });
+}
+
+export function getChanges(): Promise<{ version: string }> {
+  return request<{ version: string }>("GET", "/me/changes");
 }
 
 export function getMyConnections(): Promise<ApiConnection[]> {

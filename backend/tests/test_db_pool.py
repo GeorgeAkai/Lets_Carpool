@@ -71,3 +71,21 @@ def test_a_dropped_connection_is_replaced(tiny_pool):
     with db.get_conn() as conn:
         cur = conn.cursor(); cur.execute("SELECT 1")
         assert cur.fetchone()[0] == 1
+
+
+def test_a_recently_used_connection_is_not_probed_again(tiny_pool, monkeypatch):
+    with db.get_conn():
+        pass  # first checkout of a fresh connection is probed
+    probes: list[int] = []
+    real = db._is_alive
+    monkeypatch.setattr(db, "_is_alive", lambda c: probes.append(1) or real(c))
+
+    with db.get_conn():
+        pass
+    assert probes == []
+
+    monkeypatch.setattr(db, "VALIDATE_AFTER_IDLE_SECONDS", 0.0)
+    time.sleep(0.01)
+    with db.get_conn():
+        pass
+    assert probes == [1]
