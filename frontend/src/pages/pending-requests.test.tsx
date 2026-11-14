@@ -16,7 +16,7 @@ const trip = (id: string, over: Partial<MyListing> = {}): MyListing => ({
 });
 const props = () => ({
   currentUserId: "me", tripId: null, onSelectTrip: vi.fn(), onAccept: vi.fn(async () => {}),
-  onDecline: vi.fn(async () => {}), onOpenChat: vi.fn(), reload: vi.fn(async () => {}), showToast: vi.fn(),
+  onDecline: vi.fn(async () => {}), onOpenChat: vi.fn(), onStartDriving: vi.fn(), onOpenTripDay: vi.fn(), reload: vi.fn(async () => {}), showToast: vi.fn(),
 });
 
 describe("PendingRequestsView", () => {
@@ -30,6 +30,18 @@ describe("PendingRequestsView", () => {
     await userEvent.click(screen.getByRole("button", { name: /accept sam/i }));
     expect(p.onAccept).toHaveBeenCalledWith("c1");
     await waitFor(() => expect(p.reload).toHaveBeenCalled());
+  });
+
+  it("keeps an accepted passenger on the page with next steps", async () => {
+    const p = props();
+    const pending = conn({ riderPickupLat: 1, riderPickupLng: 2 });
+    const { rerender } = render(<PendingRequestsView {...p} trips={[trip("t1")]} connections={[pending]} />);
+    await userEvent.click(screen.getByRole("button", { name: /accept sam/i }));
+    rerender(<PendingRequestsView {...p} trips={[trip("t1")]} connections={[{ ...pending, status: "accepted" }]} />);
+    await userEvent.click(screen.getByRole("button", { name: /start trip/i }));
+    expect(p.onStartDriving).toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: /trip day/i }));
+    expect(p.onOpenTripDay).toHaveBeenCalled();
   });
 
   it("only shows the chosen trip, and ignores offers the driver started and non-pending ones", () => {

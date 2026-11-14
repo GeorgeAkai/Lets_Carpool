@@ -437,6 +437,8 @@ def run_migrations(database_url: str) -> None:
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS rider_at_pickup_at TIMESTAMPTZ")
     # Driver confirmed the passenger is in the car (the ride is en route).
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ")
+    # Driver tapped "Start trip" (on the way to the pickup); the passenger is told.
+    cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS driver_started_at TIMESTAMPTZ")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (

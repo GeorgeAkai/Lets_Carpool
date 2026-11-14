@@ -139,6 +139,8 @@ export type ApiConnection = {
   settlement?: SettlementPreference | null;
   // Driver confirmed the passenger is in the car — the ride is en route.
   picked_up_at?: string | null;
+  // Driver tapped "Start trip" — on the way to the pickup.
+  driver_started_at?: string | null;
   // Automatic fare: an estimate until the ride completes, then "paid".
   fare?: ApiFare;
 };
@@ -758,6 +760,10 @@ export type TripDayStatus = {
 
 export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {
   return request("GET", `/connections/${connectionId}/live`);
+}
+
+export function startTrip(connectionId: string): Promise<ApiConnection> {
+  return request("POST", `/connections/${connectionId}/start-trip`);
 }
 
 export function markPickedUp(connectionId: string): Promise<ApiConnection> {

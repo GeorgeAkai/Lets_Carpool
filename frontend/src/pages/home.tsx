@@ -3553,7 +3553,18 @@ export function Home() {
     setView('map')
   }, [setView])
 
-  const onStartDriving = useCallback((conn: Connection, target: 'pickup' | 'destination' = 'pickup') => {
+  const onStartDriving = useCallback(async (conn: Connection, target: 'pickup' | 'destination' = 'pickup', silent = false) => {
+    // Setting off for the pickup is the "Start trip" moment: the passenger is
+    // told, and the server refuses it too far ahead of departure.
+    if (target === 'pickup' && conn.myRole === 'driver' && !conn.raw?.driver_started_at) {
+      try {
+        const updated = await api.startTrip(conn.id)
+        setConnections(prev => prev.map(c => c.id === conn.id && c.raw ? { ...c, raw: { ...c.raw, driver_started_at: updated.driver_started_at } } : c))
+      } catch (e) {
+        if (!silent) showToast(e instanceof Error ? e.message : 'Could not start the trip', 'error')
+        return
+      }
+    }
     const dest = conn.raw?.ride_request.destination
     const lat = target === 'destination' ? dest?.latitude : conn.riderPickupLat
     const lng = target === 'destination' ? dest?.longitude : conn.riderPickupLng
@@ -3565,7 +3576,7 @@ export function Home() {
       partnerName: conn.withUser.name,
     })
     setView('map')
-  }, [setView])
+  }, [setView, showToast])
 
   // Accepting a ride that's for today puts the driver straight onto the
   // drive-to-pickup map; a future ride just confirms and waits for its day.
@@ -3574,7 +3585,8 @@ export function Home() {
     if (!currentUser) return
     const conn = apiConnectionToConnection(updated, currentUser.id)
     if (conn.myRole !== 'driver') return
-    if (conn.date <= todayLocalISO()) onStartDriving(conn)
+    // Silent: accepting well before departure just confirms; the driver starts from Trip day.
+    if (conn.date <= todayLocalISO()) onStartDriving(conn, 'pickup', true)
   }, [transact, currentUser, onStartDriving])
 
   const onStopDriving = useCallback(() => {
@@ -3937,6 +3949,7 @@ export function Home() {
                 connections={connections} trips={myListings.filter(l => l.type === 'driver')} currentUserId={currentUser.id}
                 tripId={pendingTripId} onSelectTrip={setPendingTripId}
                 onAccept={onAccept} onDecline={onDecline}
+                onStartDriving={c => onStartDriving(c)} onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
                 onOpenChat={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 reload={() => loadConnections(currentUser.id)} showToast={showToast}
               />

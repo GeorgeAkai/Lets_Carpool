@@ -58,6 +58,10 @@ function stubApi(routes: Record<string, unknown | Handler>) {
     calls.push({ key, body });
     if (!(key in routes)) return { ok: false, status: 404, json: async () => ({ detail: "not found" }) };
     const r = routes[key];
+    if (r && typeof r === "object" && "__error" in r) {
+      const e = (r as { __error: { status: number; detail: string } }).__error;
+      return { ok: false, status: e.status, json: async () => ({ detail: e.detail }) };
+    }
     return { ok: true, status: 200, json: async () => (typeof r === "function" ? (r as Handler)(body) : r) };
   }));
   return calls;
@@ -244,10 +248,29 @@ describe("Driver accepting a request", () => {
       "GET /me/connections": [conn],
       "GET /connections/con_1/messages": [],
       "POST /connections/con_1/transition": { ...conn, status: "accepted" },
+      "POST /connections/con_1/start-trip": { ...conn, status: "accepted", driver_started_at: "2030-01-01T08:00:00Z" },
     });
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /^accept$/i }));
     await waitFor(() => expect(screen.getByRole("button", { name: /i've arrived/i })).toBeTruthy());
+  });
+
+  it("only confirms when it is too early to start driving", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    const conn = pending(today);
+    const calls = stubApi({
+      ...BASE_ROUTES,
+      "GET /me/connections": [conn],
+      "GET /connections/con_1/messages": [],
+      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
+      "POST /connections/con_1/start-trip": { __error: { status: 409, detail: "Too early to start this trip." } },
+    });
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /^accept$/i }));
+    expect(await screen.findByText(/request accepted/i)).toBeTruthy();
+    await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_1/start-trip")).toBe(true));
+    expect(screen.queryByRole("button", { name: /i've arrived/i })).toBeNull();
   });
 
   it("does not start driving for a future ride", async () => {

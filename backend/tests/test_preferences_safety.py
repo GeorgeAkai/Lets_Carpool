@@ -255,3 +255,29 @@ def test_settlement_preference_never_stores_card_details() -> None:
     assert api.put("/me/settlement", headers=headers, json={"method": "card", "handle": "4242"}).status_code == 422
     cash = api.put("/me/settlement", headers=headers, json={"method": "cash", "handle": "ignored"}).json()
     assert cash["method"] == "cash" and cash["handle"] is None
+
+
+def test_driver_starts_the_trip_and_the_passenger_is_told_once() -> None:
+    from datetime import datetime
+
+    from backend.app.domain import DomainError
+
+    api = client()
+    rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
+
+    assert api.post(f"/connections/{conn['id']}/start-trip", headers=rider_headers).status_code == 403
+
+    # Before the window opens (the trip has no departure time, so: before its day) it is refused.
+    try:
+        api.app.state.store.start_trip(driver["id"], conn["id"], now=datetime(2000, 1, 1))
+        raise AssertionError("expected a too-early refusal")
+    except DomainError as exc:
+        assert exc.status_code == 409
+
+    first = api.post(f"/connections/{conn['id']}/start-trip", headers=driver_headers)
+    again = api.post(f"/connections/{conn['id']}/start-trip", headers=driver_headers)
+    assert first.status_code == 200 and first.json()["driver_started_at"] is not None
+    assert again.json()["driver_started_at"] == first.json()["driver_started_at"]
+
+    notes = api.get("/notifications", headers=rider_headers).json()
+    assert [n["type"] for n in notes].count("driver_on_the_way") == 1

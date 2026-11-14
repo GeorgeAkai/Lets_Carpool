@@ -70,6 +70,8 @@ MIN_REPLIES_FOR_STAT = 3
 # A recipient who hasn't answered gets one nudge after this long, and the request
 # lapses (the sender is pointed at the next-best match) after the TTL.
 PENDING_REMINDER_AFTER = timedelta(minutes=30)
+# How long before the departure time a driver may tap "Start trip".
+START_TRIP_EARLY = timedelta(minutes=60)
 PENDING_TTL = timedelta(hours=24)
 # Most listings one search returns (newest first); callers may ask for fewer.
 SEARCH_LIMIT = 100
@@ -291,6 +293,7 @@ class Connection:
     ride_pin: str | None = None
     pin_verified_at: datetime | None = None
     picked_up_at: datetime | None = None
+    driver_started_at: datetime | None = None
 
 
 @dataclass
@@ -545,6 +548,7 @@ def _row_to_connection(r: dict) -> Connection:
         responded_at=r.get("responded_at"), completed_at=r.get("completed_at"),
         ride_pin=r.get("ride_pin"), pin_verified_at=r.get("pin_verified_at"),
         picked_up_at=r.get("picked_up_at"),
+        driver_started_at=r.get("driver_started_at"),
     )
 
 def _row_to_message(r: dict) -> Message:
@@ -2834,6 +2838,37 @@ class Store:
             "rider_at_pickup_at": connection.rider_at_pickup_at,
             "picked_up_at": connection.picked_up_at,
         }
+
+    def start_trip(self, user_id: str, connection_id: str, now: datetime | None = None) -> Connection:
+        """Driver sets off for the pickup: allowed from START_TRIP_EARLY before
+        the departure time (any time on the day if the trip has none), and the
+        passenger is told. Tapping again is harmless and does not re-notify."""
+        connection = self.get_connection(connection_id)
+        rr = self.get_ride_request(connection.ride_request_id)
+        trip = self.get_driver_trip(connection.driver_trip_id)
+        if user_id != trip.driver_id:
+            raise DomainError("Only the driver can start the trip", 403)
+        if connection.status != "accepted":
+            raise DomainError("Only accepted rides can be started")
+        if connection.driver_started_at is not None:
+            return connection
+        local_now = now or datetime.now()
+        opens = datetime.combine(trip.target_date, trip.departure_time or time.min)
+        opens -= START_TRIP_EARLY if trip.departure_time else timedelta(0)
+        if local_now < opens:
+            when = opens.strftime("%b %d, %H:%M") if trip.departure_time else trip.target_date.isoformat()
+            raise DomainError(f"Too early to start this trip. You can start it from {when}.", 409)
+        at = now_utc()
+        with get_conn() as conn:
+            self._cur(conn).execute(
+                "UPDATE connections SET driver_started_at = %s WHERE id = %s AND driver_started_at IS NULL",
+                (at, connection_id))
+        connection.driver_started_at = at
+        driver = self.get_profile(trip.driver_id)
+        self.notify(rr.rider_id, "driver_on_the_way", "Your driver is on the way",
+                    f"{driver.display_name if driver else 'Your driver'} has started the trip to your pickup.",
+                    related_id=connection_id)
+        return connection
 
     def mark_picked_up(self, user_id: str, connection_id: str) -> Connection:
         """Driver confirms the passenger is in the car; the ride is now en route."""

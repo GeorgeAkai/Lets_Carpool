@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Calendar, Check, ChevronLeft, Inbox, MapPin, MessageCircle, Users, X } from 'lucide-react'
+import { Calendar, Car, Check, ChevronLeft, Inbox, MapPin, MessageCircle, Users, X } from 'lucide-react'
 import { Avatar, SERIF } from './home'
 import type { Connection, MyListing } from './home'
 
@@ -11,7 +11,7 @@ export function isPendingRequestFor(c: Connection, currentUserId: string): boole
 }
 
 export function PendingRequestsView({
-  connections, trips, currentUserId, tripId, onSelectTrip, onAccept, onDecline, onOpenChat, reload, showToast,
+  connections, trips, currentUserId, tripId, onSelectTrip, onAccept, onDecline, onOpenChat, onStartDriving, onOpenTripDay, reload, showToast,
 }: {
   connections: Connection[]
   trips: MyListing[]               // the driver's own trips, for the group headers
@@ -21,10 +21,13 @@ export function PendingRequestsView({
   onAccept: (id: string) => Promise<void>
   onDecline: (id: string) => Promise<void>
   onOpenChat: (c: Connection) => void
+  onStartDriving: (c: Connection) => void
+  onOpenTripDay: (c: Connection) => void
   reload: () => Promise<void>
   showToast: (msg: string, type: 'success' | 'error') => void
 }) {
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [justAccepted, setJustAccepted] = useState<string[]>([])
 
   const pending = useMemo(
     () => connections.filter(c => isPendingRequestFor(c, currentUserId)),
@@ -38,11 +41,14 @@ export function PendingRequestsView({
       .sort((a, b) => a.date.localeCompare(b.date))
   }, [pending, trips])
   const shown = tripId ? groups.filter(g => g.id === tripId) : groups
+  // Passengers accepted from this page stay here with what to do next, instead of vanishing.
+  const accepted = connections.filter(c => justAccepted.includes(c.id) && c.status === 'accepted' && c.myRole === 'driver')
 
   const run = async (c: Connection, action: 'accept' | 'decline') => {
     setBusyId(c.id)
     try {
       await (action === 'accept' ? onAccept(c.id) : onDecline(c.id))
+      if (action === 'accept') setJustAccepted(prev => [...prev, c.id])
       // Re-fetch so the list (and seats left) reflect the answer.
       await reload()
       showToast(action === 'accept' ? 'Request accepted' : 'Request declined', 'success')
@@ -65,13 +71,15 @@ export function PendingRequestsView({
         </button>
       )}
 
-      {shown.length === 0 ? (
+      {shown.length === 0 && accepted.length === 0 ? (
         <div className="text-center py-20 text-muted-foreground rounded-3xl border border-dashed border-border">
           <Inbox className="size-10 mx-auto mb-4 opacity-20" />
           <p className="font-medium">No pending requests</p>
           <p className="text-sm mt-1">When a passenger asks for a seat on one of your trips, they’ll show up here.</p>
         </div>
-      ) : shown.map(g => {
+      ) : null}
+
+      {shown.map(g => {
         const seatsLeft = g.trip?.seats != null ? g.trip.seats - (g.trip.seatsReserved ?? 0) : null
         return (
           <section key={g.id} className="space-y-2.5" aria-label={`Requests for ${g.trip?.to ?? g.requests[0].to}`}>
@@ -125,6 +133,40 @@ export function PendingRequestsView({
           </section>
         )
       })}
+
+      {accepted.length > 0 && (
+        <section className="space-y-2.5" aria-label="Accepted passengers">
+          <h2 className="text-[13px] font-semibold text-muted-foreground tracking-[0.05em] uppercase">Accepted — what’s next</h2>
+          {accepted.map(c => {
+            const canNavigate = !!c.riderPickupLat && !!c.riderPickupLng
+            return (
+              <div key={c.id} className="bg-card border border-green-500/40 rounded-2xl p-3.5 space-y-3">
+                <div className="flex items-center gap-3">
+                  <Avatar initials={c.withUser.initials} photoUrl={c.withUser.photoUrl} size="md" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold truncate">{c.withUser.name} is booked</p>
+                    <p className="text-xs text-muted-foreground truncate">Pickup: {c.riderPickupLabel ?? c.from} · {c.date}</p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {canNavigate && (
+                    <button onClick={() => onStartDriving(c)}
+                      className="flex-1 min-w-[9rem] px-3 py-2 rounded-xl bg-green-600 text-white text-sm font-semibold hover:bg-green-700 flex items-center justify-center gap-1.5">
+                      <Car className="size-4" />Start trip
+                    </button>
+                  )}
+                  <button onClick={() => onOpenTripDay(c)}
+                    className="flex-1 min-w-[7rem] px-3 py-2 rounded-xl border border-border text-sm font-medium hover:bg-muted flex items-center justify-center gap-1.5">
+                    <Calendar className="size-4" />Trip day
+                  </button>
+                  <button onClick={() => onOpenChat(c)} aria-label={`Message ${c.withUser.name}`}
+                    className="p-2 rounded-xl border border-border hover:bg-muted"><MessageCircle className="size-4" /></button>
+                </div>
+              </div>
+            )
+          })}
+        </section>
+      )}
     </div>
   )
 }

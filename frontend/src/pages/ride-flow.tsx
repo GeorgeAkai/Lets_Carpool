@@ -914,7 +914,7 @@ export function TripDayScreen({
               {connection.riderPickupLat != null && (
                 <button type="button" onClick={() => onStartDriving(connection, pickedUp ? 'destination' : 'pickup')}
                   className="w-full h-12 rounded-[14px] border border-border text-foreground text-[15px] font-semibold inline-flex items-center justify-center gap-2">
-                  <Navigation className="size-5" />{pickedUp ? 'Navigate to drop-off' : 'Start driving to pickup'}
+                  <Navigation className="size-5" />{pickedUp ? 'Navigate to drop-off' : 'Start trip'}
                 </button>
               )}
               <button type="button" disabled={busy}

@@ -895,6 +895,18 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def connection_live_status(connection_id: str, user: CurrentUser) -> dict[str, Any]:
         return serialize(app.state.store.trip_day_status(user.id, connection_id))
 
+    @app.post("/connections/{connection_id}/start-trip")
+    async def driver_start_trip(connection_id: str, user: CurrentUser) -> dict[str, Any]:
+        def start():
+            connection = app.state.store.start_trip(user.id, connection_id)
+            with app.state.store.read_scope(connections=[connection], viewer_id=user.id):
+                return (connection, app.state.store.get_ride_request(connection.ride_request_id),
+                        serialize_connection(app.state.store, connection, viewer_id=user.id))
+
+        connection, rr, body = await run_in_threadpool(start)
+        await app.state.ws_manager.broadcast([rr.rider_id], {"type": "connection_update", "connection_id": connection_id, "status": connection.status})
+        return body
+
     @app.post("/connections/{connection_id}/picked-up")
     async def driver_picked_up(connection_id: str, user: CurrentUser) -> dict[str, Any]:
         def mark():
