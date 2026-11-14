@@ -2952,7 +2952,10 @@ class Store:
     # ─── Views ────────────────────────────────────────────────────────────────
 
     def location_view(self, location_id: str, exact: bool) -> dict[str, Any]:
-        loc = self.get_location(location_id)
+        return self.location_view_of(self.get_location(location_id), exact)
+
+    @staticmethod
+    def location_view_of(loc: Location, exact: bool) -> dict[str, Any]:
         base: dict[str, Any] = {"id": loc.id, "label": loc.label if exact else loc.approximate_label, "exact": exact, "general": loc.is_general}
         if exact:
             base.update({"latitude": loc.latitude, "longitude": loc.longitude})

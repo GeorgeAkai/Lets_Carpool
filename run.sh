@@ -34,17 +34,17 @@ usage() {
 Usage: $0 <command>
 
 Commands:
-  start    Start backend and frontend (uses Neon via DATABASE_URL)
+  start    Start backend and frontend (uses Supabase via DATABASE_URL)
   stop     Stop backend and frontend
   restart  Stop then start again
 
 Requires:
-  DATABASE_URL   Neon connection string (postgresql://... or postgres://...)
+  DATABASE_URL   Supabase connection string (postgresql://... or postgres://...)
                  Set in your shell or in backend/.env
 EOF
 }
 
-check_neon_url() {
+check_db_url() {
   # Load from backend/.env if present and DATABASE_URL not already set
   if [ -z "${DATABASE_URL:-}" ] && [ -f "$ROOT_DIR/backend/.env" ]; then
     set -o allexport
@@ -56,7 +56,7 @@ check_neon_url() {
   if [ -z "${DATABASE_URL:-}" ]; then
     echo "ERROR: DATABASE_URL is not set."
     echo ""
-    echo "  Get your connection string from the Neon console and either:"
+    echo "  Get your connection string from the Supabase dashboard (Project Settings > Database) and either:"
     echo "    export DATABASE_URL='postgresql://...' before running this script, or"
     echo "    add DATABASE_URL=postgresql://... to backend/.env"
     exit 1
@@ -68,13 +68,13 @@ check_neon_url() {
     exit 1
   fi
 
-  # Warn if it looks like a local postgres URL instead of Neon
+  # Warn if it looks like a local postgres URL instead of Supabase
   if [[ "$DATABASE_URL" == *"localhost"* ]] || [[ "$DATABASE_URL" == *"127.0.0.1"* ]]; then
-    echo "Warning: DATABASE_URL points to localhost — expected a Neon cloud URL."
+    echo "Warning: DATABASE_URL points to localhost — expected a Supabase cloud URL."
   fi
 
   SAFE_URL=$(echo "$DATABASE_URL" | sed 's|://[^:]*:[^@]*@|://***:***@|')
-  echo "Database: Neon ($SAFE_URL)"
+  echo "Database: Supabase ($SAFE_URL)"
 }
 
 ensure_backend_env() {
@@ -96,7 +96,7 @@ ensure_frontend_deps() {
 }
 
 start_services() {
-  check_neon_url
+  check_db_url
   ensure_backend_env
   ensure_frontend_deps
 

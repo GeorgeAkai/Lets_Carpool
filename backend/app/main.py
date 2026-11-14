@@ -450,7 +450,7 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
     def create_location(payload: LocationCreate, user: CurrentUser) -> dict[str, Any]:
         _ = user
         location = app.state.store.create_location(payload.model_dump())
-        return serialize_location(app.state.store, location.id, exact=True)
+        return app.state.store.location_view_of(location, exact=True)
 
     @app.get("/locations/{location_id}")
     def get_location(location_id: str, exact: bool = False, user: CurrentUser | None = Depends(optional_user)) -> dict[str, Any]:
@@ -473,13 +473,28 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         except Exception:
             logging.getLogger("carpool.matching").exception("match computation failed for %s %s", kind, listing_id)
 
+    def audit_later(event_type: str, user_id: str, email: str, ip: str | None, detail: dict[str, Any]) -> None:
+        """Background task: nothing waits on the audit row, so it must not add a
+        database round trip to the response. A failure is logged, not raised."""
+        try:
+            app.state.store.log_audit(event_type, user_id, email, ip, detail)
+        except Exception:
+            logging.getLogger("carpool.audit").exception("audit log failed for %s", event_type)
+
     @app.post("/ride-requests")
     def create_ride_request(payload: RideRequestCreate, user: CurrentUser, http_request: Request,
                             background: BackgroundTasks) -> dict[str, Any]:
-        request = app.state.store.create_ride_request(user.id, payload.model_dump())
+        store = app.state.store
+        # One checkout and one commit for validate + insert + the response's reads
+        # (get_conn is re-entrant per thread, and read_scope batches the lookups).
+        with get_conn():
+            request = store.create_ride_request(user.id, payload.model_dump())
+            with store.read_scope(requests=[request]):
+                body = serialize_ride_request(store, request, exact=True)
         background.add_task(compute_matches, "request", request.id, True)
-        app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "ride_request", "id": request.id})
-        return serialize_ride_request(app.state.store, request, exact=True)
+        background.add_task(audit_later, "RIDE_PUBLISHED", user.id, user.email, client_ip(http_request),
+                            {"kind": "ride_request", "id": request.id})
+        return body
 
     @app.post("/ride-requests/expire")
     def expire_ride_requests(payload: ExpireRequest, _cron: RequireCronSecret) -> dict[str, Any]:
@@ -541,8 +556,10 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             trips = [app.state.store.create_driver_trip(user.id, data)]
         for t in trips:
             background.add_task(compute_matches, "trip", t.id, True)
-            app.state.store.log_audit("RIDE_PUBLISHED", user.id, user.email, client_ip(http_request), {"kind": "driver_trip", "id": t.id})
-        result = serialize_driver_trip(app.state.store, trips[0], exact=True)
+            background.add_task(audit_later, "RIDE_PUBLISHED", user.id, user.email, client_ip(http_request),
+                                {"kind": "driver_trip", "id": t.id})
+        with app.state.store.read_scope(trips=trips[:1]):
+            result = serialize_driver_trip(app.state.store, trips[0], exact=True)
         result["series_trip_ids"] = [t.id for t in trips]
         return result
 
