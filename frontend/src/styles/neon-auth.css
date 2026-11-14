@@ -6,7 +6,7 @@
 .neon-auth-ui {
   /* Use app radius and font */
   --neon-radius: var(--radius);
-  font-family: 'Figtree', system-ui, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
 
   /* Suppress the default card shadow/bg since we wrap with our own card.
      Keyed on data-slot rather than [class*="card"], which also matched (and
@@ -35,7 +35,7 @@
   background-color: var(--input-background) !important;
   border-color: transparent !important;
   border-radius: calc(var(--radius) + 2px) !important;
-  font-family: 'Figtree', system-ui, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
@@ -51,7 +51,7 @@
 .neon-auth-ui [data-slot="card"] button[type="submit"],
 .neon-auth-ui [data-slot="card"] [class*="submit"] {
   border-radius: calc(var(--radius) + 4px) !important;
-  font-family: 'Figtree', system-ui, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
   font-weight: 600;
   letter-spacing: 0;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--primary) 35%, transparent);
@@ -61,11 +61,11 @@
 .neon-auth-ui [class*="social"] button,
 .neon-auth-ui [class*="provider"] button {
   border-radius: calc(var(--radius) + 4px) !important;
-  font-family: 'Figtree', system-ui, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
 }
 
 /* Links */
 .neon-auth-ui [data-slot="card"] a {
   color: var(--primary);
-  font-family: 'Figtree', system-ui, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
 }

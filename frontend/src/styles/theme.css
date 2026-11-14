@@ -8,92 +8,92 @@
      with what's clearing it. */
   --bottom-nav-h: calc(4.25rem + env(safe-area-inset-bottom));
   --font-size: 16px;
-  /* Let's Carpool palette: navy ink, warm amber for the primary action, sky
-     blue for live/route information. Light is the daytime counterpart of the
-     dark (default) theme. */
-  --background: #f4f6fa;
-  --foreground: #0b1220;
+  /* Let's Carpool palette: deep green ink on a cool off-white, green for the
+     primary action, blue for verified/route information, amber for ratings.
+     Light is the default; .dark is its night counterpart. */
+  --background: #f3f6f5;
+  --foreground: #0e1f1b;
   --card: #ffffff;
-  --card-foreground: #0b1220;
+  --card-foreground: #0e1f1b;
   --popover: #ffffff;
-  --popover-foreground: #0b1220;
-  --primary: #f5b544;
-  --primary-foreground: #1a1204;
-  --secondary: #e7ecf4;
-  --secondary-foreground: #26324a;
-  --muted: #eceff5;
-  --muted-foreground: #5b6a86;
-  --accent: #1f7fd1;
+  --popover-foreground: #0e1f1b;
+  --primary: #08805a;
+  --primary-foreground: #ffffff;
+  --secondary: #e4f3ec;
+  --secondary-foreground: #1f4a3c;
+  --muted: #f0f4f2;
+  --muted-foreground: #56655f;
+  --accent: #c98a0b;
   --accent-foreground: #ffffff;
-  --info: #1f7fd1;
-  --destructive: #c62d3f;
+  --info: #1d4e89;
+  --destructive: #b23434;
   --destructive-foreground: #ffffff;
-  --border: #dde3ee;
+  --border: #e2e9e6;
   --input: transparent;
-  --input-background: #eef1f6;
-  --switch-background: #a9b4c6;
+  --input-background: #f0f4f2;
+  --switch-background: #c5d1cc;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
-  --ring: #d99a24;
+  --ring: #08805a;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
   --radius: 0.875rem;
-  --sidebar: #0e1626;
-  --sidebar-foreground: #eef2f8;
-  --sidebar-primary: #f5b544;
-  --sidebar-primary-foreground: #1a1204;
-  --sidebar-accent: #141d2f;
-  --sidebar-accent-foreground: #eef2f8;
-  --sidebar-border: #26324a;
-  --sidebar-ring: #f5b544;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0e1f1b;
+  --sidebar-primary: #08805a;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f0f4f2;
+  --sidebar-accent-foreground: #0e1f1b;
+  --sidebar-border: #e2e9e6;
+  --sidebar-ring: #08805a;
 }
 
 .dark {
-  --background: #0b1220;
-  --foreground: #eef2f8;
-  --card: #141d2f;
-  --card-foreground: #eef2f8;
-  --popover: #141d2f;
-  --popover-foreground: #eef2f8;
-  --primary: #f5b544;
-  --primary-foreground: #1a1204;
-  --secondary: #1c2740;
-  --secondary-foreground: #c3cde0;
-  --muted: #1c2740;
-  --muted-foreground: #9aa7bd;
-  --accent: #7cc4ff;
-  --accent-foreground: #0b1220;
-  --info: #7cc4ff;
-  --destructive: #ff6b7a;
+  --background: #0b1517;
+  --foreground: #e8efed;
+  --card: #142221;
+  --card-foreground: #e8efed;
+  --popover: #142221;
+  --popover-foreground: #e8efed;
+  --primary: #3ccf91;
+  --primary-foreground: #04140e;
+  --secondary: #123528;
+  --secondary-foreground: #7fe0b3;
+  --muted: #1b2b2a;
+  --muted-foreground: #9db0aa;
+  --accent: #f2b318;
+  --accent-foreground: #04140e;
+  --info: #7aa7ff;
+  --destructive: #ff7a7a;
   --destructive-foreground: #1a0508;
-  --border: #26324a;
+  --border: #253634;
   --input: transparent;
-  --input-background: #1c2740;
-  --switch-background: #33415e;
+  --input-background: #1b2b2a;
+  --switch-background: #344744;
   --font-weight-medium: 500;
   --font-weight-normal: 400;
-  --ring: #f5b544;
+  --ring: #3ccf91;
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
   --chart-4: oklch(0.627 0.265 303.9);
   --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: #0e1626;
-  --sidebar-foreground: #eef2f8;
-  --sidebar-primary: #f5b544;
-  --sidebar-primary-foreground: #1a1204;
-  --sidebar-accent: #141d2f;
-  --sidebar-accent-foreground: #eef2f8;
-  --sidebar-border: #26324a;
-  --sidebar-ring: #f5b544;
+  --sidebar: #0f1c1e;
+  --sidebar-foreground: #e8efed;
+  --sidebar-primary: #3ccf91;
+  --sidebar-primary-foreground: #04140e;
+  --sidebar-accent: #1b2b2a;
+  --sidebar-accent-foreground: #e8efed;
+  --sidebar-border: #253634;
+  --sidebar-ring: #3ccf91;
 }
 
 @theme inline {
-  --font-display: 'Bricolage Grotesque', 'Figtree', system-ui, sans-serif;
-  --font-sans: 'Figtree', system-ui, sans-serif;
+  --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -142,7 +142,7 @@
 
   body {
     @apply bg-background text-foreground;
-    font-family: 'Figtree', system-ui, sans-serif;
+    font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
   }
 
   html {

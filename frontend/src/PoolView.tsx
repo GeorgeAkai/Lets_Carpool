@@ -4,8 +4,8 @@ import { motion } from "motion/react"
 import * as api from "./api"
 import type { ApiPool, ApiPoolMembership, ApiPoolMessage } from "./api"
 
-const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
-const MONO: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
+const SERIF: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+const MONO: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 const COMMUNITY_TAGS = ["church", "college", "work", "event", "family", "sports"] as const
 type CommunityTag = (typeof COMMUNITY_TAGS)[number]

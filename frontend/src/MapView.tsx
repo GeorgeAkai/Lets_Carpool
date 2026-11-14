@@ -282,7 +282,7 @@ function formatDistance(meters: number): string {
   return `${(meters / 1000).toFixed(1)} km`
 }
 
-const MONO: React.CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
+const MONO: React.CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ── Lightweight "Where to?" search (Google geocoding) ──────────────────────────────
 interface Props {
@@ -509,7 +509,7 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   useEffect(() => {
     fetchDrivers()
-    const id = setInterval(fetchDrivers, 10000)
+    const id = setInterval(() => { if (!document.hidden) fetchDrivers() }, 10000)
     return () => clearInterval(id)
   }, [fetchDrivers])
 

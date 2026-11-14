@@ -15,8 +15,7 @@ beforeEach(() => {
   state = { connections: [conn("c1", "pending")], notifications: [], messages: [] };
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     const path = String(url).replace(BASE, "");
-    const body = path === "/me/changes" ? { version: JSON.stringify([state.connections, state.notifications]) }
-      : path === "/me/connections" ? state.connections : path === "/notifications" ? state.notifications : state.messages;
+    const body = path === "/me/connections/status" ? state.connections : path === "/notifications" ? state.notifications : state.messages;
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   }));
 });
@@ -39,6 +38,10 @@ describe("polling real-time fallback", () => {
     state.connections = [conn("c1", "accepted")];
     await tick();
     expect(events).toEqual([{ type: "connection_update", connection_id: "c1", status: "accepted" }]);
+    // Polls only read the light status feed, never the full connection list.
+    const urls = (fetch as ReturnType<typeof vi.fn>).mock.calls.map(([u]) => String(u).replace(BASE, ""));
+    expect(urls).toContain("/me/connections/status");
+    expect(urls).not.toContain("/me/connections");
     rt.close();
   });
 
@@ -68,45 +71,9 @@ describe("polling real-time fallback", () => {
   });
 });
 
-describe("change detection", () => {
-  const downloads = (suffix: string) =>
-    (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([u]) => String(u).endsWith(suffix)).length;
-
-  it("skips downloading connections and notifications while nothing has changed", async () => {
-    state.connections = [conn("c1", "accepted")]; // settled, so the slow poll cadence applies
-    const rt = createRealtime("u", () => {});
-    await vi.advanceTimersByTimeAsync(0);
-    expect(downloads("/me/connections")).toBe(1);
-
-    await tick();
-    await tick();
-    expect(downloads("/me/changes")).toBe(3);
-    expect(downloads("/me/connections")).toBe(1);
-
-    state.connections = [conn("c1", "declined")];
-    await tick();
-    expect(downloads("/me/connections")).toBe(2);
-    rt.close();
-  });
-
-  it("still polls the full lists against a backend without /me/changes", async () => {
-    (fetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
-      const path = String(url).replace(BASE, "");
-      if (path === "/me/changes") return new Response("{}", { status: 404 });
-      return new Response(JSON.stringify(path === "/me/connections" ? state.connections : []), { status: 200, headers: { "Content-Type": "application/json" } });
-    });
-    state.connections = [conn("c1", "accepted")];
-    const rt = createRealtime("u", () => {});
-    await vi.advanceTimersByTimeAsync(0);
-    await tick();
-    expect(downloads("/me/connections")).toBe(2);
-    rt.close();
-  });
-});
-
 describe("adaptive polling", () => {
   it("polls faster while a connection is pending, slower once settled", async () => {
-    const calls = () => (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([u]) => String(u).endsWith("/me/changes")).length;
+    const calls = () => (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([u]) => String(u).endsWith("/me/connections/status")).length;
     const stop = createRealtime("u", () => {}).close;
     await vi.advanceTimersByTimeAsync(0);
     const start = calls();

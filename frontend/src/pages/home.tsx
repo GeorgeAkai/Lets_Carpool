@@ -34,11 +34,14 @@ import {
   ViewToggleFab, OfferRideFab, BottomSheet,
 } from './discover-mobile'
 import { AdminView } from './admin'
+import {
+  PreferencesScreen, ProfileHub, ReceiptScreen, SafetyScreen, WelcomeScreen,
+} from './account-screens'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
-  | 'results' | 'ride' | 'trip' | 'offer' | 'finding' | 'pending-requests'
+  | 'results' | 'ride' | 'trip' | 'offer' | 'finding' | 'preferences' | 'safety' | 'receipt' | 'pending-requests'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -290,8 +293,8 @@ export const CAR_TYPE_EMOJI: Record<CarType, string> = {
   sedan: '🚗', suv: '🚙', van: '🚐', minivan: '🚐', truck: '🚚', other: '🚗',
 }
 
-export const SERIF: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
-export const MONO: CSSProperties = { fontFamily: "'Bricolage Grotesque', Figtree, sans-serif", fontVariantNumeric: 'tabular-nums' }
+export const SERIF: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontWeight: 700, letterSpacing: '-0.02em' }
+export const MONO: CSSProperties = { fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif", fontVariantNumeric: 'tabular-nums' }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -388,7 +391,8 @@ export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId
   const isDriver = conn.driver_trip.driver_id === currentUserId
   const withUserId = isDriver ? conn.ride_request.rider_id : conn.driver_trip.driver_id
   const profile = isDriver ? conn.rider_profile : conn.driver_profile
-  const otherName = profile?.display_name ?? (isDriver ? 'Rider' : 'Driver')
+  const otherName = profile?.display_name
+    ?? (isDriver ? conn.ride_request.rider_name : conn.driver_trip.driver_name) ?? (isDriver ? 'Rider' : 'Driver')
   const trip = conn.driver_trip
   const from = formatPlace(trip.pickup.label)
   const to = formatPlace(trip.destination.label)
@@ -423,7 +427,7 @@ export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; 
     return <img src={photoUrl} alt={initials} className={`${cls} rounded-full object-cover shrink-0 ring-1 ring-border`} />
   }
   return (
-    <div style={MONO} className={`${cls} rounded-full bg-secondary text-secondary-foreground font-semibold flex items-center justify-center shrink-0`}>
+    <div style={MONO} className={`${cls} rounded-full bg-secondary text-secondary-foreground font-bold flex items-center justify-center shrink-0`}>
       {initials}
     </div>
   )
@@ -757,7 +761,7 @@ function UserMenuButton({ targetUserId, showToast }: { targetUserId: string; sho
 
 function MatchCard({ match, rank, onConnect, showToast, alreadyConnected }: {
   match: EnrichedMatch; rank: number
-  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onConnect: (l: Listing) => Promise<unknown>; showToast: (msg: string, type: 'success' | 'error') => void
   alreadyConnected: boolean
 }) {
   const { listing, profile, sharedInterests } = match
@@ -998,7 +1002,7 @@ function ProposedRider({ trip, onAccepted, showToast }: {
 function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
   listings: Listing[]; referenceListing: MyListing | undefined
   currentUserId: string; currentUserInterests: string[]
-  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onConnect: (l: Listing) => Promise<unknown>; showToast: (msg: string, type: 'success' | 'error') => void
   onMatchedIds: (ids: string[]) => void
   connectedListingIds: Set<string>
 }) {
@@ -1189,7 +1193,7 @@ function DriverHomeView({
   hasLocation: boolean
   myOpenTrip: MyListing | undefined; tripActions: TripActions; listings: Listing[]
   currentUserId: string; currentUserInterests: string[]
-  onConnect: (l: Listing) => Promise<void>; showToast: (msg: string, type: 'success' | 'error') => void
+  onConnect: (l: Listing) => Promise<unknown>; showToast: (msg: string, type: 'success' | 'error') => void
   onProposalAccepted: (conn: api.ApiConnection) => void
   setView: (v: View) => void
   searchQuery: string; setSearchQuery: (v: string) => void
@@ -2520,13 +2524,13 @@ function NotificationsView({ notifications, onMarkAllRead, onDismiss, onNavigate
 
 // ─── Profile view ─────────────────────────────────────────────────────────────
 
-function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmin }: {
+function ProfileView({ currentUser, onProfileUpdate, mode, onOpenAdmin, hub }: {
   currentUser: ApiUser; onProfileUpdate: (user: ApiUser) => void
   mode: ListingType; onSetMode: (m: ListingType) => void
   onOpenAdmin: () => void
+  // Stats, driver mode and account settings, shown above the editable profile.
+  hub?: React.ReactNode
 }) {
-  const [confirmingModeSwitch, setConfirmingModeSwitch] = useState(false)
-  const otherMode: ListingType = mode === 'rider' ? 'driver' : 'rider'
   const profile = currentUser.profile
   const vehicle = currentUser.vehicle
   const [displayName, setDisplayName] = useState(profile.display_name)
@@ -2535,6 +2539,7 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   const [interestDraft, setInterestDraft] = useState('')
   const [nationality, setNationality] = useState(profile.nationality ?? '')
   const [phone, setPhone] = useState(profile.phone ?? '')
+  const [gender, setGender] = useState<api.Gender | ''>(profile.gender ?? '')
   const [make, setMake] = useState(vehicle?.make ?? '')
   const [model, setModel] = useState(vehicle?.model ?? '')
   const [color, setColor] = useState(vehicle?.color ?? '')
@@ -2560,7 +2565,7 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
   // (which would mark them as "driver ready" and skip vehicle setup later).
   const profileDirty =
     displayName !== profile.display_name || bio !== (profile.bio ?? '') || nationality !== (profile.nationality ?? '') ||
-    phone !== (profile.phone ?? '') ||
+    phone !== (profile.phone ?? '') || gender !== (profile.gender ?? '') ||
     interests.join('\u0000') !== (profile.interests ?? []).join('\u0000')
   const vehicleDirty =
     make !== (vehicle?.make ?? '') || model !== (vehicle?.model ?? '') || color !== (vehicle?.color ?? '') ||
@@ -2579,8 +2584,8 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
     try {
       let next: ApiUser = currentUser
       if (profileDirty || pendingInterest) {
-        const updated = await api.updateProfile(displayName.trim(), profile.photo_url, bio || null, nextInterests, nationality || null, phone.trim() || null)
-        next = { ...next, profile: { ...next.profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality, phone: updated.phone } }
+        const updated = await api.updateProfile(displayName.trim(), profile.photo_url, bio || null, nextInterests, nationality || null, phone.trim() || null, gender || null)
+        next = { ...next, profile: { ...next.profile, display_name: updated.display_name, bio: updated.bio, interests: updated.interests, nationality: updated.nationality, phone: updated.phone, gender: updated.gender } }
       }
       if (vehicleDirty) {
         const v = await api.updateDriverReadiness({
@@ -2622,6 +2627,8 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
         <p className="text-muted-foreground mt-1">How passengers and drivers see you, plus your vehicle details.</p>
       </div>
 
+      {hub}
+
       <div className="grid gap-6 lg:grid-cols-2 items-start">
         {/* ── Left: public profile ── */}
         <section className="rounded-3xl bg-card border border-border p-6 space-y-5">
@@ -2661,6 +2668,16 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
               <label htmlFor="pf-phone" className="text-sm font-medium">Phone <span className="text-muted-foreground font-normal">(optional)</span></label>
               <input id="pf-phone" type="tel" autoComplete="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+1 555 123 4567" className={inputCls} />
               <p className="text-xs text-muted-foreground">Only shared with your ride partner once a ride is accepted, so they can call you on trip day.</p>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="pf-gender" className="text-sm font-medium">Gender <span className="text-muted-foreground font-normal">(optional)</span></label>
+              <select id="pf-gender" value={gender} onChange={e => setGender(e.target.value as api.Gender | '')} className={inputCls}>
+                <option value="">Prefer not to say</option>
+                <option value="woman">Woman</option>
+                <option value="man">Man</option>
+                <option value="nonbinary">Non-binary</option>
+              </select>
+              <p className="text-xs text-muted-foreground">Never shown to anyone. Lets women choose women-only rides.</p>
             </div>
             <div className="space-y-1.5">
               <label htmlFor="pf-int" className="text-sm font-medium">Interests <span className="text-muted-foreground font-normal">(icebreakers, e.g. "Loves Afrobeat")</span></label>
@@ -2735,36 +2752,7 @@ function ProfileView({ currentUser, onProfileUpdate, mode, onSetMode, onOpenAdmi
         )}
       </div>
 
-      {/* Mode is chosen once per session at sign-in; changing it is a
-          deliberate, confirmed action here rather than a one-tap toggle. */}
       <div className="grid gap-6 lg:grid-cols-2 items-start">
-        <section className="rounded-3xl bg-card border border-border p-6 space-y-3">
-          <div>
-            <h3 className="text-base font-semibold text-foreground">Current mode</h3>
-            <p className="text-sm text-muted-foreground mt-0.5">
-              You're browsing as {mode === 'rider' ? 'a passenger looking for a ride' : 'a driver offering rides'} this session.
-            </p>
-          </div>
-          {!confirmingModeSwitch ? (
-            <button type="button" onClick={() => setConfirmingModeSwitch(true)} className="w-full py-2.5 rounded-xl border border-border text-sm font-semibold text-foreground hover:bg-muted transition-colors">
-              Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode
-            </button>
-          ) : (
-            <div className="rounded-2xl bg-muted p-4 space-y-3">
-              <p className="text-sm text-foreground">
-                Switch to {otherMode === 'driver' ? 'Driver' : 'Passenger'} mode? Discover will show {otherMode === 'driver' ? 'ride requests to offer rides for' : 'drivers to request a ride from'} instead.
-              </p>
-              <div className="flex gap-2">
-                <button type="button" onClick={() => { onSetMode(otherMode); setConfirmingModeSwitch(false) }} className="flex-1 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors">
-                  Confirm switch
-                </button>
-                <button type="button" onClick={() => setConfirmingModeSwitch(false)} className="flex-1 py-2 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-        </section>
         {api.isAdminUser(currentUser) && (
         <button
           type="button" onClick={onOpenAdmin}
@@ -2952,7 +2940,7 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
     { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post', 'finding'] },
     { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools', 'pending-requests'] },
     { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
-    { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin'] },
+    { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin', 'preferences', 'safety', 'receipt'] },
   ]
   return (
     <nav className="xl:hidden fixed bottom-0 left-0 right-0 bg-sidebar border-t border-border z-40 pb-[env(safe-area-inset-bottom)]">
@@ -3070,16 +3058,32 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 
 // Each app view has its own URL so tabs are linkable, survive a refresh and
 // work with the browser's back button.
+const FEED_REFRESH_MS = 120_000
+
 const VIEW_PATHS: Record<View, string> = {
   home: '/discover', feed: '/discover', admin: '/admin',
   results: '/rides', ride: '/rides/detail', finding: '/rides/finding', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
-  'my-listings': '/my-rides', 'pending-requests': '/pending-requests', connections: '/connections', notifications: '/notifications', profile: '/profile',
+  'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
+  'pending-requests': '/pending-requests', preferences: '/preferences', safety: '/safety', receipt: '/receipt',
 }
 const PATH_VIEWS: Record<string, View> = {
   '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
   '/my-rides': 'my-listings', '/connections': 'connections', '/inbox': 'connections',
   '/notifications': 'notifications', '/profile': 'profile', '/admin': 'admin',
   '/rides': 'results', '/rides/detail': 'ride', '/rides/finding': 'finding', '/trip': 'trip', '/offer': 'offer',
+  '/preferences': 'preferences', '/safety': 'safety', '/receipt': 'receipt',
+}
+
+// "Get started" is also remembered per user on this device, so a failed or
+// missing /me/onboarding/complete can't bring the Welcome screen back.
+const ONBOARDED_KEY = 'carpool_onboarded:'
+
+function onboardedOnDevice(userId: string): boolean {
+  try { return localStorage.getItem(ONBOARDED_KEY + userId) === '1' } catch { return false }
+}
+
+function rememberOnboarded(userId: string): void {
+  try { localStorage.setItem(ONBOARDED_KEY + userId, '1') } catch { /* private mode: server flag still applies */ }
 }
 
 export function Home() {
@@ -3157,6 +3161,11 @@ export function Home() {
   const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
   const [tripDayId, setTripDayId] = useState<string | null>(null)
   const [pendingTripId, setPendingTripId] = useState<string | null>(null)
+  // Account screens: which ride a receipt / safety screen is
+  // about, and where "Ride preferences" returns to.
+  const [receiptId, setReceiptId] = useState<string | null>(null)
+  const [safetyConnId, setSafetyConnId] = useState<string | null>(null)
+  const [prefsReturn, setPrefsReturn] = useState<View>('profile')
   // Find-a-ride flow: a driver the passenger picked (null = auto top match) and drivers already tried.
   const [findTrip, setFindTrip] = useState<api.ApiDriverTrip | null>(null)
   const [findNonce, setFindNonce] = useState(0)
@@ -3381,14 +3390,17 @@ export function Home() {
   }, [corridorQuery])
 
   // Another user's new post has no way to push into an already-open Discover
-  // tab — refetch whenever Discover becomes the active view (not just once on
-  // mount), and keep polling while it stays active so a listing posted while
-  // you're already browsing shows up without a manual reload.
+  // tab — refetch whenever Discover becomes the active view or the tab comes
+  // back to the foreground, plus a slow refresh while it's on screen. Never
+  // while hidden: a backgrounded tab polling every few seconds was most of
+  // our database egress.
   useEffect(() => {
     if (!currentUser || view !== 'feed') return
     loadListings()
-    const id = setInterval(loadListings, 20000)
-    return () => clearInterval(id)
+    const id = setInterval(() => { if (!document.hidden) loadListings() }, FEED_REFRESH_MS)
+    const onVisible = () => { if (!document.hidden) loadListings() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(id); document.removeEventListener('visibilitychange', onVisible) }
   }, [currentUser, view, loadListings])
 
   const LUGGAGE_ORDER = ['none', 'small', 'medium', 'large', 'oversized']
@@ -3427,7 +3439,7 @@ export function Home() {
   // `opts` comes from the Home → Results → Ride details flow, which knows the
   // passenger's real start, destination, seats and time; the plain feed falls back
   // to the current location for both ends.
-  const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }) => {
+  const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }): Promise<Connection | undefined> => {
     try {
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
       const from = opts?.from && Number.isFinite(opts.from.lat) ? opts.from : null
@@ -3615,9 +3627,10 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding', 'pending-requests']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding', 'preferences', 'safety', 'receipt', 'pending-requests']
   const pendingRequestCount = connections.filter(c => isPendingRequestFor(c, currentUser?.id ?? '')).length
   const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
+  const safetyConnection = connections.find(c => c.id === safetyConnId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
     : view === 'admin' && !api.isAdminUser(currentUser) ? 'feed'
@@ -3625,10 +3638,11 @@ export function Home() {
     : view === 'ride' && !selectedTrip ? 'results'
     : view === 'finding' && !rideSearch.to ? 'feed'
     : view === 'trip' && !tripDayConnection ? 'my-listings'
+    : view === 'receipt' && !receiptId ? 'profile'
     : view
   // Full-screen flow steps bring their own back/close controls and sticky
   // action bar, so the app chrome steps aside on phones (as on the map).
-  const immersive = guardedView === 'map' || guardedView === 'results' || guardedView === 'ride' || guardedView === 'trip' || guardedView === 'offer' || guardedView === 'finding'
+  const immersive = (['map', 'results', 'ride', 'trip', 'offer', 'finding', 'preferences', 'safety', 'receipt'] as View[]).includes(guardedView)
   const hideTopBarOnMobile = immersive || guardedView === 'feed'
   const displayName = currentUser?.profile?.display_name ?? 'You'
   const initials = toInitials(displayName)
@@ -3647,31 +3661,60 @@ export function Home() {
     )
   }
 
+  // One AuthSync, always first child of a fragment, so it stays mounted while
+  // the screen moves from Loading → Welcome → ride/drive choice → the app.
+  // A remount would re-run the session sync and reload the user from /me
+  // mid-flow (which sent people back to the Welcome screen).
+  const authSync = <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+
   // Show loading while session is resolving
   if (authLoading) {
     return (
-      <div className="min-h-screen bg-background text-foreground flex flex-col">
-        <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
-        <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
-      </div>
+      <>
+        {authSync}
+        <div className="min-h-screen bg-background text-foreground flex items-center justify-center text-muted-foreground text-sm">Loading…</div>
+      </>
     )
   }
 
   // Not authenticated — redirect effect fires above, render nothing while redirecting
   if (!currentUser) {
-    return <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
+    return <>{authSync}</>
+  }
+
+  // First run only: the server reports onboarded_at = null. An older API that
+  // doesn't send the field (undefined) never shows it, and finishing it is
+  // also remembered on this device in case the server call fails.
+  if (currentUser.onboarded_at === null && !onboardedOnDevice(currentUser.id)) {
+    return (
+      <>
+        {authSync}
+        <WelcomeScreen onStart={async () => {
+          rememberOnboarded(currentUser.id)
+          let at = new Date().toISOString()
+          try { at = (await api.completeOnboarding()).onboarded_at ?? at } catch { /* remembered on this device */ }
+          setCurrentUser(prev => prev ? { ...prev, onboarded_at: at } : prev)
+        }} />
+      </>
+    )
   }
 
   // One-time choice before Discover — see the modeGateOpen comment above.
   // Goes through handleSetMode so the existing "Driver with no vehicle on
   // file routes to Profile" behavior applies to this first choice too.
   if (modeGateOpen) {
-    return <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+    return (
+      <>
+        {authSync}
+        <ModeChoiceGate onChoose={m => { handleSetMode(m); setModeGateOpen(false) }} />
+      </>
+    )
   }
 
   return (
+    <>
+    {authSync}
     <div className="min-h-screen bg-background text-foreground flex flex-col xl:pl-60">
-      <AuthSync key={authRetryNonce} onAuthenticated={handleAuthenticated} onUnauthenticated={handleUnauthenticated} onAuthError={handleAuthError} />
       <Toast toast={toast} />
 
       {pendingReview && (
@@ -3730,6 +3773,7 @@ export function Home() {
                 onOpenMap={() => setView('map')}
                 onOpenNotifications={() => setView('notifications')}
                 unreadNotifications={unreadCount}
+                onSwitchMode={handleSetMode}
                 topSlot={driverTrip ? <ActiveTripCard trip={driverTrip} actions={tripActions} /> : undefined}
               >
                 {mode === 'driver' && (() => {
@@ -3754,6 +3798,7 @@ export function Home() {
                 search={rideSearch} userCoords={userCoords} currentUserId={currentUser.id}
                 requestedTripIds={connectedListingIds}
                 onBack={() => setView('feed')}
+                onOpenPreferences={() => { setPrefsReturn('results'); setView('preferences') }}
                 onOpenTrip={t => { setSelectedTrip(t); setView('ride') }}
                 onRequestTrip={async t => { setFindTrip(t); setFindNonce(n => n + 1); setView('finding') }}
                 onNotify={async () => {
@@ -3794,6 +3839,8 @@ export function Home() {
             {guardedView === 'trip' && tripDayConnection && (
               <TripDayScreen
                 connection={tripDayConnection} currentUserId={currentUser.id}
+                onOpenSafety={c => { setSafetyConnId(c.id); setView('safety') }}
+                onOpenReceipt={c => { setReceiptId(c.id); setView('receipt') }}
                 onClose={() => setView('my-listings')}
                 onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 onStartDriving={onStartDriving}
@@ -3801,6 +3848,20 @@ export function Home() {
                 onChanged={() => loadConnections(currentUser.id)}
                 showToast={showToast}
               />
+            )}
+            {guardedView === 'preferences' && (
+              <PreferencesScreen canWomenOnly={currentUser.profile.gender === 'woman'}
+                onClose={() => setView(prefsReturn)}
+                onApplied={() => { showToast('Preferences saved', 'success'); setView(prefsReturn) }}
+                showToast={showToast} />
+            )}
+            {guardedView === 'safety' && (
+              <SafetyScreen connection={safetyConnection}
+                onBack={() => (safetyConnection ? (setTripDayId(safetyConnection.id), setView('trip')) : setView('profile'))}
+                showToast={showToast} />
+            )}
+            {guardedView === 'receipt' && receiptId && (
+              <ReceiptScreen connectionId={receiptId} currentUserId={currentUser.id} onBack={() => window.history.back()} showToast={showToast} />
             )}
             {guardedView === 'offer' && (
               <OfferRideScreen
@@ -3892,7 +3953,16 @@ export function Home() {
               />
             )}
             {guardedView === 'notifications' && <NotificationsView notifications={notifications} onMarkAllRead={onMarkAllReadNotifs} onDismiss={onDismissNotif} onNavigate={onNotifNavigate} />}
-            {guardedView === 'profile' && <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')} />}
+            {guardedView === 'profile' && (
+              <ProfileView currentUser={currentUser} onProfileUpdate={setCurrentUser} mode={mode} onSetMode={handleSetMode} onOpenAdmin={() => setView('admin')}
+                hub={<ProfileHub currentUser={currentUser} mode={mode} onSetMode={handleSetMode} showToast={showToast}
+                  onOpen={(v, id) => {
+                    if (v === 'receipt' && id) { setReceiptId(id); setView('receipt') }
+                    else if (v === 'safety') { setSafetyConnId(null); setView('safety') }
+                    else if (v === 'preferences') { setPrefsReturn('profile'); setView('preferences') }
+                    else setView('my-listings')
+                  }} />} />
+            )}
             {guardedView === 'admin' && <AdminView showToast={showToast} />}
           </main>
         </div>
@@ -3900,5 +3970,6 @@ export function Home() {
 
       {!immersive || guardedView === 'map' ? <BottomNav view={guardedView} setView={setView} unreadMessages={unreadMessages} /> : null}
     </div>
+    </>
   )
 }

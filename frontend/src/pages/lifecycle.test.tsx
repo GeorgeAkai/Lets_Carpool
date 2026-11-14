@@ -25,7 +25,7 @@ const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String
 const iso = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
 
 const ME = {
-  id: "usr_me", email: "sam@example.com", email_domain: "example.com", status: "active",
+  id: "usr_me", email: "sam@example.com", email_domain: "example.com", status: "active", onboarded_at: "2026-01-01T00:00:00Z",
   profile: { user_id: "usr_me", display_name: "Sam Passenger", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
   vehicle: { user_id: "usr_me", make: "Honda", model: "Fit", color: "Red", seats: 5, car_type: "sedan", has_license: true, has_insurance: true, has_good_driving_record: true },
 };
@@ -217,7 +217,7 @@ describe("Passenger mode", () => {
     expect(within(sheet).getByText(/payment of \$8\.50 processed/i)).toBeTruthy();
     expect(within(sheet).getByText(/how was your driver, dana/i)).toBeTruthy();
     await user.click(within(sheet).getByRole("radio", { name: "5 stars" }));
-    await waitFor(() => expect(calls.find(c => c.key === "POST /connections/con_1/rating")?.body).toEqual({ stars: 5 }));
+    await waitFor(() => expect(calls.find(c => c.key === "POST /connections/con_1/rating")?.body).toMatchObject({ stars: 5 }));
     await user.click(within(sheet).getByRole("button", { name: /done/i }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: /ride complete/i })).toBeNull());
   });

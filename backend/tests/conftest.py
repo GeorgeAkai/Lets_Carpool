@@ -12,6 +12,12 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 TABLES = [
+    "trip_receipts",
+    "emergency_contacts",
+    "ride_buddies",
+    "settlement_preferences",
+    "saved_places",
+    "ride_preferences",
     "ratings",
     "saved_routes",
     "ride_alerts",
