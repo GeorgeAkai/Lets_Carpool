@@ -20,6 +20,7 @@ import type { PlaceResult } from '../lib/googleMaps'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
 import { IncomingRequests } from './incoming-requests'
+import { PendingRequestsView, isPendingRequestFor } from './pending-requests'
 import { supabase, getAccessToken, useAuthSession } from '../lib/auth'
 import { useIsMobile } from '../lib/useIsMobile'
 import { formatPlace } from '../lib/places'
@@ -37,7 +38,7 @@ import { AdminView } from './admin'
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type View = 'home' | 'feed' | 'post' | 'my-listings' | 'connections' | 'notifications' | 'profile' | 'map' | 'pools' | 'admin'
-  | 'results' | 'ride' | 'trip' | 'offer' | 'finding'
+  | 'results' | 'ride' | 'trip' | 'offer' | 'finding' | 'pending-requests'
 type ListingType = 'driver' | 'rider'
 export type RideTag = 'airport' | 'student' | 'church' | 'college' | 'work' | 'event'
 export type LuggageSize = 'none' | 'small' | 'medium' | 'large' | 'oversized'
@@ -1717,8 +1718,9 @@ function PostView({ onPost, userCoords, defaultType, vehicle: myVehicle, prefill
 
 type RidesTab = 'active' | 'past' | 'pools'
 
-function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClone, onCancel, tripActions }: {
+function MyRideCard({ listing, conversationCount, pendingCount = 0, onOpenPending, onManage, onViewMatches, onClone, onCancel, tripActions }: {
   listing: MyListing; conversationCount: number
+  pendingCount?: number; onOpenPending?: () => void
   onManage: () => void; onViewMatches: () => void; onClone: () => void; onCancel: () => Promise<void>
   tripActions?: TripActions
 }) {
@@ -1772,6 +1774,11 @@ function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClo
             <button onClick={onViewMatches} className="flex-1 min-w-[8rem] inline-flex items-center justify-center gap-1.5 rounded-xl border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted transition-colors">
               <Search className="size-4" />View Matches
             </button>
+            {isDriver && pendingCount > 0 && onOpenPending && (
+              <button onClick={onOpenPending} className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl bg-amber-500/15 px-3 py-2 text-sm font-semibold text-amber-700 dark:text-amber-400 hover:bg-amber-500/25 transition-colors">
+                <Users className="size-4" />{pendingCount} pending request{pendingCount > 1 ? 's' : ''}
+              </button>
+            )}
             {isDriver && tripActions && listing.status !== 'matched' && (
               <div className="w-full flex flex-wrap items-center gap-2">
                 <TripQuickActions trip={listing} actions={tripActions} showCancel={false} />
@@ -1812,8 +1819,9 @@ function MyRideCard({ listing, conversationCount, onManage, onViewMatches, onClo
   )
 }
 
-function MyListingsView({ tripActions, myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay }: {
+function MyListingsView({ tripActions, myListings, connections, onCancel, onManage, onViewMatches, onClone, onPostNew, userCoords, currentUserId, showToast, mode, onOpenTripDay, onOpenPending }: {
   onOpenTripDay: (c: Connection) => void
+  onOpenPending: (tripId: string) => void
   tripActions: TripActions
   myListings: MyListing[]; connections: Connection[]
   onCancel: (listing: MyListing) => Promise<void>
@@ -1919,6 +1927,8 @@ function MyListingsView({ tripActions, myListings, connections, onCancel, onMana
           {shown.map(listing => (
             <MyRideCard
               key={listing.id} listing={listing} conversationCount={conversationCount(listing)}
+              pendingCount={listing.type === 'driver' ? connections.filter(c => c.driverTripId === listing.id && isPendingRequestFor(c, currentUserId)).length : 0}
+              onOpenPending={() => onOpenPending(listing.id)}
               onManage={() => onManage(listing)} onViewMatches={() => onViewMatches(listing)}
               onClone={() => onClone(listing)} onCancel={() => onCancel(listing)} tripActions={tripActions}
             />
@@ -2940,7 +2950,7 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   // start from Home; Pools lives inside Trips.
   const items: Array<{ id: View; label: string; icon: React.ReactNode; also: View[] }> = [
     { id: 'feed', label: 'Home', icon: <HomeIcon className="size-[22px]" />, also: ['map', 'results', 'ride', 'offer', 'post', 'finding'] },
-    { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools'] },
+    { id: 'my-listings', label: 'Trips', icon: <Calendar className="size-[22px]" />, also: ['trip', 'pools', 'pending-requests'] },
     { id: 'connections', label: 'Messages', icon: <MessageCircle className="size-[22px]" />, also: [] },
     { id: 'profile', label: 'Profile', icon: <UserIcon className="size-[22px]" />, also: ['notifications', 'admin'] },
   ]
@@ -2965,13 +2975,14 @@ function BottomNav({ view, setView, unreadMessages }: { view: View; setView: (v:
   )
 }
 
-function Sidebar({ view, setView, unreadCount }: { view: View; setView: (v: View) => void; unreadCount: number }) {
+function Sidebar({ view, setView, unreadCount, mode, pendingCount }: { view: View; setView: (v: View) => void; unreadCount: number; mode: ListingType; pendingCount: number }) {
   const items: Array<{ id: View; label: string; icon: React.ReactNode }> = [
     { id: 'feed', label: 'Discover', icon: <Search className="size-5" /> },
     { id: 'map', label: 'Live Map', icon: <MapPin className="size-5" /> },
     { id: 'pools', label: 'Pools', icon: <Users className="size-5" /> },
     { id: 'post', label: 'Post', icon: <PlusCircle className="size-5" /> },
     { id: 'my-listings', label: 'My Rides', icon: <Calendar className="size-5" /> },
+    ...(mode === 'driver' ? [{ id: 'pending-requests' as const, label: 'Requests', icon: <ClipboardList className="size-5" /> }] : []),
     { id: 'connections', label: 'Inbox', icon: <MessageCircle className="size-5" /> },
     { id: 'notifications', label: 'Notifications', icon: <Bell className="size-5" /> },
     { id: 'profile', label: 'Profile', icon: <User className="size-5" /> },
@@ -2993,6 +3004,9 @@ function Sidebar({ view, setView, unreadCount }: { view: View; setView: (v: View
             >
               <span className={active ? '' : 'text-sidebar-foreground/50'}>{item.icon}</span>
               <span>{item.label}</span>
+              {item.id === 'pending-requests' && pendingCount > 0 && (
+                <span className="ml-auto min-w-5 text-center text-xs font-bold px-1.5 py-0.5 rounded-full bg-destructive text-white">{pendingCount > 9 ? '9+' : pendingCount}</span>
+              )}
               {item.id === 'notifications' && unreadCount > 0 && (
                 <span className="ml-auto min-w-5 text-center text-xs font-bold px-1.5 py-0.5 rounded-full bg-destructive text-white">{unreadCount > 9 ? '9+' : unreadCount}</span>
               )}
@@ -3059,7 +3073,7 @@ function ModeChoiceGate({ onChoose }: { onChoose: (m: ListingType) => void }) {
 const VIEW_PATHS: Record<View, string> = {
   home: '/discover', feed: '/discover', admin: '/admin',
   results: '/rides', ride: '/rides/detail', finding: '/rides/finding', trip: '/trip', offer: '/offer', map: '/map', pools: '/pools', post: '/post',
-  'my-listings': '/my-rides', connections: '/connections', notifications: '/notifications', profile: '/profile',
+  'my-listings': '/my-rides', 'pending-requests': '/pending-requests', connections: '/connections', notifications: '/notifications', profile: '/profile',
 }
 const PATH_VIEWS: Record<string, View> = {
   '/': 'feed', '/discover': 'feed', '/map': 'map', '/pools': 'pools', '/post': 'post',
@@ -3142,6 +3156,7 @@ export function Home() {
   const [rideSearch, setRideSearch] = useState<RideSearch>(defaultRideSearch)
   const [selectedTrip, setSelectedTrip] = useState<api.ApiDriverTrip | null>(null)
   const [tripDayId, setTripDayId] = useState<string | null>(null)
+  const [pendingTripId, setPendingTripId] = useState<string | null>(null)
   // Find-a-ride flow: a driver the passenger picked (null = auto top match) and drivers already tried.
   const [findTrip, setFindTrip] = useState<api.ApiDriverTrip | null>(null)
   const [findNonce, setFindNonce] = useState(0)
@@ -3600,7 +3615,8 @@ export function Home() {
     if (m === 'driver' && !currentUser?.vehicle) setView('profile')
   }, [currentUser?.vehicle, setView])
 
-  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding']
+  const AUTH_VIEWS: View[] = ['feed', 'post', 'my-listings', 'connections', 'notifications', 'profile', 'map', 'pools', 'admin', 'results', 'ride', 'trip', 'offer', 'finding', 'pending-requests']
+  const pendingRequestCount = connections.filter(c => isPendingRequestFor(c, currentUser?.id ?? '')).length
   const tripDayConnection = connections.find(c => c.id === tripDayId) ?? null
   const guardedView: View =
     !currentUser && AUTH_VIEWS.includes(view) ? 'feed'
@@ -3673,12 +3689,12 @@ export function Home() {
         <TopBar setView={setView} currentUser={currentUser} unreadCount={unreadCount} onSignOut={onSignOut} onOpenAdmin={() => setView('admin')} initials={initials} darkMode={darkMode} onToggleDark={() => setTheme(darkMode ? 'light' : 'dark')} mode={mode} />
       </div>
 
-      {!isMobile && <Sidebar view={guardedView} setView={setView} unreadCount={unreadCount} />}
+      {!isMobile && <Sidebar view={guardedView} setView={setView} unreadCount={unreadCount} mode={mode} pendingCount={pendingRequestCount} />}
 
       <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
-            {guardedView !== 'map' && guardedView !== 'connections' && (
+            {guardedView !== 'map' && guardedView !== 'connections' && guardedView !== 'pending-requests' && (
               <IncomingRequests
                 connections={connections} currentUserId={currentUser.id}
                 onAccept={onAccept} onDecline={onDecline} onStartDriving={onStartDriving}
@@ -3852,6 +3868,16 @@ export function Home() {
                 onManage={onManageListing} onViewMatches={onViewMatches} onClone={onCloneListing} onPostNew={() => setView('post')}
                 userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} mode={mode}
                 onOpenTripDay={c => { setTripDayId(c.id); setView('trip') }}
+                onOpenPending={id => { setPendingTripId(id); setView('pending-requests') }}
+              />
+            )}
+            {guardedView === 'pending-requests' && (
+              <PendingRequestsView
+                connections={connections} trips={myListings.filter(l => l.type === 'driver')} currentUserId={currentUser.id}
+                tripId={pendingTripId} onSelectTrip={setPendingTripId}
+                onAccept={onAccept} onDecline={onDecline}
+                onOpenChat={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
+                reload={() => loadConnections(currentUser.id)} showToast={showToast}
               />
             )}
             {guardedView === 'connections' && (
