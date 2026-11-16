@@ -326,19 +326,6 @@ export function SafetyScreen({ connection, onBack, showToast }: {
         </span>
       </a>
 
-      {connection && isRider && raw?.ride_pin && (
-        <div className="bg-card border border-border rounded-[18px] p-4 flex items-center gap-3.5">
-          <div className="flex-1 flex flex-col gap-0.5">
-            <span className="text-xs font-semibold text-muted-foreground">Your ride PIN</span>
-            <span className="text-[13px] text-muted-foreground">
-              {raw.pin_verified_at ? `${partnerFirst} confirmed it` : `Tell ${partnerFirst} before you get in`}
-            </span>
-          </div>
-          <span className="text-[28px] font-extrabold tracking-[0.2em] tabular-nums" aria-label={`PIN ${raw.ride_pin.split('').join(' ')}`}>{raw.ride_pin}</span>
-          {raw.pin_verified_at && <Check aria-hidden className="size-5 text-primary" />}
-        </div>
-      )}
-
       <section className="bg-card border border-border rounded-[18px] px-4 py-3.5 flex flex-col gap-2.5">
         <div className="flex items-center justify-between">
           <h2 className="text-[15px] font-extrabold">Trusted contacts</h2>

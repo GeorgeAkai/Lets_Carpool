@@ -8,6 +8,8 @@ import * as api from '../api'
 import type { ApiDriverTrip, ApiUser, SavedRoute, TripDayStatus } from '../api'
 import { formatPlace } from '../lib/places'
 import { LiveTripMap } from '../LiveTripMap'
+import { currentPosition } from '../lib/geo'
+import { fetchRoute } from '../lib/googleMaps'
 import {
   Avatar, LocationInput, reverseGeocode, toInitials, todayLocalISO, tripToMyListing, FLEX_LABEL,
   type Connection, type Flexibility, type LocationValue, type MyListing,
@@ -749,8 +751,6 @@ export function TripDayScreen({
   const [live, setLive] = useState<TripDayStatus | null>(null)
   const [checkedIn, setCheckedIn] = useState<string | null>(raw?.rider_at_pickup_at ?? null)
   const [safetyOpen, setSafetyOpen] = useState(false)
-  const [pinVerified, setPinVerified] = useState<string | null>(raw?.pin_verified_at ?? null)
-  const [pinDraft, setPinDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [pickedUpAt, setPickedUpAt] = useState<string | null>(raw?.picked_up_at ?? null)
   const accepted = connection.status === 'accepted'
@@ -789,6 +789,28 @@ export function TripDayScreen({
     pollRef.current = setInterval(load, connection.date === todayLocalISO() ? LIVE_POLL_MS : IDLE_POLL_MS)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [connection.id, accepted])
+
+  // Before the pickup the driver sees the whole trip, starting from where they are.
+  const [myPos, setMyPos] = useState<{ lat: number; lng: number } | null>(null)
+  const previewing = accepted && connection.myRole === 'driver' && !pickedUp
+  useEffect(() => {
+    if (!previewing) return
+    let alive = true
+    currentPosition().then(p => { if (alive && p) setMyPos(p) })
+    return () => { alive = false }
+  }, [previewing])
+  // How far the passenger is going, from their pickup to their drop-off.
+  const [rideLeg, setRideLeg] = useState<{ meters: number; seconds: number } | null>(null)
+  const ends = live?.pickup && live.destination ? { from: live.pickup, to: live.destination } : null
+  const legKey = ends ? `${ends.from.latitude},${ends.from.longitude},${ends.to.latitude},${ends.to.longitude}` : ''
+  useEffect(() => {
+    if (!ends || !accepted) return
+    let alive = true
+    fetchRoute(ends.from.latitude, ends.from.longitude, ends.to.latitude, ends.to.longitude)
+      .then(r => { if (alive && r) setRideLeg({ meters: r.distanceMeters, seconds: r.durationSeconds }) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [legKey, accepted]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const pickupLabel = live?.pickup.label ? formatPlace(live.pickup.label) : connection.riderPickupLabel ?? connection.from
   const departure = trip?.departure_time ? fmtTime(trip.departure_time) : null
@@ -873,8 +895,8 @@ export function TripDayScreen({
 
       {accepted && live?.pickup && live.destination && (
         <LiveTripMap
-          phase={pickedUp ? 'enroute' : 'approach'}
-          driver={live.driver ? { lat: live.driver.latitude, lng: live.driver.longitude } : null}
+          phase={pickedUp ? 'enroute' : previewing ? 'preview' : 'approach'}
+          driver={live.driver ? { lat: live.driver.latitude, lng: live.driver.longitude } : previewing ? myPos : null}
           driverAt={live.driver?.updated_at ? Date.parse(live.driver.updated_at) : undefined}
           pickup={{ lat: live.pickup.latitude, lng: live.pickup.longitude, label: pickupLabel }}
           destination={{ lat: live.destination.latitude, lng: live.destination.longitude, label: destLabel }}
@@ -896,37 +918,6 @@ export function TripDayScreen({
         )}
       </div>
 
-      {accepted && connection.myRole === 'rider' && raw?.ride_pin && (
-        <div className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-3">
-          <span className="flex-1 flex flex-col gap-0.5">
-            <span className="text-[13px] font-bold">Your ride PIN</span>
-            <span className="text-[13px] text-muted-foreground">{pinVerified ? `${partnerFirst} confirmed it — you’re in the right car` : `Read it to ${partnerFirst} when they arrive, so you both know it’s the right car`}</span>
-          </span>
-          <span aria-label={`Ride PIN ${raw.ride_pin.split('').join(' ')}`} className="text-[22px] font-extrabold tracking-[0.2em] tabular-nums">{raw.ride_pin}</span>
-          {pinVerified && <Check aria-hidden className="size-5 text-primary" />}
-        </div>
-      )}
-      {accepted && connection.myRole === 'driver' && (
-        pinVerified ? (
-          <p className="text-[13px] font-semibold text-primary flex items-center gap-1.5"><Check className="size-4" aria-hidden />Ride PIN confirmed — it's {partnerFirst}</p>
-        ) : (
-          <form className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-2.5"
-            onSubmit={async e => {
-              e.preventDefault()
-              try { const c = await api.verifyRidePin(connection.id, pinDraft); setPinVerified(c.pin_verified_at ?? new Date().toISOString()); showToast('PIN confirmed', 'success') }
-              catch (err) { showToast(err instanceof Error ? err.message : 'Could not check PIN', 'error') }
-            }}>
-            <label htmlFor="ride-pin" className="flex-1 flex flex-col gap-0.5">
-              <span className="text-[13px] font-bold">Check it’s {partnerFirst} <span className="font-normal text-muted-foreground">(optional)</span></span>
-              <span className="text-[13px] text-muted-foreground">{partnerFirst} has a 4-digit PIN on their trip screen. Ask them to read it out at pickup.</span>
-            </label>
-            <input id="ride-pin" inputMode="numeric" autoComplete="one-time-code" maxLength={4} value={pinDraft}
-              onChange={e => setPinDraft(e.target.value.replace(/\D/g, ''))}
-              className="w-[72px] h-11 rounded-xl bg-input-background border border-border text-center text-lg font-extrabold tracking-[0.15em]" />
-            <button type="submit" disabled={pinDraft.length !== 4} className="h-11 px-3.5 rounded-xl bg-primary text-primary-foreground text-sm font-bold disabled:opacity-50">Check</button>
-          </form>
-        )
-      )}
       {accepted && connection.myRole === 'rider' && raw?.settlement && (
         <p className="text-[13px] text-muted-foreground">{partnerFirst} settles up via <span className="font-semibold text-foreground">{settlementLine(raw.settlement)}</span></p>
       )}
@@ -953,7 +944,8 @@ export function TripDayScreen({
           title={`Pickup ${departure ?? dayLabel(connection.date)} · ${pickupLabel}`}
           sub={pickedUp ? 'Picked up' : checkedIn ? `${connection.myRole === 'rider' ? 'You' : partnerFirst} checked in at the pickup` : undefined} />
         <TimelineStep state={connection.status === 'completed' ? 'done' : pickedUp ? 'current' : 'next'} last
-          title={`Drop-off${trip?.estimated_arrival_time ? ` ${fmtTime(trip.estimated_arrival_time)}` : ''} · ${connection.to}`} />
+          title={`Drop-off${trip?.estimated_arrival_time ? ` ${fmtTime(trip.estimated_arrival_time)}` : ''} · ${destLabel}`}
+          sub={accepted && rideLeg ? `${(rideLeg.meters / 1609.344).toFixed(rideLeg.meters < 16093 ? 1 : 0)} mi from the pickup · about ${rideLeg.seconds < 3600 ? `${Math.max(1, Math.round(rideLeg.seconds / 60))} min` : `${Math.floor(rideLeg.seconds / 3600)} hr ${Math.round((rideLeg.seconds % 3600) / 60)} min`}` : undefined} />
       </ol>
 
       {connection.status === 'completed' && (

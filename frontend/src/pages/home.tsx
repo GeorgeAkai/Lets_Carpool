@@ -16,6 +16,8 @@ import * as api from '../api'
 import type { ApiUser, WsMessage } from '../api'
 import { MapView, distanceMeters } from '../MapView'
 import { searchPlaces, reverseGeocode, autocompletePlaces } from '../lib/googleMaps'
+import { currentPosition } from '../lib/geo'
+import { clearCache, readCache, writeCache } from '../lib/cache'
 import type { PlaceResult } from '../lib/googleMaps'
 import type { TripRoute, DrivingTarget } from '../MapView'
 import { PoolView } from '../PoolView'
@@ -3103,8 +3105,23 @@ export function Home() {
   const isMobile = useIsMobile()
 
   // ── Auth ──
-  const [currentUser, setCurrentUser] = useState<ApiUser | null>(null)
-  const [authLoading, setAuthLoading] = useState(true)
+  // What this device last showed for the signed-in user. The screens open on
+  // it straight away and each list is replaced when the server answers, so a
+  // reload never starts from an empty app.
+  const [cached] = useState(() => {
+    const me = localStorage.getItem('carpool_token') ? readCache<ApiUser>('me') : null
+    if (!me) return null
+    return {
+      me,
+      connections: (readCache<api.ApiConnection[]>(`${me.id}:connections`) ?? []).map(c => apiConnectionToConnection(c, me.id)),
+      myListings: readCache<MyListing[]>(`${me.id}:myListings`) ?? [],
+      feed: readCache<Listing[]>(`${me.id}:feed`) ?? [],
+      notifications: readCache<api.ApiNotification[]>(`${me.id}:notifications`) ?? [],
+    }
+  })
+  const [currentUser, setCurrentUser] = useState<ApiUser | null>(cached?.me ?? null)
+  // With a remembered user there is something to show while the session is re-checked.
+  const [authLoading, setAuthLoading] = useState(!cached)
   const [authError, setAuthError] = useState<string | null>(null)
   const [authRetryNonce, setAuthRetryNonce] = useState(0)
 
@@ -3154,7 +3171,9 @@ export function Home() {
   const [filterTag, setFilterTag] = useState<'' | RideTag>('')
   const [filterCarType, setFilterCarType] = useState<'' | CarType>('')
   const [filterLuggage, setFilterLuggage] = useState<'' | LuggageSize>('')
-  const [allListings, setAllListings] = useState<Listing[]>([])
+  const [allListings, setAllListings] = useState<Listing[]>(cached?.feed ?? [])
+  const allListingsRef = useRef(allListings)
+  allListingsRef.current = allListings
   const [matchedListingIds, setMatchedListingIds] = useState<string[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
 
@@ -3164,7 +3183,7 @@ export function Home() {
   const [filterSheetOpen, setFilterSheetOpen] = useState(false)
 
   // ── My Listings ──
-  const [myListings, setMyListings] = useState<MyListing[]>([])
+  const [myListings, setMyListings] = useState<MyListing[]>(cached?.myListings ?? [])
   const [postPrefill, setPostPrefill] = useState<PostPrefill | null>(null)
 
   // ── Ride flow (Home → Results → Ride details; Trip day; Offer a ride) ──
@@ -3185,8 +3204,8 @@ export function Home() {
   useEffect(() => { if (view !== 'post') setPostPrefill(null) }, [view])
 
   // ── Connections ──
-  const [connections, setConnections] = useState<Connection[]>([])
-  const connectionsRef = useRef<Connection[]>([])
+  const [connections, setConnections] = useState<Connection[]>(cached?.connections ?? [])
+  const connectionsRef = useRef<Connection[]>(cached?.connections ?? [])
   const loadMyListingsRef = useRef<() => void>(() => {})
   useEffect(() => { connectionsRef.current = connections }, [connections])
   const [incomingMessage, setIncomingMessage] = useState<{ connectionId: string; message: api.ApiMessage } | null>(null)
@@ -3207,7 +3226,7 @@ export function Home() {
     && Date.now() - new Date(c.raw.updated_at).getTime() < 24 * 3600 * 1000) ?? null
 
   // ── Notifications ──
-  const [notifications, setNotifications] = useState<api.ApiNotification[]>([])
+  const [notifications, setNotifications] = useState<api.ApiNotification[]>(cached?.notifications ?? [])
   const [connDeepLink, setConnDeepLink] = useState<{ connectionId: string; section: 'chat' | 'gassplit' } | null>(null)
 
   // ── Real-time (WebSocket locally, polling in production — see api.createRealtime) ──
@@ -3294,7 +3313,8 @@ export function Home() {
   }, [requestLocation])
 
   const handleUnauthenticated = useCallback(() => {
-    api.logout(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
+    api.logout(); clearCache(); setCurrentUser(null); setAuthLoading(false); setAuthError(null)
+    setConnections([]); setMyListings([]); setAllListings([]); setNotifications([])
   }, [])
 
   // Fires only after AuthSync exhausts its retries — e.g. the auth
@@ -3329,6 +3349,14 @@ export function Home() {
     if (!currentUser) return
     api.getNotifications().then(setNotifications).catch(() => {})
   }, [currentUser])
+
+  // Remember what is on screen (per user) for the next time the app opens.
+  const uid = currentUser?.id
+  useEffect(() => { if (currentUser) writeCache('me', currentUser) }, [currentUser])
+  useEffect(() => { if (uid) writeCache(`${uid}:connections`, connections.flatMap(c => (c.raw ? [c.raw] : []))) }, [uid, connections])
+  useEffect(() => { if (uid) writeCache(`${uid}:myListings`, myListings) }, [uid, myListings])
+  useEffect(() => { if (uid) writeCache(`${uid}:feed`, allListings) }, [uid, allListings])
+  useEffect(() => { if (uid) writeCache(`${uid}:notifications`, notifications.filter(n => !n.id.startsWith('ws_')).slice(0, 100)) }, [uid, notifications])
 
   // ── Connections from API ──
   const loadConnections = useCallback(async (userId: string) => {
@@ -3390,7 +3418,8 @@ export function Home() {
   } : null, [reqKey?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadListings = useCallback(async () => {
-    setFeedLoading(true)
+    // A refresh keeps the current list on screen; only a first load shows the placeholder.
+    setFeedLoading(allListingsRef.current.length === 0)
     try {
       const [trips, requests, corridorTrips] = await Promise.all([
         api.searchDriverTrips({}), api.searchRideRequests({}),
@@ -3478,9 +3507,17 @@ export function Home() {
         return confirmed
       }
 
-      const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
       const from = opts?.from && Number.isFinite(opts.from.lat) ? opts.from : null
-      const pickupLabel = from ? from.label : userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      // Every end of the ride gets real coordinates: the chosen start, else
+      // this device's location, else the place the listing names. A drop-off
+      // saved at the wrong spot leaves the driver with no route to it.
+      const locate = async (label: string): Promise<LocationValue> => {
+        const hit = (await searchPlaces(label, userCoords).catch(() => []))[0]
+        if (!hit) throw new Error(`Couldn’t find “${label}” on the map. Search for your trip from Home instead.`)
+        return { label, lat: hit.lat, lng: hit.lng }
+      }
+      const startPoint = async (): Promise<LocationValue> =>
+        from ?? (userCoords ? { label: await reverseGeocode(userCoords.lat, userCoords.lng), lat: userCoords.lat, lng: userCoords.lng } : locate(listing.from))
       // A listing I already posted for this ride (same day, same destination)
       // is the one to connect: it has the real route, time and price, and it
       // keeps both people on the same pair of listings.
@@ -3492,10 +3529,8 @@ export function Home() {
       if (listing.type === 'driver') {
         let requestId = mine?.id
         if (!requestId) {
-          const [p, d] = await Promise.all([
-            api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
-            opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
-          ])
+          const [a, b] = await Promise.all([startPoint(), opts?.to ?? locate(listing.to)])
+          const [p, d] = await Promise.all([api.createLocation(a.label, a.lat, a.lng), api.createLocation(b.label, b.lat, b.lng)])
           const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null, unlisted: true })
           requestId = rr.id
           spare = () => api.cancelRideRequest(rr.id)
@@ -3505,7 +3540,8 @@ export function Home() {
       } else {
         let tripId = mine?.id
         if (!tripId) {
-          const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
+          const [a, b] = await Promise.all([startPoint(), locate(listing.to)])
+          const [p, d] = await Promise.all([api.createLocation(a.label, a.lat, a.lng), api.createLocation(b.label, b.lat, b.lng)])
           const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: Math.max(1, listing.passengers ?? 1), tags: [], unlisted: true })
           tripId = trip.id
           spare = () => api.cancelDriverTrip(trip.id)
@@ -3629,12 +3665,17 @@ export function Home() {
     const lat = target === 'destination' ? dest?.latitude : conn.riderPickupLat
     const lng = target === 'destination' ? dest?.longitude : conn.riderPickupLng
     if (!lat || !lng) return
+    // Find the driver before drawing anything, so the route starts where they
+    // really are. Only if location is blocked or slow does the pickup leg start
+    // from their posted start, and the drop-off leg from the pickup.
+    const here = await currentPosition(4000)
     setTripRoute(null)
     setDrivingTo({
-      // Without a GPS fix the pickup leg is drawn from the driver's posted
-      // start, and the drop-off leg from the pickup.
-      originLat: target === 'destination' ? conn.riderPickupLat : conn.pickupLat,
-      originLng: target === 'destination' ? conn.riderPickupLng : conn.pickupLng,
+      originLat: here?.lat ?? (target === 'destination' ? conn.riderPickupLat : conn.pickupLat),
+      originLng: here?.lng ?? (target === 'destination' ? conn.riderPickupLng : conn.pickupLng),
+      // The drop-off, while still heading to the pickup (for the hand-off to Google Maps).
+      finalLat: target === 'pickup' ? dest?.latitude : undefined,
+      finalLng: target === 'pickup' ? dest?.longitude : undefined,
       connectionId: conn.id, pickupLat: lat, pickupLng: lng, kind: target,
       pickupLabel: target === 'destination' ? formatPlace(dest?.label) : conn.riderPickupLabel ?? 'Pickup',
       partnerName: conn.withUser.name,
@@ -3720,7 +3761,7 @@ export function Home() {
 
   const onSignOut = useCallback(() => {
     supabase.auth.signOut().catch(() => {})
-    api.logout(); setCurrentUser(null); setConnections([]); setMyListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
+    api.logout(); clearCache(); setCurrentUser(null); setConnections([]); setMyListings([]); setAllListings([]); setNotifications([]); setTripRoute(null); setDrivingTo(null)
     navigate('/auth/sign-in', { replace: true })
   }, [navigate])
 

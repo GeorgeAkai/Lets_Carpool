@@ -435,7 +435,7 @@ describe("Account screens", () => {
     expect(calls.filter(c => c.key === "GET /driver-trips/search" && c.url.includes("destination_latitude")).length).toBe(2);
   });
 
-  it("opens Safety from trip day with the ride PIN and texts the trip to trusted contacts", async () => {
+  it("opens Safety from trip day (no ride PIN) and texts the trip to trusted contacts", async () => {
     const user = userEvent.setup();
     signIn("rider");
     const calls = stubApi({
@@ -449,13 +449,16 @@ describe("Account screens", () => {
 
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /8:10 am with priya/i }));
-    await screen.findByText(/read it to priya when they arrive/i);
-    expect(screen.getByText(/settles up via/i)).toHaveTextContent("Venmo · @priya");
+    expect(await screen.findByText(/settles up via/i)).toHaveTextContent("Venmo · @priya");
+    // The ride PIN is switched off for now: it is not shown on the trip page…
+    expect(screen.queryByText(/ride pin/i)).toBeNull();
+    expect(screen.queryByText("4821")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /safety/i }));
     await screen.findByRole("heading", { name: /^safety$/i });
     expect(screen.getByRole("link", { name: /call emergency services/i })).toHaveAttribute("href", "tel:911");
-    expect(screen.getByText("4821")).toBeTruthy();
+    // …or on Safety.
+    expect(screen.queryByText("4821")).toBeNull();
 
     await user.click(await screen.findByRole("button", { name: /\+ add/i }));
     await user.type(screen.getByLabelText(/^name$/i), "Alex");
@@ -467,7 +470,7 @@ describe("Account screens", () => {
     expect((calls.find(c => c.key === "POST /me/emergency-contacts")!.body as { name: string }).name).toBe("Alex");
   });
 
-  it("lets the driver confirm the rider's PIN", async () => {
+  it("does not ask the driver for a ride PIN", async () => {
     const user = userEvent.setup();
     signIn("driver");
     const asDriver = acceptedConnection({
@@ -475,22 +478,19 @@ describe("Account screens", () => {
       ride_request: { ...acceptedConnection().ride_request, rider_id: "usr_sam" },
       rider_profile: { user_id: "usr_sam", display_name: "Sam Rivera", photo_url: null, bio: null, photo_verified: false, interests: [], nationality: null },
     });
-    const calls = stubApi({
+    stubApi({
       ...BASE_ROUTES,
       "GET /me/driver-trips": [], "GET /me/ride-requests": [],
       "GET /me/connections": [asDriver],
       "GET /connections/con_9/messages": [],
       "GET /connections/con_9/live": { connection_id: "con_9", pickup: { label: "Elm St", latitude: 39.7, longitude: -121.8 }, departure_time: "08:10:00", driver: null, rider_at_pickup_at: null },
-      "POST /connections/con_9/verify-pin": { ...asDriver, pin_verified_at: "2026-10-26T08:09:00Z" },
     });
 
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /picking up sam/i }));
-    await user.type(await screen.findByLabelText(/check it’s sam/i), "4821");
-    await user.click(screen.getByRole("button", { name: /^check$/i }));
-
-    await screen.findByText(/ride pin confirmed/i);
-    expect((calls.find(c => c.key === "POST /connections/con_9/verify-pin")!.body as { pin: string }).pin).toBe("4821");
+    expect(await screen.findByRole("button", { name: /sam is in the car/i })).toBeTruthy();
+    expect(screen.queryByText(/pin/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /^check$/i })).toBeNull();
   });
 
   it("rates with tags, rides again and opens the receipt after a completed ride", async () => {

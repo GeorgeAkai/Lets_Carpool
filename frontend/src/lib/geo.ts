@@ -36,3 +36,19 @@ export function snapToPath(path: LatLng[], p: LatLng, maxMeters = 35): LatLng {
   if (!best || best.d > maxMeters) return p
   return { lat: p.lat + best.y / mPerDegLat, lng: p.lng + best.x / mPerDegLng }
 }
+
+/**
+ * The device's position right now, or null if location is blocked, missing or
+ * slower than `timeoutMs` (so callers can fall back instead of hanging).
+ */
+export function currentPosition(timeoutMs = 5000): Promise<LatLng | null> {
+  return new Promise(resolve => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) { resolve(null); return }
+    const timer = setTimeout(() => resolve(null), timeoutMs + 500)
+    navigator.geolocation.getCurrentPosition(
+      pos => { clearTimeout(timer); resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }) },
+      () => { clearTimeout(timer); resolve(null) },
+      { enableHighAccuracy: true, timeout: timeoutMs, maximumAge: 15000 },
+    )
+  })
+}

@@ -40,6 +40,10 @@ export interface DrivingTarget {
   // and directions still show.
   originLat?: number
   originLng?: number
+  // On the pickup leg: the passenger's drop-off, so a hand-off to Google Maps
+  // can carry the whole trip.
+  finalLat?: number
+  finalLng?: number
 }
 
 type OsrmResult = RouteGeometry
@@ -233,6 +237,8 @@ const DRIVING_SELF_KEY = "__driving_self__"
 // Uber-style nav view doesn't need a new route on every single GPS tick.
 const DRIVING_ROUTE_REFRESH_METERS = 40
 const DRIVING_ROUTE_REFRESH_MS = 20000
+// How close to the drop-off the driver must be before the ride can be completed from the map.
+const ARRIVE_RADIUS_METERS = 150
 
 // ── Marker DOM factories ─────────────────────────────────────────────────────
 // A top-down SVG car (nose pointing north at 0deg) that rotates to the
@@ -797,6 +803,22 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       window.speechSynthesis.speak(new SpeechSynthesisUtterance(maneuverText))
     } catch { /* no voice on this device */ }
   }, [maneuverText])
+  // "We've arrived" unlocks at the drop-off itself, judged by the driver's GPS.
+  // With location blocked there is nothing to judge by, so it stays available.
+  const metersToTarget = drivingTo && drivingSample ? distanceMeters(drivingSample.pos, [drivingTo.pickupLat, drivingTo.pickupLng]) : null
+  const atTarget = metersToTarget != null ? metersToTarget <= ARRIVE_RADIUS_METERS : drivingGeoError
+  // Google Maps gets the real start and end: from here (or the leg's start) to
+  // the target, and on the pickup leg onward to the drop-off.
+  const googleMapsUrl = (() => {
+    if (!drivingTo) return ""
+    const q = new URLSearchParams({ api: "1", travelmode: "driving" })
+    if (drivingOrigin) q.set("origin", `${drivingOrigin[0]},${drivingOrigin[1]}`)
+    if (!toDropoff && drivingTo.finalLat != null && drivingTo.finalLng != null) {
+      q.set("destination", `${drivingTo.finalLat},${drivingTo.finalLng}`)
+      q.set("waypoints", `${drivingTo.pickupLat},${drivingTo.pickupLng}`)
+    } else q.set("destination", `${drivingTo.pickupLat},${drivingTo.pickupLng}`)
+    return `https://www.google.com/maps/dir/?${q.toString()}`
+  })()
   const [legBusy, setLegBusy] = useState(false)
   const finishLeg = async (act: ((id: string) => Promise<void>) | undefined) => {
     if (!act || !drivingTo) return
@@ -1093,16 +1115,23 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                   </details>
                 )}
                 {toDropoff ? (
-                  <button onClick={() => finishLeg(onCompleteRide)} disabled={legBusy} className="w-full py-3 rounded-xl bg-white text-slate-900 text-sm font-bold disabled:opacity-60">
-                    We’ve arrived · complete ride
-                  </button>
+                  <>
+                    <button onClick={() => finishLeg(onCompleteRide)} disabled={legBusy || !atTarget} className="w-full py-3 rounded-xl bg-white text-slate-900 text-sm font-bold disabled:opacity-40">
+                      We’ve arrived · complete ride
+                    </button>
+                    {!atTarget && (
+                      <p className="text-xs text-white/60 text-center">
+                        {metersToTarget != null ? `Unlocks at the drop-off · ${formatStepDistance(metersToTarget)} to go` : "Finding your location… this unlocks at the drop-off"}
+                      </p>
+                    )}
+                  </>
                 ) : (
                   <button onClick={() => finishLeg(onPickedUp)} disabled={legBusy} className="w-full py-3 rounded-xl bg-white text-slate-900 text-sm font-bold disabled:opacity-60">
                     {drivingTo.partnerName.split(" ")[0]} is in the car · go to drop-off
                   </button>
                 )}
                 <div className="flex gap-2">
-                  <a href={`https://www.google.com/maps/dir/?api=1&destination=${drivingTo.pickupLat},${drivingTo.pickupLng}&travelmode=driving`}
+                  <a href={googleMapsUrl}
                     target="_blank" rel="noreferrer"
                     className="flex-1 py-2.5 rounded-xl bg-white/10 text-sm font-semibold text-center">Open in Google Maps</a>
                   <button onClick={onStopDriving} className="flex-1 py-2.5 rounded-xl bg-white/10 text-sm font-semibold">Back to trip</button>

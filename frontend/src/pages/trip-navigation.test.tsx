@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -89,9 +89,26 @@ function signIn(mode: "rider" | "driver") {
 }
 const phone = () => { window.matchMedia = ((query: string) => ({ matches: query.includes("max-width"), media: query, onchange: null, addListener: () => {}, removeListener: () => {}, addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false })) as typeof window.matchMedia; };
 
+// Where the "Open in Google Maps" link starts, passes through and ends.
+function mapsLink() {
+  const q = new URL((screen.getByRole("link", { name: /open in google maps/i }) as HTMLAnchorElement).href).searchParams;
+  return { origin: q.get("origin"), waypoints: q.get("waypoints"), destination: q.get("destination") };
+}
+
+// Pretend the device reports this position.
+function gps(latitude: number, longitude: number) {
+  const fix = { coords: { latitude, longitude, heading: null, speed: null, accuracy: 5 } };
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition: (ok: (p: unknown) => void) => ok(fix),
+    watchPosition: (ok: (p: unknown) => void) => { ok(fix); return 1; },
+    clearWatch: () => {},
+  } });
+}
+
 const originalMatchMedia = window.matchMedia;
 beforeEach(() => { localStorage.clear(); sessionStorage.clear(); phone(); });
-afterEach(() => { vi.unstubAllGlobals(); window.matchMedia = originalMatchMedia; });
+// Unmount first: the map stops watching the position as it goes.
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); window.matchMedia = originalMatchMedia; Reflect.deleteProperty(navigator, "geolocation"); });
 
 describe("Driver, from accept to drop-off", () => {
   it("gets directions to the pickup, then to the passenger's destination, then completes the ride", async () => {
@@ -110,6 +127,9 @@ describe("Driver, from accept to drop-off", () => {
 
     // Accept → the trip page, with the next step as the main button.
     await user.click(await screen.findByRole("button", { name: /^accept$/i }));
+    // Before starting, the driver can see where the passenger wants to go and how far it is.
+    expect(await screen.findByText(/drop-off · capitol mall, sacramento, ca/i)).toBeTruthy();
+    expect(await screen.findByText(/2\.6 mi from the pickup · about 9 min/i)).toBeTruthy();
     await user.click(await screen.findByRole("button", { name: /start trip/i }));
     await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_1/start-trip")).toBe(true));
 
@@ -118,9 +138,10 @@ describe("Driver, from accept to drop-off", () => {
     expect(await screen.findByText(/picking up/i)).toBeTruthy();
     expect((await screen.findAllByText("Turn left onto Main St")).length).toBe(2); // the next-turn banner and the step list
     expect(screen.getByText(/all directions \(3 steps\)/i)).toBeTruthy();
-    const toPickup = calls.find(c => c.key === "ROUTE")!;
-    expect(toPickup.url).toContain("-121.84,39.73");
-    expect((screen.getByRole("link", { name: /open in google maps/i }) as HTMLAnchorElement).href).toContain("destination=39.73,-121.84");
+    // From the driver's posted start (no GPS here) to the passenger's pickup.
+    expect(calls.some(c => c.key === "ROUTE" && c.url.includes("/driving/-121.8,39.7;-121.84,39.73"))).toBe(true);
+    // Google Maps gets the whole trip: start → pickup → the passenger's drop-off.
+    expect(mapsLink()).toEqual({ origin: "39.7,-121.8", waypoints: "39.73,-121.84", destination: "38.5766,-121.4934" });
 
     // Passenger gets in: the same map now leads to the drop-off they asked for.
     await user.click(screen.getByRole("button", { name: /rae is in the car · go to drop-off/i }));
@@ -128,33 +149,62 @@ describe("Driver, from accept to drop-off", () => {
     expect(await screen.findByText(/dropping off/i)).toBeTruthy();
     expect((await screen.findAllByText("Turn left onto Capitol Mall")).length).toBe(2); // the next-turn banner and the step list
     await waitFor(() => expect(calls.filter(c => c.key === "ROUTE").some(c => c.url.includes(";-121.4934,38.5766"))).toBe(true));
-    expect((screen.getByRole("link", { name: /open in google maps/i }) as HTMLAnchorElement).href).toContain("destination=38.5766,-121.4934");
+    expect(mapsLink()).toEqual({ origin: "39.73,-121.84", waypoints: null, destination: "38.5766,-121.4934" });
 
     // At the drop-off: complete, and land on the finished ride.
     await user.click(screen.getByRole("button", { name: /we’ve arrived · complete ride/i }));
     await waitFor(() => expect(calls.find(c => c.key === "POST /connections/con_1/transition" && (c.body as { action: string }).action === "complete")).toBeTruthy());
     expect(await screen.findByRole("heading", { name: /ride with rae complete/i })).toBeTruthy();
   });
+});
 
-  it("is told the PIN is the passenger's, and optional", async () => {
+describe("Driver with location on", () => {
+  const onBoard = () => ({ status: "accepted", driver_started_at: iso(20), picked_up_at: iso(5) });
+  const routes = (calls: { n: number }) => ({
+    ...BASE_ROUTES,
+    "GET /me/connections": [ride(onBoard())],
+    "GET /connections/con_1/live": () => { calls.n++; return { ...LIVE, picked_up_at: iso(5), driver_started_at: iso(20) }; },
+    "POST /me/location": {}, "PUT /me/location": {},
+  });
+
+  it("starts the route from where the driver actually is", async () => {
     const user = userEvent.setup();
     signIn("driver");
-    let state: Record<string, unknown> = { status: "pending" };
-    stubApi({
-      ...BASE_ROUTES,
-      "GET /me/connections": () => [ride(state)],
-      "GET /connections/con_1/live": LIVE,
-      "POST /connections/con_1/transition": () => { state = { status: "accepted" }; return ride(state); },
-    });
-    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
-    await user.click(await screen.findByRole("button", { name: /^accept$/i }));
-    expect(await screen.findByText(/rae has a 4-digit pin on their trip screen/i)).toBeTruthy();
-    expect(screen.getByText(/\(optional\)/i)).toBeTruthy();
+    gps(39.5, -121.6);
+    const calls = stubApi(routes({ n: 0 }));
+    render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /picking up rae rider/i }));
+    await user.click(await screen.findByRole("button", { name: /navigate to drop-off/i }));
+
+    await waitFor(() => expect(calls.some(c => c.key === "ROUTE" && c.url.includes("/driving/-121.6,39.5;-121.4934,38.5766"))).toBe(true));
+    expect(mapsLink()).toEqual({ origin: "39.5,-121.6", waypoints: null, destination: "38.5766,-121.4934" });
+  });
+
+  it("only lets the ride be completed at the drop-off", async () => {
+    const user = userEvent.setup();
+    signIn("driver");
+    gps(39.5, -121.6); // still far from Sacramento
+    stubApi(routes({ n: 0 }));
+    const { unmount } = render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /picking up rae rider/i }));
+    await user.click(await screen.findByRole("button", { name: /navigate to drop-off/i }));
+    const far = await screen.findByRole("button", { name: /we’ve arrived · complete ride/i });
+    expect((far as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/unlocks at the drop-off · \d+ mi to go/i)).toBeTruthy();
+    unmount();
+
+    gps(38.5767, -121.4935); // a few metres from the drop-off
+    render(<MemoryRouter initialEntries={["/my-rides"]}><App /></MemoryRouter>);
+    await user.click(await screen.findByRole("button", { name: /picking up rae rider/i }));
+    await user.click(await screen.findByRole("button", { name: /navigate to drop-off/i }));
+    const near = await screen.findByRole("button", { name: /we’ve arrived · complete ride/i });
+    await waitFor(() => expect((near as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByText(/unlocks at the drop-off/i)).toBeNull();
   });
 });
 
 describe("Passenger, once accepted", () => {
-  it("sees the driver is on the way from the page's own poll, and their PIN with what to do with it", async () => {
+  it("sees the driver is on the way from the page's own poll, with no PIN step", async () => {
     const user = userEvent.setup();
     signIn("rider");
     // I am the passenger here; the connection list never says the driver set off.
@@ -175,8 +225,8 @@ describe("Passenger, once accepted", () => {
 
     expect(await screen.findByRole("heading", { name: /dana is on the way/i })).toBeTruthy();
     expect(screen.getByText(/dana has set off/i)).toBeTruthy();
-    expect(screen.getByText("Your ride PIN")).toBeTruthy();
-    expect(screen.getByText(/read it to dana when they arrive/i)).toBeTruthy();
-    expect(screen.getByText("4821")).toBeTruthy();
+    // No PIN step for now, even though the server still sends one.
+    expect(screen.queryByText(/pin/i)).toBeNull();
+    expect(screen.queryByText("4821")).toBeNull();
   });
 });

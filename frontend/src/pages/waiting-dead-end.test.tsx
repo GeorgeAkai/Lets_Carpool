@@ -72,6 +72,9 @@ type Handler = (body: unknown) => unknown;
 function stubApi(routes: Record<string, unknown | Handler>) {
   const calls: Array<{ key: string; body: unknown }> = [];
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+    if (String(url).includes("nominatim.openstreetmap.org/search")) {
+      return { ok: true, status: 200, json: async () => [{ place_id: 1, lat: "38.58", lon: "-121.49", display_name: "Somewhere, CA", type: "city", class: "place", address: {} }] };
+    }
     const key = `${(init?.method ?? "GET").toUpperCase()} ${String(url).replace(BASE, "").split("?")[0]}`;
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ key, body });

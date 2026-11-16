@@ -22,10 +22,14 @@ function signInWithExistingToken() {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+// What the open geocoder answers when the app looks up a listing's place name.
+const GEOCODED = [{ place_id: 1, lat: "42.3656", lon: "-71.0096", display_name: "Somewhere, MA", type: "city", class: "place", address: {} }];
+
 function mockFetch(handlers: Record<string, unknown>) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes("nominatim.openstreetmap.org/search")) return { ok: true, status: 200, json: async () => GEOCODED };
       const method = (init?.method ?? "GET").toUpperCase();
       const cleanUrl = String(url).replace(BASE, "");
       const urlPath = cleanUrl.split("?")[0];
@@ -466,6 +470,7 @@ describe("Connections view", () => {
     const LOC = { id: "loc_tmp", label: "tmp", exact: true };
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const path = String(url).replace(BASE, "");
+      if (path.includes("nominatim.openstreetmap.org/search")) return { ok: true, json: async () => GEOCODED };
       if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
       if (path.startsWith("/driver-trips/search")) return { ok: true, json: async () => [DRIVER_TRIP_1] };
       if (path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };
@@ -518,6 +523,7 @@ describe("Connections view", () => {
     const LOC = { id: "loc_tmp", label: "tmp", exact: true };
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const path = String(url).replace(BASE, "");
+      if (path.includes("nominatim.openstreetmap.org/search")) return { ok: true, json: async () => GEOCODED };
       if (path === "/me") return { ok: true, json: async () => ME_RESPONSE };
       if (path.startsWith("/driver-trips/search")) return { ok: true, json: async () => [DRIVER_TRIP_1] };
       if (path.startsWith("/ride-requests/search")) return { ok: true, json: async () => [] };

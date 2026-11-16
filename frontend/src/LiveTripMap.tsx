@@ -11,8 +11,12 @@ export interface LiveTripMapProps {
   driverAt?: number
   pickup: Point & { label?: string }
   destination: Point & { label?: string }
-  /** "approach": driver heading to the pickup. "enroute": passenger on board, heading to the destination. */
-  phase: "approach" | "enroute"
+  /**
+   * "approach": driver heading to the pickup. "enroute": passenger on board,
+   * heading to the destination. "preview": the whole trip before it starts —
+   * from the driver (when known) to the pickup and on to the drop-off.
+   */
+  phase: "approach" | "enroute" | "preview"
   className?: string
 }
 
@@ -168,23 +172,30 @@ export function LiveTripMap({ driver, driverAt, pickup, destination, phase, clas
     if (ready !== "ok" || !map) return
     const origin: Point | null = phase === "enroute" ? (driver ?? pickup) : driver
     const target = phase === "enroute" ? destination : pickup
-    if (!origin) {
+    if (!origin && phase !== "preview") {
       map.setCenter(pickup)
       return
     }
+    const from = origin ?? pickup
     const last = lastRouteRef.current
-    if (last && last.phase === phase && Date.now() - last.at < ROUTE_REFRESH_MS && metersBetween(last.from, origin) < ROUTE_REFRESH_METERS) return
-    lastRouteRef.current = { at: Date.now(), from: origin, phase }
+    if (last && last.phase === phase && Date.now() - last.at < ROUTE_REFRESH_MS && metersBetween(last.from, from) < ROUTE_REFRESH_METERS) return
+    lastRouteRef.current = { at: Date.now(), from, phase }
     let cancelled = false
-    fetchRoute(origin.lat, origin.lng, target.lat, target.lng).then(route => {
-      if (cancelled || !route) return
-      const path = route.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
-      pathRef.current = path
+    // A preview is two legs (to the pickup, then to the drop-off); otherwise one.
+    const legs = phase === "preview"
+      ? [...(origin ? [fetchRoute(origin.lat, origin.lng, pickup.lat, pickup.lng)] : []), fetchRoute(pickup.lat, pickup.lng, destination.lat, destination.lng)]
+      : [fetchRoute(from.lat, from.lng, target.lat, target.lng)]
+    Promise.all(legs).then(routes => {
+      const found = routes.filter((r): r is NonNullable<typeof r> => !!r)
+      if (cancelled || found.length === 0) return
+      const path = found.flatMap(r => r.geometry.coordinates.map(([lng, lat]) => ({ lat, lng })))
+      // Only a single live leg is something to snap the moving car onto.
+      pathRef.current = phase === "preview" ? null : path
       if (!lineRef.current) {
         lineRef.current = new google.maps.Polyline({ map, strokeColor: "#2563eb", strokeOpacity: 0.9, strokeWeight: 5 })
       }
       lineRef.current.setPath(path)
-      setEta({ seconds: route.durationSeconds, meters: route.distanceMeters })
+      setEta({ seconds: found.reduce((n, r) => n + r.durationSeconds, 0), meters: found.reduce((n, r) => n + r.distanceMeters, 0) })
       const bounds = new google.maps.LatLngBounds()
       path.forEach(p => bounds.extend(p))
       map.fitBounds(bounds, 56)
@@ -195,19 +206,19 @@ export function LiveTripMap({ driver, driverAt, pickup, destination, phase, clas
   if (ready === "unavailable") {
     return (
       <div role="status" className={`rounded-[20px] border border-border bg-muted text-sm text-muted-foreground flex items-center justify-center text-center p-6 ${className}`}>
-        The live map isn't available right now — you'll still get updates here as your {phase === "enroute" ? "ride progresses" : "driver approaches"}.
+        The live map isn't available right now — {phase === "preview" ? "the pickup and drop-off are listed below." : `you'll still get updates here as your ${phase === "enroute" ? "ride progresses" : "driver approaches"}.`}
       </div>
     )
   }
 
   return (
     <div className={`relative overflow-hidden rounded-[20px] border border-border bg-muted ${className}`}>
-      <div ref={elRef} role="img" aria-label={phase === "enroute" ? "Map of your route to the destination" : "Map of your driver approaching the pickup"} className="h-64 w-full" />
+      <div ref={elRef} role="img" aria-label={phase === "preview" ? "Map of the whole trip: pickup and drop-off" : phase === "enroute" ? "Map of your route to the destination" : "Map of your driver approaching the pickup"} className="h-64 w-full" />
       {ready === "loading" && <p className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground animate-pulse">Loading map…</p>}
       {ready === "ok" && (
         <div className="absolute left-3 bottom-3 rounded-full bg-card/95 border border-border px-3 py-1.5 text-xs font-semibold shadow">
-          {phase === "enroute" ? "Heading to destination" : driver ? "Driver approaching" : "Waiting for your driver to start sharing"}
-          {eta && (driver || phase === "enroute") && ` · ${fmtEta(eta.seconds)} · ${(eta.meters / 1000).toFixed(1)} km`}
+          {phase === "preview" ? "Whole trip" : phase === "enroute" ? "Heading to destination" : driver ? "Driver approaching" : "Waiting for your driver to start sharing"}
+          {eta && (driver || phase !== "approach") && ` · ${fmtEta(eta.seconds)} · ${(eta.meters / 1609.344).toFixed(1)} mi`}
         </div>
       )}
     </div>
