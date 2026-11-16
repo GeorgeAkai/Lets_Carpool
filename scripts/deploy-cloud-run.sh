@@ -53,10 +53,12 @@ gcloud run deploy "$SERVICE" \
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')"
 echo "Deployed: $URL"
 
-# Daily expiry sweep (Vercel Cron equivalent). Sends the same bearer secret.
+# Expiry sweep (Vercel Cron equivalent). Sends the same bearer secret. It runs
+# every 15 minutes because it also reminds people about unanswered requests
+# (after 30 min) and closes them (after 24 h); once a day left requests hanging.
 CRON_SECRET="$(gcloud secrets versions access latest --secret carpool-cron-secret)"
 JOB="${SERVICE}-expire"
-COMMON=(--location "$REGION" --schedule "0 4 * * *" --time-zone "Etc/UTC"
+COMMON=(--location "$REGION" --schedule "${EXPIRE_SCHEDULE:-*/15 * * * *}" --time-zone "Etc/UTC"
         --uri "${URL}/cron/expire" --http-method GET)
 # `create` takes --headers; `update` calls it --update-headers (and rejects --headers).
 if gcloud scheduler jobs describe "$JOB" --location "$REGION" >/dev/null 2>&1; then

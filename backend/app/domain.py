@@ -1845,6 +1845,19 @@ class Store:
         if self.is_blocked(rr.rider_id, trip.driver_id):
             raise DomainError("Blocked users cannot connect", 403)
 
+        # The apps create a fresh listing for whoever taps "Request" / "Offer",
+        # so a passenger asking this driver and the driver offering this
+        # passenger are usually two different (request, trip) pairs. If the
+        # other person is already waiting on this user for the same day, both
+        # want the ride: confirm theirs instead of adding a second one that
+        # waits the other way round.
+        mutual = self._pending_from_other_party(user_id, rr, trip)
+        if mutual is not None:
+            try:
+                return self.transition_connection(user_id, mutual.id, "accept")
+            except DomainError:
+                pass  # e.g. not enough seats on that trip: send this one normally
+
         # A passenger's request and a driver's offer for the same pair would
         # otherwise sit as two pending connections, each waiting on the other.
         conn_obj = Connection(
@@ -1898,9 +1911,31 @@ class Store:
         if (user_id == rr.rider_id and trip.auto_accept_verified
                 and self.user_for_id(rr.rider_id).id_verified):
             return self.transition_connection(trip.driver_id, conn_obj.id, "accept")
-        self.notify(recipient, "connection_received", "New carpool interest",
-                    "You have a new pending connection.", related_id=conn_obj.id)
+        sender = self.get_profile(user_id)
+        name = sender.display_name if sender else "Someone"
+        self.notify(recipient, "connection_received",
+                    f"{name} wants a ride" if user_id == rr.rider_id else f"{name} offered you a ride",
+                    "Open it to accept or decline.", related_id=conn_obj.id)
         return conn_obj
+
+    def _pending_from_other_party(self, user_id: str, rr: RideRequest, trip: DriverTrip) -> Connection | None:
+        """The oldest pending connection where the other person (same passenger,
+        same driver, same day) already asked this user, on a different pair of
+        listings. The same pair is settled by the insert in create_connection."""
+        with get_conn() as conn:
+            cur = self._cur(conn)
+            cur.execute(
+                """SELECT c.* FROM connections c
+                   JOIN ride_requests r2 ON r2.id = c.ride_request_id
+                   JOIN driver_trips t2 ON t2.id = c.driver_trip_id
+                   WHERE c.status = 'pending' AND c.initiator_user_id <> %s
+                     AND r2.rider_id = %s AND t2.driver_id = %s AND t2.target_date = %s
+                     AND NOT (c.ride_request_id = %s AND c.driver_trip_id = %s)
+                   ORDER BY c.created_at LIMIT 1""",
+                (user_id, rr.rider_id, trip.driver_id, trip.target_date, rr.id, trip.id),
+            )
+            row = cur.fetchone()
+        return _row_to_connection(row) if row else None
 
     def get_connection(self, connection_id: str) -> Connection:
         with get_conn() as conn:

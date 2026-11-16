@@ -39,9 +39,14 @@ SUPABASE_URL="https://<project-ref>.supabase.co" \
 ./scripts/deploy-cloud-run.sh
 ```
 
-The script builds with Cloud Build, deploys to Cloud Run, creates the daily
-Cloud Scheduler job for `/cron/expire` (replacing Vercel Cron), and checks
-`/health`. Re-run it to ship a new version.
+The script builds with Cloud Build, deploys to Cloud Run, creates the Cloud
+Scheduler job for `/cron/expire` (replacing Vercel Cron), and checks `/health`.
+Re-run it to ship a new version.
+
+The sweep runs every 15 minutes (`EXPIRE_SCHEDULE` overrides it). It expires
+past-date listings, reminds the person asked about a request after 30 minutes,
+and closes requests nobody answered within 24 hours, so a slower schedule
+delays those by up to its interval.
 
 ## Environment
 

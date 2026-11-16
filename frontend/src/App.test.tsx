@@ -244,6 +244,7 @@ describe("Feed view", () => {
         id: "con_1",
         ride_request_id: "rrq_1",
         driver_trip_id: "trp_1",
+        initiator_user_id: ME_RESPONSE.id,
         status: "pending",
         created_at: "2026-05-24T00:00:00Z",
         updated_at: "2026-05-24T00:00:00Z",
@@ -481,7 +482,8 @@ describe("Connections view", () => {
 
     // Create a connection by clicking connect
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
-    await waitFor(() => screen.getByText(/to accept/i));
+    // The fixture makes the other person the sender, so it is this user's call.
+    await waitFor(() => screen.getByRole("heading", { name: /offered you a ride/i }));
     await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 
@@ -531,7 +533,8 @@ describe("Connections view", () => {
     await waitFor(() => screen.getByText("Logan Airport"));
 
     await user.click(screen.getByRole("button", { name: /instant request match/i }));
-    await waitFor(() => screen.getByText(/to accept/i));
+    // The fixture makes the other person the sender, so it is this user's call.
+    await waitFor(() => screen.getByRole("heading", { name: /offered you a ride/i }));
     await user.click(screen.getAllByRole("button", { name: /^inbox$/i })[0]);
     await waitFor(() => screen.getByText(/track pending offers/i));
 

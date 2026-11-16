@@ -419,6 +419,17 @@ export function apiConnectionToConnection(conn: api.ApiConnection, currentUserId
   }
 }
 
+const placeKey = (label: string) => label.split(',')[0].trim().toLowerCase()
+
+// The viewer's own open listing for the same ride as someone else's listing:
+// opposite side, same day, same destination, and (for a trip) enough free seats.
+export function ownListingFor(listing: Listing, myListings: MyListing[]): MyListing | undefined {
+  const mySide: ListingType = listing.type === 'driver' ? 'rider' : 'driver'
+  return myListings.find(l => l.type === mySide && l.status === 'open' && l.date === listing.date
+    && placeKey(l.to) === placeKey(listing.to)
+    && (mySide === 'rider' || (l.seats ?? 0) - (l.seatsReserved ?? 0) >= (listing.passengers ?? 1)))
+}
+
 // ─── Small utility components ─────────────────────────────────────────────────
 
 export function Avatar({ initials, size = 'md', photoUrl }: { initials: string; size?: 'sm' | 'md' | 'card' | 'lg'; photoUrl?: string | null }) {
@@ -3236,6 +3247,9 @@ export function Home() {
         if (before && before.initiatorUserId === currentUser.id) {
           if (msg.status === 'accepted') { showToastRef.current(`🎉 ${before.withUser.name} accepted your request`, 'success'); playSound('accepted') }
           else if (msg.status === 'declined') { showToastRef.current(`${before.withUser.name} declined your request`, 'error'); playSound('declined') }
+          else if (msg.status === 'expired') { showToastRef.current(`${before.withUser.name} didn’t answer — request closed`, 'error'); playSound('declined') }
+        } else if (before && before.status === 'pending' && msg.status === 'cancelled') {
+          showToastRef.current(`${before.withUser.name} cancelled their request`, 'error')
         }
         // Accepting reveals the pickup details and changes seat counts; refetch.
         loadConnections(currentUser.id)
@@ -3446,29 +3460,69 @@ export function Home() {
   // to the current location for both ends.
   const onConnect = useCallback(async (listing: Listing, opts?: { from?: LocationValue | null; to?: LocationValue | null; seats?: number; time?: string; quiet?: boolean }): Promise<Connection | undefined> => {
     try {
+      const me = currentUser?.id ?? ''
+      // They already asked me for this same ride (their request to my trip, or
+      // their offer on my request): answering it is what this tap means, not
+      // sending a second request that waits the other way round.
+      const theirs = connectionsRef.current.find(c => c.status === 'pending' && c.initiatorUserId !== me
+        && c.withUserId === listing.ownerId && c.date === listing.date
+        && c.myRole === (listing.type === 'driver' ? 'rider' : 'driver'))
+      if (theirs) {
+        const updated = await api.transitionConnection(theirs.id, 'accept')
+        const confirmed = apiConnectionToConnection(updated, me)
+        setConnections(prev => prev.map(c => c.id === confirmed.id ? { ...c, status: confirmed.status, raw: updated } : c))
+        showToast(`🎉 You both asked — ride with ${theirs.withUser.name} confirmed`, 'success')
+        loadConnections(me)
+        if (opts?.quiet) return confirmed
+        setTripDayId(confirmed.id); setView('trip')
+        return confirmed
+      }
+
       const lat = userCoords?.lat ?? 0; const lng = userCoords?.lng ?? 0
       const from = opts?.from && Number.isFinite(opts.from.lat) ? opts.from : null
       const pickupLabel = from ? from.label : userCoords ? await reverseGeocode(lat, lng) : 'My location'
+      // A listing I already posted for this ride (same day, same destination)
+      // is the one to connect: it has the real route, time and price, and it
+      // keeps both people on the same pair of listings.
+      const mine = !opts?.from && !opts?.to ? ownListingFor(listing, myListings) : undefined
       let conn: api.ApiConnection
+      // Set when this tap had to make a listing of its own.
+      let spare: (() => Promise<unknown>) | null = null
       if (listing.type === 'driver') {
-        const [p, d] = await Promise.all([
-          api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
-          opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
-        ])
-        const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null })
-        conn = await api.createConnection(rr.id, listing.apiId)
+        let requestId = mine?.id
+        if (!requestId) {
+          const [p, d] = await Promise.all([
+            api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
+            opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
+          ])
+          const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null })
+          requestId = rr.id
+          spare = () => api.cancelRideRequest(rr.id)
+        }
+        conn = await api.createConnection(requestId, listing.apiId)
+        if (conn.ride_request_id === requestId) spare = null
       } else {
-        const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-        const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
-        conn = await api.createConnection(listing.apiId, trip.id)
+        let tripId = mine?.id
+        if (!tripId) {
+          const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
+          const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
+          tripId = trip.id
+          spare = () => api.cancelDriverTrip(trip.id)
+        }
+        conn = await api.createConnection(listing.apiId, tripId)
+        if (conn.driver_trip_id === tripId) spare = null
       }
-      const newConn = apiConnectionToConnection(conn, currentUser?.id ?? '')
-      const sentMessage = listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!'
-      setConnections(prev => [newConn, ...prev]); showToast(sentMessage, 'success')
+      // The server confirmed a request the other person had already sent, so
+      // the listing made for this tap was never used: don't leave it in Discover.
+      if (spare) spare().catch(() => {})
+      const newConn = apiConnectionToConnection(conn, me)
+      setConnections(prev => [newConn, ...prev.filter(c => c.id !== newConn.id)])
+      showToast(newConn.status === 'accepted' ? `🎉 You both asked — ride with ${newConn.withUser.name} confirmed`
+        : listing.type === 'driver' ? 'Request sent successfully!' : 'Offer sent successfully!', 'success')
       if (opts?.quiet) return
       setTripDayId(newConn.id); setView('trip')
     } catch (e) { showToast(e instanceof Error ? e.message : 'Failed to connect', 'error'); if (opts?.quiet) throw e }
-  }, [currentUser, userCoords, showToast, setView])
+  }, [currentUser, userCoords, showToast, setView, myListings, loadConnections])
 
   const onPost = useCallback((listing: MyListing) => {
     setMyListings(prev => [listing, ...prev]); setPostPrefill(null); loadListings(); loadMyListings(); setView('my-listings'); showToast('Listing posted!', 'success')
@@ -3612,7 +3666,10 @@ export function Home() {
   const onNotifNavigate = useCallback((n: api.ApiNotification) => {
     setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
     setInboxListingFilter(null)
-    if (n.related_id && n.type === 'driver_on_the_way') {
+    // Something to answer, or an answer to something sent: the trip page has
+    // Accept / Decline, or says what happened and where to go next.
+    const TRIP_PAGE = ['driver_on_the_way', 'connection_received', 'connection_reminder', 'connection_declined', 'connection_expired', 'connection_cancelled']
+    if (n.related_id && TRIP_PAGE.includes(n.type) && connectionsRef.current.some(c => c.id === n.related_id)) {
       setTripDayId(n.related_id)
       setView('trip')
     } else if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
@@ -3757,9 +3814,16 @@ export function Home() {
       <div className={`flex-1 w-full max-w-[1000px] mx-auto px-4 lg:px-8 xl:py-6 xl:pb-6 ${immersive ? 'pt-4 pb-6' : 'pt-[max(1.5rem,env(safe-area-inset-top))] pb-[calc(var(--bottom-nav-h)+2rem)]'}`}>
         <div>
           <main className="min-w-0">
-            {guardedView !== 'map' && guardedView !== 'connections' && guardedView !== 'pending-requests' && (
+            {/* Whoever has a request to answer sees Accept / Decline on every
+                screen except the full-screen map and the inbox (whose
+                conversations carry the same buttons); a screen that already
+                shows the buttons for one request leaves that one out. */}
+            {guardedView !== 'map' && guardedView !== 'connections' && (
               <IncomingRequests
-                connections={connections} currentUserId={currentUser.id}
+                connections={connections.filter(c =>
+                  !(guardedView === 'trip' && c.id === tripDayId)
+                  && !(guardedView === 'pending-requests' && c.myRole === 'driver'))}
+                currentUserId={currentUser.id}
                 onAccept={onAccept} onDecline={onDecline} onStartDriving={onStartDriving}
                 onOpenChat={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 reload={() => loadConnections(currentUser.id)} showToast={showToast}
@@ -3864,6 +3928,10 @@ export function Home() {
                 onClose={() => setView('my-listings')}
                 onMessage={c => { setInboxListingFilter(null); setConnDeepLink({ connectionId: c.id, section: 'chat' }); setView('connections') }}
                 onStartDriving={onStartDriving}
+                onAccept={async id => { await onAccept(id); await loadConnections(currentUser.id); showToast('🎉 Ride confirmed', 'success') }}
+                onDecline={async id => { await onDecline(id); showToast('Request declined', 'success') }}
+                onCancelRequest={async id => { await onCancel(id); showToast('Request cancelled', 'success') }}
+                onKeepLooking={() => setView('feed')}
                 onComplete={async id => { await onComplete(id); showToast('Ride completed!', 'success') }}
                 onChanged={() => loadConnections(currentUser.id)}
                 showToast={showToast}

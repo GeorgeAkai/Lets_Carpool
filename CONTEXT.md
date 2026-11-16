@@ -151,7 +151,9 @@ Connection states:
 - `cancelled`
 - `completed`
 
-Pending connections expire if nobody responds before the relevant ride date, and also lapse 24 hours after they were sent. The person being asked gets one reminder after about 30 minutes (the hourly sweep sends it), and when a request is declined or lapses the sender is pointed at the next-best match.
+Pending connections expire if nobody responds before the relevant ride date, and also lapse 24 hours after they were sent. The person being asked gets one reminder after about 30 minutes (the `/cron/expire` sweep sends it; it must run at least every 15 minutes), and when a request is declined or lapses the sender is pointed at the next-best match.
+
+Exactly one person answers a pending connection: the one who did not send it. If the two people ask each other (the passenger requests the driver and the driver offers the passenger a ride for the same day, even through different listings), that is mutual interest and the first connection is confirmed instead of a second one being created; if it cannot be seated, the second is sent normally. The person who must answer gets Accept / Decline on every screen and on the trip page; the sender can cancel or keep browsing, and a declined, expired or cancelled connection says so and points back to Discover.
 
 A passenger may have up to 3 requests out for the same ride request at once. The first accept wins: the passenger's other pending connections for that request are cancelled in the same transaction and their drivers are told.
 

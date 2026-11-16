@@ -710,9 +710,25 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 // A live ride polls fast so the car on the map stays within a couple of seconds of the driver.
 const LIVE_POLL_MS = 2000
 
+// How long a pending request can sit before the screen stops calling it fresh.
+const SLOW_REPLY_MIN = 15
+
+function sentAgo(iso: string | undefined, now: number): { minutes: number; label: string } | null {
+  if (!iso) return null
+  const minutes = Math.max(0, Math.floor((now - new Date(iso).getTime()) / 60000))
+  const label = minutes < 1 ? 'just now' : minutes < 60 ? `${minutes} min ago` : `${Math.floor(minutes / 60)} hr ago`
+  return { minutes, label }
+}
+
 export function TripDayScreen({
   connection, currentUserId, onClose, onMessage, onStartDriving, onComplete, showToast, onChanged, onOpenSafety, onOpenReceipt,
+  onAccept, onDecline, onCancelRequest, onKeepLooking,
 }: {
+  // Answering or withdrawing a pending request, and the way out to Discover.
+  onAccept?: (id: string) => Promise<void>
+  onDecline?: (id: string) => Promise<void>
+  onCancelRequest?: (id: string) => Promise<void>
+  onKeepLooking?: () => void
   onOpenSafety?: (c: Connection) => void
   onOpenReceipt?: (c: Connection) => void
   connection: Connection
@@ -737,8 +753,29 @@ export function TripDayScreen({
   const [busy, setBusy] = useState(false)
   const [pickedUpAt, setPickedUpAt] = useState<string | null>(raw?.picked_up_at ?? null)
   const accepted = connection.status === 'accepted'
+  const pending = connection.status === 'pending'
+  // Declined, expired or cancelled: nothing is booked and nobody is waiting.
+  const closed = connection.status === 'declined' || connection.status === 'expired' || connection.status === 'cancelled'
+  // Whoever did not send the request is the one who answers it.
+  const iAsked = connection.initiatorUserId === currentUserId
+  const myTurn = pending && !iAsked
   const pickedUp = !!(live?.picked_up_at ?? pickedUpAt)
   const driverStarted = !!raw?.driver_started_at
+  // Keeps "sent 4 min ago" honest while the screen sits open.
+  const [clock, setClock] = useState(() => Date.now())
+  useEffect(() => {
+    if (!pending) return
+    const id = setInterval(() => setClock(Date.now()), 30000)
+    return () => clearInterval(id)
+  }, [pending])
+  const sent = sentAgo(raw?.created_at, clock)
+  const answer = async (act: ((id: string) => Promise<void>) | undefined, failed: string) => {
+    if (!act) return
+    setBusy(true)
+    try { await act(connection.id) }
+    catch (e) { showToast(e instanceof Error ? e.message : failed, 'error') }
+    finally { setBusy(false) }
+  }
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
@@ -759,16 +796,26 @@ export function TripDayScreen({
   const phone = partner && 'phone' in partner ? partner.phone : null
 
   const destLabel = live?.destination?.label ? formatPlace(live.destination.label) : connection.to
+  const others = connection.myRole === 'rider' ? 'rides' : 'passengers'
   const headline = connection.status === 'completed' ? `Ride with ${partnerFirst} complete`
-    : !accepted ? `Waiting for ${partnerFirst} to accept`
+    : myTurn ? (connection.myRole === 'rider' ? `${partnerFirst} offered you a ride` : `${partnerFirst} wants a ride`)
+    : pending ? `Waiting for ${partnerFirst} to accept`
+    : connection.status === 'declined' ? (iAsked ? `${partnerFirst} can’t make this one` : 'You declined this ride')
+    : connection.status === 'expired' ? (iAsked ? `${partnerFirst} didn’t answer in time` : 'This request ran out of time')
+    : connection.status === 'cancelled' ? 'This request was cancelled'
     : pickedUp ? (connection.myRole === 'rider' ? 'You’re on your way' : `On the way with ${partnerFirst}`)
     : connection.myRole === 'rider'
       ? (driverStarted && eta == null ? `${partnerFirst} is on the way` : eta != null ? (eta <= 1 ? `${partnerFirst} is arriving now` : `${partnerFirst} arrives in ${eta} min`) : departure ? `Pickup at ${departure}` : `Pickup ${dayLabel(connection.date)}`)
       : (checkedIn ? `${partnerFirst} is at the pickup` : departure ? `Pick up ${partnerFirst} at ${departure}` : `Pick up ${partnerFirst} ${dayLabel(connection.date).toLowerCase()}`)
-  const subline = pickedUp ? `Heading to ${destLabel}`
+  const subline = closed ? `Nothing is booked. Other ${others} going your way are on Discover.`
+    : myTurn ? `It’s your call — ${partnerFirst} is waiting for your answer${sent ? ` (asked ${sent.label})` : ''}.`
+    : pending ? (sent && sent.minutes >= SLOW_REPLY_MIN
+        ? `No answer yet — sent ${sent.label}. You can keep looking at other ${others}; this request closes by itself after 24 hours.`
+        : `${sent ? `Sent ${sent.label}. ` : ''}This page updates the moment ${partnerFirst} answers${connection.myRole === 'driver' ? ', and Start trip appears here' : ''}.`)
+    : pickedUp ? `Heading to ${destLabel}`
     : connection.myRole === 'rider'
-    ? (accepted ? (driverStarted ? `Head to ${pickupLabel} — they’re driving to you` : eta != null && eta <= 10 ? `Leave now to reach ${pickupLabel} on time` : `Meet at ${pickupLabel}`) : 'You’ll get a notification when they do')
-    : accepted ? `Pickup at ${pickupLabel}` : `You’ll go straight to Start trip once ${partnerFirst} accepts`
+    ? (driverStarted ? `Head to ${pickupLabel} — they’re driving to you` : eta != null && eta <= 10 ? `Leave now to reach ${pickupLabel} on time` : `Meet at ${pickupLabel}`)
+    : `Pickup at ${pickupLabel}`
 
   const share = async () => {
     const text = `I'm carpooling with ${connection.withUser.name} on ${dayLabel(connection.date)}${departure ? ` at ${departure}` : ''}: ${connection.from} → ${connection.to}${car ? ` in a ${car}` : ''}${trip?.vehicle?.plate ? ` (${trip.vehicle.plate})` : ''}.`
@@ -884,9 +931,15 @@ export function TripDayScreen({
       </div>
 
       <ol className="bg-card border border-border rounded-[20px] p-4 flex flex-col">
-        <TimelineStep state="done" title={accepted || connection.status === 'completed' ? 'Booked · seat confirmed' : 'Requested · waiting to be accepted'}
+        <TimelineStep state={pending ? 'current' : 'done'}
+          title={accepted || connection.status === 'completed' ? 'Booked · seat confirmed'
+            : myTurn ? 'Waiting for your answer'
+            : pending ? `${connection.myRole === 'rider' ? 'Requested' : 'Offered'} · waiting for ${partnerFirst}`
+            : connection.status === 'declined' ? 'Declined · not booked'
+            : connection.status === 'expired' ? 'No answer · not booked'
+            : 'Cancelled · not booked'}
           sub={trip?.pricing ? `${fmtMoney(trip.pricing.price_per_seat_cents)} per seat, settled with ${connection.myRole === 'rider' ? partnerFirst : 'your passenger'}` : undefined} />
-        <TimelineStep state={connection.status === 'completed' || pickedUp ? 'done' : 'current'}
+        <TimelineStep state={connection.status === 'completed' || pickedUp ? 'done' : accepted ? 'current' : 'next'}
           title={`Pickup ${departure ?? dayLabel(connection.date)} · ${pickupLabel}`}
           sub={pickedUp ? 'Picked up' : checkedIn ? `${connection.myRole === 'rider' ? 'You' : partnerFirst} checked in at the pickup` : undefined} />
         <TimelineStep state={connection.status === 'completed' ? 'done' : pickedUp ? 'current' : 'next'} last
@@ -895,6 +948,37 @@ export function TripDayScreen({
 
       {connection.status === 'completed' && (
         <RideOutcome connection={connection} showToast={showToast} onOpenReceipt={onOpenReceipt ? () => onOpenReceipt(connection) : undefined} />
+      )}
+
+      {myTurn && (
+        <StickyFooter>
+          <PrimaryButton disabled={busy} onClick={() => answer(onAccept, 'Could not accept')}>
+            {connection.myRole === 'rider' ? `Accept ${partnerFirst}’s ride` : `Accept ${partnerFirst}`}
+          </PrimaryButton>
+          <button type="button" disabled={busy} onClick={() => answer(onDecline, 'Could not decline')}
+            className="w-full h-12 rounded-[14px] border border-border text-foreground text-[15px] font-semibold disabled:opacity-50">
+            Decline
+          </button>
+        </StickyFooter>
+      )}
+
+      {pending && iAsked && (
+        <StickyFooter>
+          {onKeepLooking && (
+            <PrimaryButton disabled={busy} onClick={onKeepLooking}>Keep looking at other {others}</PrimaryButton>
+          )}
+          <button type="button" disabled={busy} onClick={() => answer(onCancelRequest, 'Could not cancel')}
+            className="w-full h-12 rounded-[14px] border border-border text-destructive text-[15px] font-semibold disabled:opacity-50">
+            Cancel request
+          </button>
+          <p className="text-xs text-muted-foreground text-center">Your request stays open while you look around.</p>
+        </StickyFooter>
+      )}
+
+      {closed && onKeepLooking && (
+        <StickyFooter>
+          <PrimaryButton onClick={onKeepLooking}>Find {connection.myRole === 'rider' ? 'another ride' : 'another passenger'}</PrimaryButton>
+        </StickyFooter>
       )}
 
       {accepted && (
@@ -1381,6 +1465,9 @@ export function FindRideScreen({
       cb.current.onTripPassed(trip.id)
       return requestNext()
     }
+    // The driver had already offered this passenger a ride, so the server
+    // confirmed that one: our just-made request is spare.
+    if (conn.ride_request_id !== requestIdRef.current) closeRequest()
     if (!aliveRef.current) return
     try { cb.current.onConnectionCreated(conn) } catch (e) { console.error(e) }
     setNow(Date.now())
