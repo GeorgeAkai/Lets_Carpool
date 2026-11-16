@@ -5,6 +5,8 @@ import { createLocationUploader } from "./lib/locationUploader"
 import { snapToPath } from "./lib/geo"
 import type { LatLng } from "./lib/geo"
 import { loadGoogleMaps, searchPlaces, fetchRoute } from "./lib/googleMaps"
+import { formatStepDistance, upcomingManeuver } from "./lib/directions"
+import { isMuted } from "./lib/sounds"
 import type { LineString, PlaceResult, RouteGeometry } from "./lib/googleMaps"
 import {
   MapPin, Navigation, X, Car, Search, Crosshair, ChevronUp, ChevronDown, Sun, Moon,
@@ -33,6 +35,11 @@ export interface DrivingTarget {
   partnerName: string
   // Which leg is being navigated; the coordinates above are that leg's target.
   kind?: "pickup" | "destination"
+  // Where the leg starts when the driver's GPS isn't available (their posted
+  // start for the pickup leg, the pickup for the drop-off leg), so the route
+  // and directions still show.
+  originLat?: number
+  originLng?: number
 }
 
 type OsrmResult = RouteGeometry
@@ -293,9 +300,14 @@ interface Props {
   onClearRoute?: () => void
   drivingTo?: DrivingTarget | null
   onStopDriving?: () => void
+  // Driver confirms the passenger is in the car: the parent records it and
+  // hands back the drop-off as the next target.
+  onPickedUp?: (connectionId: string) => Promise<void>
+  // Driver finishes the ride at the drop-off.
+  onCompleteRide?: (connectionId: string) => Promise<void>
 }
 
-export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving }: Props) {
+export function MapView({ userCoords, userMode, tripRoute, onClearRoute, drivingTo, onStopDriving, onPickedUp, onCompleteRide }: Props) {
   const { resolvedTheme } = useTheme()
   const [mapThemeChoice, setMapThemeChoice] = useState<"light" | "dark" | null>(storedMapTheme)
   const mapTheme = mapThemeChoice ?? (resolvedTheme === "light" ? "light" : "dark")
@@ -636,6 +648,9 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
 
   useEffect(() => () => { if (watchId != null) navigator.geolocation.clearWatch(watchId) }, [watchId])
 
+  const drivingToRef = useRef(drivingTo)
+  drivingToRef.current = drivingTo
+
   // ── "Start Driving" mode: watch the driver's own live position ─────────────
   // Autodetects the driver's real GPS position (the passenger's pickup point is
   // already known from their accepted ride request, so no address entry is
@@ -697,10 +712,25 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
     if (now - lastCameraAtRef.current >= CAMERA_FOLLOW_MS) { lastCameraAtRef.current = now; map.panTo(toLatLngLiteral(pos)) }
   }, [drivingSample, mode, accentColor, stepMarkerAnimations, mapReady])
 
-  // ── "Start Driving" mode: pickup marker + route to the passenger ───────────────
+  // A new target (pickup → drop-off once the passenger is in the car) starts
+  // from scratch: new pin, new route, re-fit the camera.
+  useEffect(() => {
+    drivingPickupMarkerRef.current?.remove(); drivingPickupMarkerRef.current = null
+    drivingLastRouteFetchRef.current = null
+    drivingFitOnceRef.current = false
+    drivingPathRef.current = null
+    setDrivingRoute(null)
+  }, [drivingTo?.kind, drivingTo?.pickupLat, drivingTo?.pickupLng])
+
+  // The driver's live position, or (no GPS fix yet / location blocked) where
+  // this leg starts, so the route and directions never wait on a GPS fix.
+  const drivingOrigin: [number, number] | null = drivingSample?.pos
+    ?? (drivingTo?.originLat != null && drivingTo.originLng != null ? [drivingTo.originLat, drivingTo.originLng]
+      : userCoords ? [userCoords.lat, userCoords.lng] : null)
+
+  // ── "Start Driving" mode: target marker + route to it ───────────────────────────
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !mapReady) return
 
     if (mode !== "driving" || !drivingTo) {
       drivingPickupMarkerRef.current?.remove(); drivingPickupMarkerRef.current = null
@@ -710,39 +740,69 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
       return
     }
 
-    if (!drivingPickupMarkerRef.current) {
-      drivingPickupMarkerRef.current = newMarker(map, makePickupEl(), [drivingTo.pickupLat, drivingTo.pickupLng])
+    // The directions don't wait for the map canvas: if it is slow or fails to
+    // load, the driver still gets the turns, ETA and the Google Maps link.
+    if (map && mapReady && !drivingPickupMarkerRef.current) {
+      drivingPickupMarkerRef.current = newMarker(map, drivingTo.kind === "destination" ? makeDestEl() : makePickupEl(), [drivingTo.pickupLat, drivingTo.pickupLng])
       drivingPickupMarkerRef.current.setPopup(drivingTo.partnerName, drivingTo.pickupLabel)
     }
 
-    if (!drivingSample) return
+    const origin = drivingOrigin
+    if (!origin) return
     const last = drivingLastRouteFetchRef.current
-    const moved = last ? distanceMeters(last.pos, drivingSample.pos) : Infinity
+    const moved = last ? distanceMeters(last.pos, origin) : Infinity
     const elapsed = last ? performance.now() - last.time : Infinity
     if (moved < DRIVING_ROUTE_REFRESH_METERS && elapsed < DRIVING_ROUTE_REFRESH_MS) return
 
-    drivingLastRouteFetchRef.current = { pos: drivingSample.pos, time: performance.now() }
+    drivingLastRouteFetchRef.current = { pos: origin, time: performance.now() }
     setDrivingLoadingRoute(true)
-    fetchRoute(drivingSample.pos[0], drivingSample.pos[1], drivingTo.pickupLat, drivingTo.pickupLng).then(result => {
-      if (!mapRef.current || mode !== "driving") return
+    const target = drivingTo
+    fetchRoute(origin[0], origin[1], target.pickupLat, target.pickupLng).then(result => {
+      // The passenger got in (or navigation ended) while this was loading.
+      if (drivingToRef.current !== target) return
       if (result) {
         setRouteLine(result.geometry, false)
         drivingPathRef.current = result.geometry.coordinates.map(([lng, lat]) => ({ lat, lng }))
         setDrivingRoute(result)
       } else {
-        setRouteLine({ type: "LineString", coordinates: [toLngLat(drivingSample.pos), toLngLat([drivingTo.pickupLat, drivingTo.pickupLng])] }, true)
+        setRouteLine({ type: "LineString", coordinates: [toLngLat(origin), toLngLat([target.pickupLat, target.pickupLng])] }, true)
         setDrivingRoute(null)
       }
     }).finally(() => setDrivingLoadingRoute(false))
-  }, [drivingTo, drivingSample, mode, mapReady]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [drivingTo, drivingSample, drivingOrigin?.[0], drivingOrigin?.[1], mode, mapReady]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // First fix while driving: fit both the driver and the passenger on screen.
+  // A route that arrived before the map was ready still gets drawn.
+  useEffect(() => {
+    if (mapReady && mode === "driving" && drivingRoute) setRouteLine(drivingRoute.geometry, false)
+  }, [mapReady, mode, drivingRoute, setRouteLine])
+
+  // First position while driving: fit both the driver and the target on screen.
   useEffect(() => {
     const map = mapRef.current
-    if (!map || mode !== "driving" || !drivingTo || !drivingSample || drivingFitOnceRef.current) return
+    if (!map || !mapReady || mode !== "driving" || !drivingTo || !drivingOrigin || drivingFitOnceRef.current) return
     drivingFitOnceRef.current = true
-    fitPoints(map, [drivingSample.pos, [drivingTo.pickupLat, drivingTo.pickupLng]], 80)
-  }, [mode, drivingTo, drivingSample])
+    fitPoints(map, [drivingOrigin, [drivingTo.pickupLat, drivingTo.pickupLng]], 80)
+  }, [mode, mapReady, drivingTo, drivingOrigin?.[0], drivingOrigin?.[1]]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The next manoeuvre, read aloud when it changes (unless sounds are muted).
+  const toDropoff = drivingTo?.kind === "destination"
+  const maneuver = mode === "driving" && drivingTo
+    ? upcomingManeuver(drivingRoute?.steps, drivingSample ? { lat: drivingSample.pos[0], lng: drivingSample.pos[1] } : null, toDropoff ? "the drop-off" : `${drivingTo.partnerName.split(" ")[0]}’s pickup`)
+    : null
+  const maneuverText = maneuver?.text ?? null
+  useEffect(() => {
+    if (!maneuverText || isMuted() || typeof window === "undefined" || !("speechSynthesis" in window)) return
+    try {
+      window.speechSynthesis.cancel()
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(maneuverText))
+    } catch { /* no voice on this device */ }
+  }, [maneuverText])
+  const [legBusy, setLegBusy] = useState(false)
+  const finishLeg = async (act: ((id: string) => Promise<void>) | undefined) => {
+    if (!act || !drivingTo) return
+    setLegBusy(true)
+    try { await act(drivingTo.connectionId) } finally { setLegBusy(false) }
+  }
 
   // Clean up the self marker once driving mode ends.
   useEffect(() => {
@@ -998,11 +1058,17 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
             {mode === "driving" && drivingTo && (
               <div className="space-y-3">
                 <div>
-                  <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">Picking up</p>
+                  <p className="text-[10px] text-white/50 font-medium uppercase tracking-wide">{toDropoff ? "Dropping off" : "Picking up"}</p>
                   <p className="text-sm font-semibold truncate">{drivingTo.partnerName} · {drivingTo.pickupLabel}</p>
                 </div>
-                {drivingGeoError && <p className="text-sm text-red-300">Couldn't access your location. Enable location access to navigate.</p>}
-                {!drivingGeoError && drivingLoadingRoute && !drivingRoute && <p className="text-sm text-white/60 animate-pulse">Calculating route…</p>}
+                {maneuver && (
+                  <div role="status" aria-live="polite" className="rounded-xl bg-emerald-500/20 border border-emerald-400/40 p-3">
+                    <p style={MONO} className="text-xs text-emerald-200">In {formatStepDistance(maneuver.inMeters)}</p>
+                    <p className="text-base font-bold leading-snug">{maneuver.text}</p>
+                  </div>
+                )}
+                {drivingGeoError && <p className="text-sm text-amber-200">Location is off, so this route starts from {toDropoff ? "the pickup" : "your posted start"} and {drivingTo.partnerName.split(" ")[0]} can’t see you coming. Allow location for live directions.</p>}
+                {drivingLoadingRoute && !drivingRoute && <p className="text-sm text-white/60 animate-pulse">Calculating route…</p>}
                 {drivingRoute && (
                   <div className="grid grid-cols-2 gap-2">
                     {[["ETA", formatDuration(drivingRoute.durationSeconds)], ["Distance", formatDistance(drivingRoute.distanceMeters)]].map(([label, value]) => (
@@ -1013,7 +1079,34 @@ export function MapView({ userCoords, userMode, tripRoute, onClearRoute, driving
                     ))}
                   </div>
                 )}
-                <button onClick={onStopDriving} className="w-full py-2.5 rounded-xl bg-white text-slate-900 text-sm font-semibold">I've arrived</button>
+                {drivingRoute?.steps && drivingRoute.steps.length > 1 && (
+                  <details className="rounded-xl bg-white/5">
+                    <summary className="px-3 py-2 text-sm font-semibold cursor-pointer">All directions ({drivingRoute.steps.length} steps)</summary>
+                    <ol className="px-3 pb-2 max-h-40 overflow-y-auto space-y-1.5">
+                      {drivingRoute.steps.map((st, i) => (
+                        <li key={i} className="flex gap-2 text-xs">
+                          <span className="flex-1 text-white/85">{st.instruction}</span>
+                          <span style={MONO} className="text-white/50 shrink-0">{formatStepDistance(st.distanceMeters)}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                )}
+                {toDropoff ? (
+                  <button onClick={() => finishLeg(onCompleteRide)} disabled={legBusy} className="w-full py-3 rounded-xl bg-white text-slate-900 text-sm font-bold disabled:opacity-60">
+                    We’ve arrived · complete ride
+                  </button>
+                ) : (
+                  <button onClick={() => finishLeg(onPickedUp)} disabled={legBusy} className="w-full py-3 rounded-xl bg-white text-slate-900 text-sm font-bold disabled:opacity-60">
+                    {drivingTo.partnerName.split(" ")[0]} is in the car · go to drop-off
+                  </button>
+                )}
+                <div className="flex gap-2">
+                  <a href={`https://www.google.com/maps/dir/?api=1&destination=${drivingTo.pickupLat},${drivingTo.pickupLng}&travelmode=driving`}
+                    target="_blank" rel="noreferrer"
+                    className="flex-1 py-2.5 rounded-xl bg-white/10 text-sm font-semibold text-center">Open in Google Maps</a>
+                  <button onClick={onStopDriving} className="flex-1 py-2.5 rounded-xl bg-white/10 text-sm font-semibold">Back to trip</button>
+                </div>
               </div>
             )}
           </div>

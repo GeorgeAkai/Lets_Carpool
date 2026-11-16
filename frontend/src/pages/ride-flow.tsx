@@ -709,6 +709,7 @@ export function RideDetailScreen({ trip, seats, requested, onBack, onRequest }: 
 
 // A live ride polls fast so the car on the map stays within a couple of seconds of the driver.
 const LIVE_POLL_MS = 2000
+const IDLE_POLL_MS = 15000
 
 // How long a pending request can sit before the screen stops calling it fresh.
 const SLOW_REPLY_MIN = 15
@@ -760,7 +761,8 @@ export function TripDayScreen({
   const iAsked = connection.initiatorUserId === currentUserId
   const myTurn = pending && !iAsked
   const pickedUp = !!(live?.picked_up_at ?? pickedUpAt)
-  const driverStarted = !!raw?.driver_started_at
+  // From the page's own live poll as well, so "on the way" never waits on a notification.
+  const driverStarted = !!(live?.driver_started_at ?? raw?.driver_started_at)
   // Keeps "sent 4 min ago" honest while the screen sits open.
   const [clock, setClock] = useState(() => Date.now())
   useEffect(() => {
@@ -782,9 +784,9 @@ export function TripDayScreen({
     if (!accepted) return
     const load = () => document.hidden ? undefined : api.getTripDayStatus(connection.id).then(s => { setLive(s); if (s.rider_at_pickup_at) setCheckedIn(s.rider_at_pickup_at); if (s.picked_up_at) setPickedUpAt(s.picked_up_at) }).catch(() => {})
     load()
-    // Live position only matters on the day of the ride.
-    if (connection.date !== todayLocalISO()) return
-    pollRef.current = setInterval(load, LIVE_POLL_MS)
+    // Fast on the day of the ride so the car keeps up; a slow check otherwise,
+    // so the page still notices the driver setting off early.
+    pollRef.current = setInterval(load, connection.date === todayLocalISO() ? LIVE_POLL_MS : IDLE_POLL_MS)
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [connection.id, accepted])
 
@@ -860,7 +862,9 @@ export function TripDayScreen({
         {accepted && connection.myRole === 'rider' && (
           <span className="text-[13px] font-bold text-primary flex items-center gap-2">
             <span aria-hidden className="size-2 rounded-full bg-primary" />
-            {live?.driver ? 'Live · updated just now' : 'Live location appears when your driver starts sharing'}
+            {live?.driver ? 'Live · updated just now'
+              : driverStarted ? `${partnerFirst} has set off · their car shows here once their location comes through`
+              : `${partnerFirst} hasn’t set off yet · you’ll be told when they do`}
           </span>
         )}
         <h1 className="text-[26px] font-extrabold tracking-[-0.015em] leading-tight">{headline}</h1>
@@ -894,8 +898,11 @@ export function TripDayScreen({
 
       {accepted && connection.myRole === 'rider' && raw?.ride_pin && (
         <div className="bg-card border border-border rounded-[18px] px-3.5 py-3 flex items-center gap-3">
-          <span className="flex-1 text-[13px] text-muted-foreground">{pinVerified ? `${partnerFirst} confirmed your ride PIN` : `Tell ${partnerFirst} your ride PIN before you get in`}</span>
-          <span className="text-[22px] font-extrabold tracking-[0.2em] tabular-nums">{raw.ride_pin}</span>
+          <span className="flex-1 flex flex-col gap-0.5">
+            <span className="text-[13px] font-bold">Your ride PIN</span>
+            <span className="text-[13px] text-muted-foreground">{pinVerified ? `${partnerFirst} confirmed it — you’re in the right car` : `Read it to ${partnerFirst} when they arrive, so you both know it’s the right car`}</span>
+          </span>
+          <span aria-label={`Ride PIN ${raw.ride_pin.split('').join(' ')}`} className="text-[22px] font-extrabold tracking-[0.2em] tabular-nums">{raw.ride_pin}</span>
           {pinVerified && <Check aria-hidden className="size-5 text-primary" />}
         </div>
       )}
@@ -909,7 +916,10 @@ export function TripDayScreen({
               try { const c = await api.verifyRidePin(connection.id, pinDraft); setPinVerified(c.pin_verified_at ?? new Date().toISOString()); showToast('PIN confirmed', 'success') }
               catch (err) { showToast(err instanceof Error ? err.message : 'Could not check PIN', 'error') }
             }}>
-            <label htmlFor="ride-pin" className="flex-1 text-[13px] text-muted-foreground">Ask {partnerFirst} for their 4-digit ride PIN</label>
+            <label htmlFor="ride-pin" className="flex-1 flex flex-col gap-0.5">
+              <span className="text-[13px] font-bold">Check it’s {partnerFirst} <span className="font-normal text-muted-foreground">(optional)</span></span>
+              <span className="text-[13px] text-muted-foreground">{partnerFirst} has a 4-digit PIN on their trip screen. Ask them to read it out at pickup.</span>
+            </label>
             <input id="ride-pin" inputMode="numeric" autoComplete="one-time-code" maxLength={4} value={pinDraft}
               onChange={e => setPinDraft(e.target.value.replace(/\D/g, ''))}
               className="w-[72px] h-11 rounded-xl bg-input-background border border-border text-center text-lg font-extrabold tracking-[0.15em]" />
@@ -993,13 +1003,19 @@ export function TripDayScreen({
             )
           ) : (
             <>
-              {!pickedUp && (
-                <PrimaryButton onClick={confirmPickedUp} disabled={busy}>{checkedIn ? `${partnerFirst} is here — start the ride` : `${partnerFirst} is in the car`}</PrimaryButton>
-              )}
+              {/* The next step first: drive to the pickup, then to the drop-off. */}
               {connection.riderPickupLat != null && (
-                <button type="button" onClick={() => onStartDriving(connection, pickedUp ? 'destination' : 'pickup')}
-                  className="w-full h-12 rounded-[14px] border border-border text-foreground text-[15px] font-semibold inline-flex items-center justify-center gap-2">
-                  <Navigation className="size-5" />{pickedUp ? 'Navigate to drop-off' : 'Start trip'}
+                <PrimaryButton disabled={busy} onClick={() => onStartDriving(connection, pickedUp ? 'destination' : 'pickup')}>
+                  <span className="inline-flex items-center justify-center gap-2">
+                    <Navigation className="size-5" />
+                    {pickedUp ? 'Navigate to drop-off' : driverStarted ? 'Continue to pickup' : 'Start trip'}
+                  </span>
+                </PrimaryButton>
+              )}
+              {!pickedUp && (
+                <button type="button" onClick={confirmPickedUp} disabled={busy}
+                  className="w-full h-12 rounded-[14px] border border-border text-foreground text-[15px] font-semibold disabled:opacity-50">
+                  {checkedIn ? `${partnerFirst} is here — start the ride` : `${partnerFirst} is in the car`}
                 </button>
               )}
               <button type="button" disabled={busy}

@@ -140,6 +140,8 @@ class RideRequestCreate(BaseModel):
     preferred_car_type: str | None = None
     notes: str | None = Field(default=None, max_length=500)
     departure_time: time | None = None
+    # Made for one "Request" tap rather than posted: kept out of Discover.
+    unlisted: bool = False
 
 
 class DriverTripCreate(BaseModel):
@@ -155,6 +157,8 @@ class DriverTripCreate(BaseModel):
     departure_time: time | None = None
     price_per_seat_cents: int | None = Field(default=None, ge=0, le=100_000)
     auto_accept_verified: bool = False
+    # Made for one "Offer" tap rather than posted: kept out of Discover.
+    unlisted: bool = False
     # 0 = Mon … 6 = Sun. Non-empty posts one trip per matching day this week.
     repeat_weekdays: list[int] = Field(default_factory=list)
 
@@ -537,7 +541,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
             request = store.create_ride_request(user.id, payload.model_dump())
             with store.read_scope(requests=[request]):
                 body = serialize_ride_request(store, request, exact=True)
-        background.add_task(compute_matches, "request", request.id, True)
+        if not request.unlisted:  # nobody browses it, so there is nobody to match or nudge
+            background.add_task(compute_matches, "request", request.id, True)
         background.add_task(audit_later, "RIDE_PUBLISHED", user.id, user.email, client_ip(http_request),
                             {"kind": "ride_request", "id": request.id})
         return body
@@ -601,7 +606,8 @@ def create_app(store: Store | None = None, settings: Settings | None = None) -> 
         else:
             trips = [app.state.store.create_driver_trip(user.id, data)]
         for t in trips:
-            background.add_task(compute_matches, "trip", t.id, True)
+            if not t.unlisted:
+                background.add_task(compute_matches, "trip", t.id, True)
             background.add_task(audit_later, "RIDE_PUBLISHED", user.id, user.email, client_ip(http_request),
                                 {"kind": "driver_trip", "id": t.id})
         with app.state.store.read_scope(trips=trips[:1]):

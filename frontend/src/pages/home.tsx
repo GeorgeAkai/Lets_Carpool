@@ -3486,7 +3486,8 @@ export function Home() {
       // keeps both people on the same pair of listings.
       const mine = !opts?.from && !opts?.to ? ownListingFor(listing, myListings) : undefined
       let conn: api.ApiConnection
-      // Set when this tap had to make a listing of its own.
+      // Set when this tap had to make a listing of its own. Such a listing is
+      // unlisted: it carries this one connection and never shows up as a post.
       let spare: (() => Promise<unknown>) | null = null
       if (listing.type === 'driver') {
         let requestId = mine?.id
@@ -3495,7 +3496,7 @@ export function Home() {
             api.createLocation(pickupLabel, from?.lat ?? lat, from?.lng ?? lng),
             opts?.to ? api.createLocation(opts.to.label, opts.to.lat, opts.to.lng) : api.createLocation(listing.to, lat, lng),
           ])
-          const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null })
+          const rr = await api.createRideRequest({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, passenger_count: opts?.seats ?? 1, tags: [], departure_time: opts?.time || null, unlisted: true })
           requestId = rr.id
           spare = () => api.cancelRideRequest(rr.id)
         }
@@ -3505,7 +3506,7 @@ export function Home() {
         let tripId = mine?.id
         if (!tripId) {
           const [p, d] = await Promise.all([api.createLocation(pickupLabel, lat, lng), api.createLocation(listing.to, lat, lng)])
-          const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: 1, tags: [] })
+          const trip = await api.createDriverTrip({ pickup_location_id: p.id, destination_location_id: d.id, target_date: listing.date, flexibility: listing.flexibility, seats_available: Math.max(1, listing.passengers ?? 1), tags: [], unlisted: true })
           tripId = trip.id
           spare = () => api.cancelDriverTrip(trip.id)
         }
@@ -3630,6 +3631,10 @@ export function Home() {
     if (!lat || !lng) return
     setTripRoute(null)
     setDrivingTo({
+      // Without a GPS fix the pickup leg is drawn from the driver's posted
+      // start, and the drop-off leg from the pickup.
+      originLat: target === 'destination' ? conn.riderPickupLat : conn.pickupLat,
+      originLng: target === 'destination' ? conn.riderPickupLng : conn.pickupLng,
       connectionId: conn.id, pickupLat: lat, pickupLng: lng, kind: target,
       pickupLabel: target === 'destination' ? formatPlace(dest?.label) : conn.riderPickupLabel ?? 'Pickup',
       partnerName: conn.withUser.name,
@@ -3648,10 +3653,33 @@ export function Home() {
     setView('trip')
   }, [transact, currentUser, setView])
 
+  // Leaving navigation goes back to the ride's own page, not an empty map.
   const onStopDriving = useCallback(() => {
+    const id = drivingTo?.connectionId
     setDrivingTo(null)
-    showToast('Trip navigation ended', 'success')
-  }, [showToast])
+    if (id && connectionsRef.current.some(c => c.id === id)) { setTripDayId(id); setView('trip') }
+  }, [drivingTo, setView])
+
+  // On the map: the passenger is in the car, so the same map now leads to the
+  // drop-off they asked for.
+  const onPickedUpFromMap = useCallback(async (id: string) => {
+    try {
+      const updated = await api.markPickedUp(id)
+      setConnections(prev => prev.map(c => c.id === id ? { ...c, raw: updated } : c))
+      const conn = connectionsRef.current.find(c => c.id === id)
+      if (conn) await onStartDriving({ ...conn, raw: updated }, 'destination')
+      showToast('On board — heading to the drop-off', 'success')
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Could not confirm the pickup', 'error') }
+  }, [onStartDriving, showToast])
+
+  const onCompleteFromMap = useCallback(async (id: string) => {
+    try {
+      await onComplete(id)
+      setDrivingTo(null)
+      setTripDayId(id); setView('trip')
+      showToast('Ride completed!', 'success')
+    } catch (e) { showToast(e instanceof Error ? e.message : 'Could not complete the ride', 'error') }
+  }, [onComplete, setView, showToast])
 
   const onMarkAllReadNotifs = useCallback(() => {
     setNotifications(prev => prev.map(n => ({ ...n, read: true })))
@@ -4008,7 +4036,7 @@ export function Home() {
                 } />
               )
             )}
-            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} />}
+            {guardedView === 'map' && <MapView userCoords={userCoords} currentUserId={currentUser.id} userMode={mode} tripRoute={tripRoute} onClearRoute={() => setTripRoute(null)} drivingTo={drivingTo} onStopDriving={onStopDriving} onPickedUp={onPickedUpFromMap} onCompleteRide={onCompleteFromMap} />}
             {guardedView === 'pools' && <PoolView userCoords={userCoords} currentUserId={currentUser.id} showToast={showToast} />}
             {guardedView === 'post' && <PostView key={postPrefill?.key ?? 'new'} onPost={onPost} userCoords={userCoords} defaultType={mode} vehicle={currentUser.vehicle} prefill={postPrefill} onClearPrefill={() => setPostPrefill(null)} />}
             {guardedView === 'my-listings' && (

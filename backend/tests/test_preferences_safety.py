@@ -266,6 +266,7 @@ def test_driver_starts_the_trip_and_the_passenger_is_told_once() -> None:
     rider, rider_headers, driver, driver_headers, conn = _connect_and_accept(api)
 
     assert api.post(f"/connections/{conn['id']}/start-trip", headers=rider_headers).status_code == 403
+    assert api.get(f"/connections/{conn['id']}/live", headers=rider_headers).json()["driver_started_at"] is None
 
     # Before the window opens (the trip has no departure time, so: before its day) it is refused.
     try:
@@ -278,6 +279,8 @@ def test_driver_starts_the_trip_and_the_passenger_is_told_once() -> None:
     again = api.post(f"/connections/{conn['id']}/start-trip", headers=driver_headers)
     assert first.status_code == 200 and first.json()["driver_started_at"] is not None
     assert again.json()["driver_started_at"] == first.json()["driver_started_at"]
+    # The passenger's trip page reads this from its own poll, notification or not.
+    assert api.get(f"/connections/{conn['id']}/live", headers=rider_headers).json()["driver_started_at"] is not None
 
     notes = api.get("/notifications", headers=rider_headers).json()
     assert [n["type"] for n in notes].count("driver_on_the_way") == 1

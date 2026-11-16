@@ -515,6 +515,8 @@ export function createDriverTrip(data: {
   price_per_seat_cents?: number | null;
   auto_accept_verified?: boolean;
   repeat_weekdays?: number[];
+  // Made for one Request/Offer tap, not posted: hidden from Discover and My Rides.
+  unlisted?: boolean;
 }): Promise<ApiDriverTrip> {
   return request<ApiDriverTrip>("POST", "/driver-trips", data);
 }
@@ -576,6 +578,8 @@ export function createRideRequest(data: {
   luggage_size?: string;
   preferred_car_type?: string;
   notes?: string;
+  // Made for one Request/Offer tap, not posted: hidden from Discover and My Rides.
+  unlisted?: boolean;
 }): Promise<ApiRideRequest> {
   return request<ApiRideRequest>("POST", "/ride-requests", data);
 }
@@ -756,6 +760,7 @@ export type TripDayStatus = {
   departure_time: string | null;
   driver: { latitude: number; longitude: number; updated_at: string; distance_to_pickup_m: number; eta_minutes: number } | null;
   rider_at_pickup_at: string | null;
+  driver_started_at?: string | null;
 };
 
 export function getTripDayStatus(connectionId: string): Promise<TripDayStatus> {

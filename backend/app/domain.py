@@ -240,6 +240,10 @@ class RideRequest:
     match_score: int | None = None
     # Minutes between this request's and the trip's exact departure times, when both set.
     time_gap_minutes: int | None = None
+    # Made on the fly so its owner could request one specific trip: it carries
+    # that connection but is not a post, so it stays out of Discover, proposals,
+    # nudges and the owner's own listings.
+    unlisted: bool = False
 
 
 @dataclass
@@ -261,6 +265,9 @@ class DriverTrip:
     departure_time: time | None = None
     price_per_seat_cents: int | None = None
     auto_accept_verified: bool = False
+    # Made on the fly so its owner could offer one specific passenger a ride
+    # (see RideRequest.unlisted).
+    unlisted: bool = False
     series_id: str | None = None
     route_distance_m: float | None = None
     route_duration_s: float | None = None
@@ -468,6 +475,7 @@ def _row_to_ride_request(r: dict) -> RideRequest:
         luggage_size=r["luggage_size"] or "none",
         preferred_car_type=r["preferred_car_type"],
         notes=r["notes"], departure_time=r.get("departure_time"),
+        unlisted=bool(r.get("unlisted") or False),
     )
 
 def _time_gap_minutes(trip: DriverTrip, rr: RideRequest) -> int | None:
@@ -509,6 +517,7 @@ _TRIP_COLUMNS = (
     "flexibility", "seats_available", "seats_reserved", "tags", "status", "created_at",
     "luggage_capacity", "car_type", "notes", "route_distance_m", "route_duration_s",
     "departure_time", "price_per_seat_cents", "auto_accept_verified", "series_id", "vibes",
+    "unlisted",
 )
 
 
@@ -531,6 +540,7 @@ def _row_to_driver_trip(r: dict) -> DriverTrip:
         notes=r["notes"], departure_time=r.get("departure_time"),
         price_per_seat_cents=r.get("price_per_seat_cents"),
         auto_accept_verified=bool(r.get("auto_accept_verified") or False),
+        unlisted=bool(r.get("unlisted") or False),
         series_id=r.get("series_id"),
         route_distance_m=r.get("route_distance_m"), route_duration_s=r.get("route_duration_s"),
         vibes=list(r.get("vibes") or []),
@@ -933,6 +943,7 @@ class Store:
             status="open", created_at=now_utc(),
             luggage_size=luggage_size, preferred_car_type=preferred_car_type,
             notes=notes, departure_time=data.get("departure_time"),
+            unlisted=bool(data.get("unlisted")),
         )
         with get_conn() as conn:
             cur = self._cur(conn)
@@ -940,12 +951,12 @@ class Store:
                 """INSERT INTO ride_requests (id, rider_id, pickup_location_id,
                        destination_location_id, target_date, flexibility,
                        passenger_count, tags, status, created_at, luggage_size,
-                       preferred_car_type, notes, departure_time)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       preferred_car_type, notes, departure_time, unlisted)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (rr.id, rr.rider_id, rr.pickup_location_id,
                  rr.destination_location_id, rr.target_date, rr.flexibility,
                  rr.passenger_count, rr.tags, rr.status, rr.created_at,
-                 rr.luggage_size, rr.preferred_car_type, rr.notes, rr.departure_time),
+                 rr.luggage_size, rr.preferred_car_type, rr.notes, rr.departure_time, rr.unlisted),
             )
         return rr
 
@@ -994,7 +1005,7 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                "SELECT * FROM ride_requests WHERE rider_id = %s ORDER BY created_at DESC",
+                "SELECT * FROM ride_requests WHERE rider_id = %s AND NOT unlisted ORDER BY created_at DESC",
                 (user_id,),
             )
             return [_row_to_ride_request(r) for r in cur.fetchall()]
@@ -1029,6 +1040,7 @@ class Store:
             notes=notes, departure_time=data.get("departure_time"),
             price_per_seat_cents=None if price is None else int(price),
             auto_accept_verified=bool(data.get("auto_accept_verified")),
+            unlisted=bool(data.get("unlisted")),
             series_id=data.get("series_id"),
             vibes=self.get_ride_preferences(driver_id)["vibes"],
         )
@@ -1044,18 +1056,20 @@ class Store:
                        seats_available, seats_reserved, tags, status, created_at,
                        luggage_capacity, car_type, notes,
                        route_geog, route_distance_m, route_duration_s,
-                       departure_time, price_per_seat_cents, auto_accept_verified, series_id, vibes)
+                       departure_time, price_per_seat_cents, auto_accept_verified, series_id, vibes,
+                       unlisted)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           ST_GeogFromText(%s), %s, %s, %s, %s, %s, %s, %s)""",
+                           ST_GeogFromText(%s), %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (trip.id, trip.driver_id, trip.pickup_location_id,
                  trip.destination_location_id, trip.target_date, trip.flexibility,
                  trip.seats_available, trip.seats_reserved, trip.tags,
                  trip.status, trip.created_at, trip.luggage_capacity, trip.car_type,
                  trip.notes, route_wkt, route_distance_m, route_duration_s,
                  trip.departure_time, trip.price_per_seat_cents, trip.auto_accept_verified,
-                 trip.series_id, trip.vibes),
+                 trip.series_id, trip.vibes, trip.unlisted),
             )
-        self._fulfil_ride_alerts(trip)
+        if not trip.unlisted:
+            self._fulfil_ride_alerts(trip)
         return trip
 
     def create_driver_trip_series(self, driver_id: str, data: dict[str, Any], weekdays: list[int]) -> list[DriverTrip]:
@@ -1225,7 +1239,7 @@ class Store:
         with get_conn() as conn:
             cur = self._cur(conn)
             cur.execute(
-                f"SELECT {_trip_columns()} FROM driver_trips WHERE driver_id = %s ORDER BY created_at DESC",
+                f"SELECT {_trip_columns()} FROM driver_trips WHERE driver_id = %s AND NOT unlisted ORDER BY created_at DESC",
                 (user_id,),
             )
             return [_row_to_driver_trip(r) for r in cur.fetchall()]
@@ -1293,7 +1307,7 @@ class Store:
                           ST_Y(dt.dest_geog::geometry) AS trip_dest_lat, ST_X(dt.dest_geog::geometry) AS trip_dest_lng
                    FROM driver_trips dt
                    {joins}
-                   WHERE dt.status IN ('open', 'matched')
+                   WHERE dt.status IN ('open', 'matched') AND NOT dt.unlisted
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND dt.driver_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')
@@ -1374,7 +1388,7 @@ class Store:
                    FROM match_candidates mc
                    JOIN driver_trips dt ON dt.id = mc.driver_trip_id
                    WHERE mc.ride_request_id = %s
-                   AND dt.status = 'open'
+                   AND dt.status = 'open' AND NOT dt.unlisted
                    AND dt.seats_available - dt.seats_reserved >= %s
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND abs(dt.target_date - %s::date) <= 1
@@ -1440,7 +1454,7 @@ class Store:
                    FROM match_candidates mc
                    JOIN ride_requests rr ON rr.id = mc.ride_request_id
                    WHERE mc.driver_trip_id = %s
-                   AND rr.status = 'open'
+                   AND rr.status = 'open' AND NOT rr.unlisted
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND abs(rr.target_date - %s::date) <= 1
                    AND rr.rider_id != %s
@@ -1553,7 +1567,7 @@ class Store:
                               CASE WHEN t.route_geog IS NOT NULL THEN ST_Distance(t.route_geog, r.pickup_geog)
                                    ELSE ST_Distance(t.pickup_geog, r.pickup_geog) END AS off_route_m
                        FROM ride_requests r
-                       JOIN driver_trips t ON t.status IN ('open', 'matched', 'paused')
+                       JOIN driver_trips t ON t.status IN ('open', 'matched', 'paused') AND NOT t.unlisted
                         AND t.driver_id != r.rider_id
                         AND t.target_date >= CURRENT_DATE - INTERVAL '1 day'
                         AND abs(t.target_date - r.target_date) <= 1
@@ -1604,7 +1618,7 @@ class Store:
                               CASE WHEN t.route_geog IS NOT NULL THEN ST_Distance(t.route_geog, r.pickup_geog)
                                    ELSE ST_Distance(t.pickup_geog, r.pickup_geog) END AS off_route_m
                        FROM driver_trips t
-                       JOIN ride_requests r ON r.status = 'open'
+                       JOIN ride_requests r ON r.status = 'open' AND NOT r.unlisted
                         AND r.rider_id != t.driver_id
                         AND r.target_date >= CURRENT_DATE - INTERVAL '1 day'
                         AND abs(r.target_date - t.target_date) <= 1
@@ -1765,7 +1779,7 @@ class Store:
             cur.execute(
                 f"""SELECT rr.* FROM ride_requests rr
                    {joins}
-                   WHERE rr.status IN ('open', 'matched')
+                   WHERE rr.status IN ('open', 'matched') AND NOT rr.unlisted
                    AND rr.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND rr.rider_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = rr.rider_id AND u.status = 'suspended')
@@ -2872,6 +2886,9 @@ class Store:
             "driver": driver,
             "rider_at_pickup_at": connection.rider_at_pickup_at,
             "picked_up_at": connection.picked_up_at,
+            # Lets the passenger's page say "on the way" from its own poll,
+            # without depending on the notification arriving.
+            "driver_started_at": connection.driver_started_at,
         }
 
     def start_trip(self, user_id: str, connection_id: str, now: datetime | None = None) -> Connection:

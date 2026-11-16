@@ -192,6 +192,8 @@ describe("The person who asked", () => {
     await user.click(await screen.findByRole("button", { name: REQUEST }));
 
     expect(await screen.findByRole("heading", { name: /waiting for dana to accept/i })).toBeTruthy();
+    // The request made for this tap is not a post: it must not show up in Discover.
+    expect(posted(calls, "POST /ride-requests")[0]?.body).toMatchObject({ unlisted: true });
     expect(screen.getByText(/this page updates the moment dana answers/i)).toBeTruthy();
     expect(screen.getByRole("button", { name: /keep looking at other rides/i })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: /cancel request/i }));

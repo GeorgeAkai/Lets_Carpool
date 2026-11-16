@@ -439,6 +439,10 @@ def run_migrations(database_url: str) -> None:
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ")
     # Driver tapped "Start trip" (on the way to the pickup); the passenger is told.
     cur.execute("ALTER TABLE connections ADD COLUMN IF NOT EXISTS driver_started_at TIMESTAMPTZ")
+    # Listings made on the fly for one "Request" / "Offer" tap: they carry the
+    # connection but are not posts, so they are hidden from browsing.
+    cur.execute("ALTER TABLE ride_requests ADD COLUMN IF NOT EXISTS unlisted BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("ALTER TABLE driver_trips ADD COLUMN IF NOT EXISTS unlisted BOOLEAN NOT NULL DEFAULT FALSE")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (

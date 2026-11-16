@@ -449,7 +449,7 @@ describe("Account screens", () => {
 
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /8:10 am with priya/i }));
-    await screen.findByText(/tell priya your ride pin/i);
+    await screen.findByText(/read it to priya when they arrive/i);
     expect(screen.getByText(/settles up via/i)).toHaveTextContent("Venmo · @priya");
 
     await user.click(screen.getByRole("button", { name: /safety/i }));
@@ -486,7 +486,7 @@ describe("Account screens", () => {
 
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /picking up sam/i }));
-    await user.type(await screen.findByLabelText(/ask sam for their 4-digit ride pin/i), "4821");
+    await user.type(await screen.findByLabelText(/check it’s sam/i), "4821");
     await user.click(screen.getByRole("button", { name: /^check$/i }));
 
     await screen.findByText(/ride pin confirmed/i);

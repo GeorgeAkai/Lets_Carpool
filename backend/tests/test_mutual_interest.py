@@ -133,3 +133,68 @@ def test_the_person_asked_gets_a_notification_that_says_who_and_what() -> None:
     assert len(received) == 1
     assert received[0]["title"] == "Riley Passenger wants a ride"
     assert "accept" in received[0]["body"].lower()
+
+
+# ─── Listings made on the fly for "Request" / "Offer" stay out of Discover ────
+
+def _search_trips(c, headers) -> list[dict]:
+    return c.get("/driver-trips/search", headers=headers, params={
+        "destination_latitude": 37.6213, "destination_longitude": -122.3790,
+        "target_date": date.today().isoformat(), "apply_preferences": "false"}).json()
+
+
+def _search_requests(c, headers) -> list[dict]:
+    return c.get("/ride-requests/search", headers=headers, params={
+        "destination_latitude": 37.6213, "destination_longitude": -122.3790,
+        "target_date": date.today().isoformat()}).json()
+
+
+def test_a_trip_made_for_an_offer_is_not_a_second_public_listing() -> None:
+    c = client()
+    _passenger, rider_headers, _driver, driver_headers, ride_request, driver_trip = make_request_and_trip(
+        c, passenger_count=1)
+    pickup = location(c, driver_headers, "Shattuck Ave, Berkeley, CA", 37.8690, -122.2680)
+    destination = location(c, driver_headers, "SFO, San Francisco, CA", 37.6213, -122.3790)
+    made = c.post("/driver-trips", headers=driver_headers, json={
+        "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible",
+        "seats_available": 1, "tags": [], "unlisted": True,
+    })
+    assert made.status_code == 200, made.text
+    offered = c.post("/connections", headers=driver_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": made.json()["id"]}).json()
+    assert offered["status"] == "pending"
+
+    # Passengers browsing still see the one trip the driver posted.
+    assert [t["id"] for t in _search_trips(c, rider_headers)] == [driver_trip["id"]]
+    # The driver's posted trips do not grow a duplicate either.
+    assert [t["id"] for t in c.get("/me/driver-trips", headers=driver_headers).json()] == [driver_trip["id"]]
+    # It is never proposed to the passenger as a match for their request.
+    proposal = c.get(f"/ride-requests/{ride_request['id']}/proposal", headers=rider_headers).json()
+    assert (proposal.get("trip") or {}).get("id") != made.json()["id"]
+    # The offer itself works: the passenger sees and can accept it.
+    accepted = c.post(f"/connections/{offered['id']}/transition", headers=rider_headers, json={"action": "accept"})
+    assert accepted.status_code == 200 and accepted.json()["status"] == "accepted"
+    assert accepted.json()["driver_trip"]["id"] == made.json()["id"]
+
+
+def test_a_request_made_for_one_driver_is_not_a_second_public_listing() -> None:
+    c = client()
+    _passenger, rider_headers, _driver, driver_headers, ride_request, driver_trip = make_request_and_trip(
+        c, passenger_count=1)
+    pickup = location(c, rider_headers, "9 Oak St, Berkeley, CA", 37.8720, -122.2740)
+    destination = location(c, rider_headers, "SFO, San Francisco, CA", 37.6213, -122.3790)
+    made = c.post("/ride-requests", headers=rider_headers, json={
+        "pickup_location_id": pickup["id"], "destination_location_id": destination["id"],
+        "target_date": date.today().isoformat(), "flexibility": "flexible",
+        "passenger_count": 1, "tags": [], "unlisted": True,
+    }).json()
+    asked = c.post("/connections", headers=rider_headers, json={
+        "ride_request_id": made["id"], "driver_trip_id": driver_trip["id"]}).json()
+    assert asked["status"] == "pending"
+
+    assert [r["id"] for r in _search_requests(c, driver_headers)] == [ride_request["id"]]
+    assert [r["id"] for r in c.get("/me/ride-requests", headers=rider_headers).json()] == [ride_request["id"]]
+    # No "new match" nudge goes out for a request nobody can browse.
+    nudges = [n for n in c.get("/notifications", headers=driver_headers).json() if n["type"] == "new_match"]
+    assert all(n.get("related_id") != made["id"] for n in nudges)

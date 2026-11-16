@@ -3,6 +3,8 @@
 // Maps JavaScript API runs client-side (restrict the key by HTTP referrer).
 // Geocoding and routing use Google first and degrade to Nominatim / OSRM, so
 // the app still works if the key is missing or an API isn't enabled for it.
+import { osrmSteps, stripHtml } from "./directions"
+import type { RouteStep } from "./directions"
 import { BASE } from "../api"
 import { formatPlace } from "./places"
 
@@ -206,6 +208,8 @@ export interface RouteGeometry {
   distanceMeters: number
   durationSeconds: number
   geometry: LineString
+  /** Turn-by-turn steps, when the routing service returned them. */
+  steps?: RouteStep[]
 }
 
 export async function fetchRoute(fromLat: number, fromLng: number, toLat: number, toLng: number): Promise<RouteGeometry | null> {
@@ -224,13 +228,18 @@ export async function fetchRoute(fromLat: number, fromLng: number, toLat: number
           distanceMeters: leg.distance?.value ?? 0,
           durationSeconds: leg.duration?.value ?? 0,
           geometry: { type: "LineString", coordinates: route.overview_path.map(p => [p.lng(), p.lat()]) },
+          steps: leg.steps.map(st => ({
+            instruction: stripHtml(st.instructions ?? ""),
+            distanceMeters: st.distance?.value ?? 0,
+            end: { lat: st.end_location.lat(), lng: st.end_location.lng() },
+          })),
         }
       }
     } catch { /* fall through to OSRM */ }
   }
   try {
     const res = await fetch(
-      `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson`,
+      `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson&steps=true`,
       { headers: { Accept: "application/json" } },
     )
     const data = await res.json()
@@ -239,6 +248,7 @@ export async function fetchRoute(fromLat: number, fromLng: number, toLat: number
         distanceMeters: data.routes[0].legs[0].distance,
         durationSeconds: data.routes[0].legs[0].duration,
         geometry: data.routes[0].geometry,
+        steps: osrmSteps(data.routes[0].legs[0].steps ?? []),
       }
     }
   } catch { /* no route */ }
