@@ -9,6 +9,7 @@ describe("notification sounds", () => {
     expect(soundForNotification("connection_accepted")).toBe("accepted");
     expect(soundForNotification("new_match")).toBe("request");
     expect(soundForNotification("connection_declined")).toBe("declined");
+    expect(soundForNotification("driver_on_the_way")).toBe("driving");
     expect(soundForNotification("ride_started")).toBe("driving");
     expect(soundForNotification("chat_message")).toBe("message");
     expect(soundForNotification("payment_processed")).toBe("paid");

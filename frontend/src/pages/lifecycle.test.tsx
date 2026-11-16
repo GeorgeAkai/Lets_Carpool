@@ -239,53 +239,36 @@ describe("Driver accepting a request", () => {
     rider_profile: { ...ME.profile, user_id: "usr_rider", display_name: "Rae Passenger" }, driver_profile: { ...ME.profile },
   });
 
-  it("goes straight to the drive-to-pickup map when the ride is today", async () => {
+  it("lands on the trip page with Start trip after accepting", async () => {
     const user = userEvent.setup();
     signIn("driver");
     const conn = pending(today);
+    let accepted = false;
     stubApi({
       ...BASE_ROUTES,
-      "GET /me/connections": [conn],
+      "GET /me/connections": () => [accepted ? { ...conn, status: "accepted" } : conn],
       "GET /connections/con_1/messages": [],
-      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
-      "POST /connections/con_1/start-trip": { ...conn, status: "accepted", driver_started_at: "2030-01-01T08:00:00Z" },
+      "POST /connections/con_1/transition": () => { accepted = true; return { ...conn, status: "accepted" }; },
     });
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /^accept$/i }));
-    await waitFor(() => expect(screen.getByRole("button", { name: /i've arrived/i })).toBeTruthy());
+    expect(await screen.findByRole("button", { name: /start trip/i })).toBeTruthy();
   });
 
-  it("only confirms when it is too early to start driving", async () => {
-    const user = userEvent.setup();
-    signIn("driver");
-    const conn = pending(today);
-    const calls = stubApi({
-      ...BASE_ROUTES,
-      "GET /me/connections": [conn],
-      "GET /connections/con_1/messages": [],
-      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
-      "POST /connections/con_1/start-trip": { __error: { status: 409, detail: "Too early to start this trip." } },
-    });
-    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
-    await user.click(await screen.findByRole("button", { name: /^accept$/i }));
-    expect(await screen.findByText(/request accepted/i)).toBeTruthy();
-    await waitFor(() => expect(calls.some(c => c.key === "POST /connections/con_1/start-trip")).toBe(true));
-    expect(screen.queryByRole("button", { name: /i've arrived/i })).toBeNull();
-  });
-
-  it("does not start driving for a future ride", async () => {
+  it("lands on the trip page without starting for a future ride", async () => {
     const user = userEvent.setup();
     signIn("driver");
     const conn = pending("2099-01-01");
+    let accepted = false;
     stubApi({
       ...BASE_ROUTES,
-      "GET /me/connections": [conn],
+      "GET /me/connections": () => [accepted ? { ...conn, status: "accepted" } : conn],
       "GET /connections/con_1/messages": [],
-      "POST /connections/con_1/transition": { ...conn, status: "accepted" },
+      "POST /connections/con_1/transition": () => { accepted = true; return { ...conn, status: "accepted" }; },
     });
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     await user.click(await screen.findByRole("button", { name: /^accept$/i }));
-    await screen.findByText(/request accepted/i);
+    expect(await screen.findByRole("button", { name: /start trip/i })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /i've arrived/i })).toBeNull();
   });
 });

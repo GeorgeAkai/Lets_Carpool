@@ -3251,7 +3251,12 @@ export function Home() {
         setNotifications(prev => (prev.some(x => x.id === n.id) ? prev : [n, ...prev]))
         // Accept/decline/request/chat already sound from their own events above.
         const snd = soundForNotification(n.type)
-        if (snd === 'driving' || snd === 'arrived' || snd === 'paid') { playSound(snd); showToastRef.current(n.title, 'success') }
+        if (snd === 'driving' || snd === 'arrived' || snd === 'paid') {
+          playSound(snd)
+          showToastRef.current(n.type === 'driver_on_the_way' ? `🚗 ${n.body || n.title}` : n.title, 'success')
+        }
+        // The driver set off: refresh so the passenger's trip page flips to "on the way".
+        if (n.type === 'driver_on_the_way') loadConnections(currentUser.id)
       } else if (msg.type === 'driver_nearby') {
         showToastRef.current(`🚗 ${msg.display_name} is nearby!`, 'success')
       }
@@ -3578,16 +3583,16 @@ export function Home() {
     setView('map')
   }, [setView, showToast])
 
-  // Accepting a ride that's for today puts the driver straight onto the
-  // drive-to-pickup map; a future ride just confirms and waits for its day.
+  // Accepting a ride takes the driver straight to the trip page, where "Start
+  // trip" is waiting (the server only lets it through near departure).
   const onAccept = useCallback(async (id: string) => {
     const updated = await transact(id, 'accept')
     if (!currentUser) return
     const conn = apiConnectionToConnection(updated, currentUser.id)
     if (conn.myRole !== 'driver') return
-    // Silent: accepting well before departure just confirms; the driver starts from Trip day.
-    if (conn.date <= todayLocalISO()) onStartDriving(conn, 'pickup', true)
-  }, [transact, currentUser, onStartDriving])
+    setTripDayId(conn.id)
+    setView('trip')
+  }, [transact, currentUser, setView])
 
   const onStopDriving = useCallback(() => {
     setDrivingTo(null)
@@ -3607,7 +3612,10 @@ export function Home() {
   const onNotifNavigate = useCallback((n: api.ApiNotification) => {
     setNotifications(prev => prev.map(x => x.id === n.id ? { ...x, read: true } : x))
     setInboxListingFilter(null)
-    if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
+    if (n.related_id && n.type === 'driver_on_the_way') {
+      setTripDayId(n.related_id)
+      setView('trip')
+    } else if (n.related_id && (n.type === 'chat_message' || n.type === 'connection_received' || n.type === 'connection_accepted' || n.type === 'chat_unlocked')) {
       setConnDeepLink({ connectionId: n.related_id, section: 'chat' })
       setView('connections')
     } else if (n.related_id && n.type === 'gas_split_confirmed') {

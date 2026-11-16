@@ -738,6 +738,7 @@ export function TripDayScreen({
   const [pickedUpAt, setPickedUpAt] = useState<string | null>(raw?.picked_up_at ?? null)
   const accepted = connection.status === 'accepted'
   const pickedUp = !!(live?.picked_up_at ?? pickedUpAt)
+  const driverStarted = !!raw?.driver_started_at
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
@@ -762,12 +763,12 @@ export function TripDayScreen({
     : !accepted ? `Waiting for ${partnerFirst} to accept`
     : pickedUp ? (connection.myRole === 'rider' ? 'You’re on your way' : `On the way with ${partnerFirst}`)
     : connection.myRole === 'rider'
-      ? (eta != null ? (eta <= 1 ? `${partnerFirst} is arriving now` : `${partnerFirst} arrives in ${eta} min`) : departure ? `Pickup at ${departure}` : `Pickup ${dayLabel(connection.date)}`)
+      ? (driverStarted && eta == null ? `${partnerFirst} is on the way` : eta != null ? (eta <= 1 ? `${partnerFirst} is arriving now` : `${partnerFirst} arrives in ${eta} min`) : departure ? `Pickup at ${departure}` : `Pickup ${dayLabel(connection.date)}`)
       : (checkedIn ? `${partnerFirst} is at the pickup` : departure ? `Pick up ${partnerFirst} at ${departure}` : `Pick up ${partnerFirst} ${dayLabel(connection.date).toLowerCase()}`)
   const subline = pickedUp ? `Heading to ${destLabel}`
     : connection.myRole === 'rider'
-    ? (accepted ? (eta != null && eta <= 10 ? `Leave now to reach ${pickupLabel} on time` : `Meet at ${pickupLabel}`) : 'You’ll get a notification when they do')
-    : `Pickup at ${pickupLabel}`
+    ? (accepted ? (driverStarted ? `Head to ${pickupLabel} — they’re driving to you` : eta != null && eta <= 10 ? `Leave now to reach ${pickupLabel} on time` : `Meet at ${pickupLabel}`) : 'You’ll get a notification when they do')
+    : accepted ? `Pickup at ${pickupLabel}` : `You’ll go straight to Start trip once ${partnerFirst} accepts`
 
   const share = async () => {
     const text = `I'm carpooling with ${connection.withUser.name} on ${dayLabel(connection.date)}${departure ? ` at ${departure}` : ''}: ${connection.from} → ${connection.to}${car ? ` in a ${car}` : ''}${trip?.vehicle?.plate ? ` (${trip.vehicle.plate})` : ''}.`

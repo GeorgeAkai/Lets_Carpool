@@ -88,7 +88,7 @@ export function soundForNotification(type: string): SoundName | null {
   if (type === 'connection_received' || type === 'new_match' || type === 'connection_reminder') return 'request'
   if (type.includes('accepted') || type === 'chat_unlocked') return 'accepted'
   if (type.includes('declined')) return 'declined'
-  if (type === 'ride_started') return 'driving'
+  if (type === 'ride_started' || type === 'driver_on_the_way') return 'driving'
   if (type.includes('arrived') || type.includes('at_pickup')) return 'arrived'
   if (type === 'payment_processed' || type === 'gas_split_confirmed') return 'paid'
   if (type === 'chat_message') return 'message'
