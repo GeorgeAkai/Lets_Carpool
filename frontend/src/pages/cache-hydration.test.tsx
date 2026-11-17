@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "../App";
@@ -95,5 +95,39 @@ describe("Discover", () => {
     render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
     expect((await screen.findAllByText("Owen Openseat")).length).toBeGreaterThan(0);
     expect(screen.queryByText("Fiona Fullcar")).toBeNull();
+  });
+
+  it("narrows every ride on the page, best matches included, as the search box is typed in", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit): Promise<Answer> => {
+      const key = `${(init?.method ?? "GET").toUpperCase()} ${String(url).replace(BASE, "").split("?")[0]}`;
+      const routes: Record<string, unknown> = {
+        "GET /me": ME, "GET /driver-trips/search": [trip("reno", "Rhea Reno", "Reno, NV"), trip("tahoe", "Theo Tahoe", "Tahoe City, CA")],
+        "GET /ride-requests/search": [], "GET /me/routes": [],
+        "GET /me/connections": [], "GET /notifications": [], "GET /me/driver-trips": [], "GET /me/ride-requests": [],
+      };
+      return key in routes ? { ok: true, status: 200, json: async () => routes[key] } : { ok: false, status: 404, json: async () => ({ detail: "not found" }) };
+    }));
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    // Both are promoted into "Best matches" once scored.
+    await screen.findByText(/best matches for you/i);
+    expect(screen.getAllByText("Rhea Reno").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Theo Tahoe").length).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByPlaceholderText(/search destination/i), { target: { value: "tahoe" } });
+    await waitFor(() => expect(screen.queryByText("Rhea Reno")).toBeNull());
+    expect(screen.getAllByText("Theo Tahoe").length).toBeGreaterThan(0);
+
+    // Everything shown is a best match, so the page does not also claim there are none.
+    expect(screen.queryByText("No rides found")).toBeNull();
+    expect(screen.queryByText("All listings")).toBeNull();
+
+    // The name of who posted it works too.
+    fireEvent.change(screen.getByPlaceholderText(/search destination/i), { target: { value: "rhea" } });
+    await waitFor(() => expect(screen.queryByText("Theo Tahoe")).toBeNull());
+    expect(screen.getAllByText("Rhea Reno").length).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByPlaceholderText(/search destination/i), { target: { value: "nowhere" } });
+    await waitFor(() => expect(screen.queryByText("Rhea Reno")).toBeNull());
+    expect(screen.getByText("No rides found")).toBeTruthy();
   });
 });

@@ -64,6 +64,15 @@ export interface Listing {
   detourMinutes?: number | null
 }
 
+// The Discover search box: every word typed must appear somewhere a person
+// would look for it — the route, who posted it, its tags or its note.
+export function matchesSearch(listing: Listing, query: string): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return true
+  const haystack = [listing.from, listing.to, listing.user.name, listing.notes ?? '', ...listing.tags].join(' ').toLowerCase()
+  return words.every(w => haystack.includes(w))
+}
+
 export interface MyListing {
   id: string; type: ListingType; from: string; to: string; date: string
   flexibility: Flexibility; seats?: number; seatsReserved?: number; passengers?: number; tags: RideTag[]
@@ -1012,15 +1021,18 @@ function ProposedRider({ trip, onAccepted, showToast }: {
   )
 }
 
-function BestMatches({ listings, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
-  listings: Listing[]; referenceListing: MyListing | undefined
+function BestMatches({ listings, visibleIds, referenceListing, currentUserId, currentUserInterests, onConnect, showToast, onMatchedIds, connectedListingIds }: {
+  listings: Listing[]; visibleIds: Set<string>; referenceListing: MyListing | undefined
   currentUserId: string; currentUserInterests: string[]
   onConnect: (l: Listing) => Promise<unknown>; showToast: (msg: string, type: 'success' | 'error') => void
   onMatchedIds: (ids: string[]) => void
   connectedListingIds: Set<string>
 }) {
   const candidates = useMemo(() => listings.filter(l => l.type === 'driver'), [listings])
-  const { matches, loading } = useRankedMatches(candidates, referenceListing, currentUserId, currentUserInterests)
+  const { matches: ranked, loading } = useRankedMatches(candidates, referenceListing, currentUserId, currentUserInterests)
+  // Ranking runs over every listing (so typing does not refetch profiles), but
+  // the search box and filters decide which of the ranked ones are shown.
+  const matches = ranked.filter(m => visibleIds.has(m.listing.id))
 
   // Let the parent exclude these from the flat feed below so the same listing
   // doesn't render twice on screen.
@@ -1239,7 +1251,7 @@ function DriverHomeView({
     const todayLocal = todayLocalISO()
     return matches.filter(m => {
       const l = m.listing
-      const matchSearch = searchQuery.trim() === '' || l.to.toLowerCase().includes(searchQuery.toLowerCase()) || l.from.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchSearch = matchesSearch(l, searchQuery)
       const matchTag = filterTag === '' || l.tags.includes(filterTag)
       const matchLuggage = filterLuggage === '' || l.luggageSize == null || l.luggageSize === 'none' || l.luggageSize === filterLuggage
       const matchDate = quickDateFilter === 'any' || l.date === todayLocal
@@ -1386,9 +1398,9 @@ function FeedView({
   filterCarType, setFilterCarType, filterLuggage, setFilterLuggage,
   quickDateFilter, setQuickDateFilter, seatsNeeded, setSeatsNeeded,
   filterSheetOpen, setFilterSheetOpen,
-  listings, onConnect, loading, currentUserId, setView, hasLocation, connectedListingIds, bestMatches,
+  listings, onConnect, loading, currentUserId, setView, hasLocation, connectedListingIds, bestMatches, matchedCount = 0,
 }: {
-  hasLocation: boolean
+  hasLocation: boolean; matchedCount?: number
   searchQuery: string; setSearchQuery: (v: string) => void
   filterType: 'all' | 'driver' | 'rider'; setFilterType: (v: 'all' | 'driver' | 'rider') => void
   filterTag: '' | RideTag; setFilterTag: (v: '' | RideTag) => void
@@ -1511,7 +1523,9 @@ function FeedView({
 
       {bestMatches}
 
-      <div>
+      {/* When every ride on the page is already shown as a best match, an empty
+          "All listings · 0 found · No rides found" below it would contradict it. */}
+      {(loading || listings.length > 0 || matchedCount === 0) && <div>
         <div className="flex items-center justify-between">
           <SectionLabel>All listings</SectionLabel>
           {!loading && <span className="text-xs text-muted-foreground mb-3"><span style={MONO} className="text-foreground font-medium">{listings.length}</span> found</span>}
@@ -1529,7 +1543,7 @@ function FeedView({
             <p className="text-sm mt-1">Try adjusting your search or filters, or post a request.</p>
           </div>
         )}
-      </div>
+      </div>}
     </div>
   )
 }
@@ -3459,7 +3473,7 @@ export function Home() {
     return allListings.filter(listing => {
       const matchType = filterType === 'all' || listing.type === filterType
       const matchTag = filterTag === '' || listing.tags.includes(filterTag)
-      const matchSearch = searchQuery.trim() === '' || listing.to.toLowerCase().includes(searchQuery.toLowerCase()) || listing.from.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchSearch = matchesSearch(listing, searchQuery)
       const matchCarType = filterCarType === '' || (listing.type === 'driver' && listing.carType === filterCarType)
       const matchLuggage = filterLuggage === '' || listing.type !== 'driver' || (listing.luggageCapacity != null && LUGGAGE_ORDER.indexOf(listing.luggageCapacity) >= LUGGAGE_ORDER.indexOf(filterLuggage))
       const matchDate = quickDateFilter === 'any' || listing.date === todayLocal
@@ -3467,6 +3481,8 @@ export function Home() {
       return matchType && matchTag && matchSearch && matchCarType && matchLuggage && matchDate && matchSeats
     })
   }, [allListings, filterTag, filterType, searchQuery, filterCarType, filterLuggage, quickDateFilter, seatsNeeded]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const filteredIds = useMemo(() => new Set(filteredListings.map(l => l.id)), [filteredListings])
 
   // ── Listings the current user has already acted on ──────────────────────────
   // onConnect always creates a fresh ride_request/driver_trip on our side, so
@@ -4051,7 +4067,7 @@ export function Home() {
                   hasLocation={!!userCoords}
                 />
               ) : (
-                <FeedView hasLocation={!!userCoords} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} bestMatches={
+                <FeedView hasLocation={!!userCoords} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filterType={filterType} setFilterType={setFilterType} filterTag={filterTag} setFilterTag={setFilterTag} filterCarType={filterCarType} setFilterCarType={setFilterCarType} filterLuggage={filterLuggage} setFilterLuggage={setFilterLuggage} quickDateFilter={quickDateFilter} setQuickDateFilter={setQuickDateFilter} seatsNeeded={seatsNeeded} setSeatsNeeded={setSeatsNeeded} filterSheetOpen={filterSheetOpen} setFilterSheetOpen={setFilterSheetOpen} listings={filteredListings.filter(l => !matchedListingIds.includes(l.id))} onConnect={onConnect} loading={feedLoading} currentUserId={currentUser.id} setView={setView} connectedListingIds={connectedListingIds} matchedCount={isMobile ? 0 : matchedListingIds.length} bestMatches={
                   <>
                     {(() => {
                       const openRequest = myListings.find(l => l.type === 'rider' && l.status === 'open')
@@ -4069,7 +4085,7 @@ export function Home() {
                         card design, and isn't part of the mobile redesign's scope. */}
                     {!isMobile && (
                     <BestMatches
-                      listings={allListings}
+                      listings={allListings} visibleIds={filteredIds}
                       referenceListing={myListings.find(l => l.type === 'rider' && l.status === 'open')}
                       currentUserId={currentUser.id} currentUserInterests={currentUser.profile.interests}
                       onConnect={onConnect} showToast={showToast} onMatchedIds={setMatchedListingIds} connectedListingIds={connectedListingIds}
