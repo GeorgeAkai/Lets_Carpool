@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from backend.tests.test_mvp_api import client, location, make_request_and_trip
+from backend.tests.test_mvp_api import auth, client, location, make_request_and_trip
 
 
 def _fresh_request(c, rider_headers, day: date | None = None) -> dict:
@@ -198,3 +198,20 @@ def test_a_request_made_for_one_driver_is_not_a_second_public_listing() -> None:
     # No "new match" nudge goes out for a request nobody can browse.
     nudges = [n for n in c.get("/notifications", headers=driver_headers).json() if n["type"] == "new_match"]
     assert all(n.get("related_id") != made["id"] for n in nudges)
+
+
+def test_a_trip_with_no_seats_left_leaves_discover_and_returns_when_a_seat_frees_up() -> None:
+    c = client()
+    _passenger, rider_headers, _driver, driver_headers, ride_request, driver_trip = make_request_and_trip(
+        c, passenger_count=1, seats_available=1)
+    browsing = auth(c, "browser@example.com", "Bo Browser")[1]
+    assert [t["id"] for t in _search_trips(c, browsing)] == [driver_trip["id"]]
+
+    asked = c.post("/connections", headers=rider_headers, json={
+        "ride_request_id": ride_request["id"], "driver_trip_id": driver_trip["id"]}).json()
+    c.post(f"/connections/{asked['id']}/transition", headers=driver_headers, json={"action": "accept"})
+    # The only seat is taken: nobody else is shown a ride they cannot request.
+    assert _search_trips(c, browsing) == []
+
+    c.post(f"/connections/{asked['id']}/transition", headers=rider_headers, json={"action": "cancel"})
+    assert [t["id"] for t in _search_trips(c, browsing)] == [driver_trip["id"]]

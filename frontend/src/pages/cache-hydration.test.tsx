@@ -79,3 +79,21 @@ describe("Opening the app with data from last time", () => {
     await waitFor(() => expect(readCache("me")).toBeNull());
   });
 });
+
+describe("Discover", () => {
+  it("leaves out a ride with no seats remaining", async () => {
+    const full = { ...trip("full", "Fiona Fullcar", "Reno, NV"), seats_available: 2, seats_reserved: 2, status: "matched" };
+    const open = trip("open", "Owen Openseat", "Reno, NV");
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit): Promise<Answer> => {
+      const key = `${(init?.method ?? "GET").toUpperCase()} ${String(url).replace(BASE, "").split("?")[0]}`;
+      const routes: Record<string, unknown> = {
+        "GET /me": ME, "GET /driver-trips/search": [full, open], "GET /ride-requests/search": [], "GET /me/routes": [],
+        "GET /me/connections": [], "GET /notifications": [], "GET /me/driver-trips": [], "GET /me/ride-requests": [],
+      };
+      return key in routes ? { ok: true, status: 200, json: async () => routes[key] } : { ok: false, status: 404, json: async () => ({ detail: "not found" }) };
+    }));
+    render(<MemoryRouter initialEntries={["/discover"]}><App /></MemoryRouter>);
+    expect((await screen.findAllByText("Owen Openseat")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Fiona Fullcar")).toBeNull();
+  });
+});

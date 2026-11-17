@@ -1308,6 +1308,8 @@ class Store:
                    FROM driver_trips dt
                    {joins}
                    WHERE dt.status IN ('open', 'matched') AND NOT dt.unlisted
+                   -- A full trip has nothing left to request, so it is not browsable.
+                   AND dt.seats_available - dt.seats_reserved > 0
                    AND dt.target_date >= CURRENT_DATE - INTERVAL '1 day'
                    AND dt.driver_id != %s
                    AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = dt.driver_id AND u.status = 'suspended')

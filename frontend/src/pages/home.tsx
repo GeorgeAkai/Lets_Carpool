@@ -3428,7 +3428,9 @@ export function Home() {
       // (`Map` is the lucide icon in this file, hence a plain record.)
       const detourByTrip: Record<string, number | null> = Object.fromEntries(corridorTrips.map(t => [t.id, t.detour_minutes ?? null]))
       const combined = [
-        ...trips.map(t => ({ ...tripToListing(t), detourMinutes: detourByTrip[t.id] ?? undefined })),
+        // A trip with no seats left has nothing to request, so it is not shown.
+        ...trips.filter(t => t.seats_available - t.seats_reserved > 0)
+          .map(t => ({ ...tripToListing(t), detourMinutes: detourByTrip[t.id] ?? undefined })),
         ...requests.map(requestToListing),
       ]
       const seenIds = new Set<string>()
